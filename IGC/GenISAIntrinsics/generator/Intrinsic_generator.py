@@ -150,6 +150,20 @@ class IntrinsicFormatter:
         return output
 
     @staticmethod
+    def get_parameter_attribute_entry(attribute, is_last):
+        output = 'llvm::Attribute::{}'.format(attribute)
+        if not is_last:
+            output = "{},".format(output)
+        return output
+
+    @staticmethod
+    def get_memory_effect_entry(effect, is_last):
+        output = 'llvm::MemoryEffects::Location::{}'.format(effect)
+        if not is_last:
+            output = "{},".format(output)
+        return output   
+
+    @staticmethod
     def get_prefix():
         prefix = 'llvm.genx.GenISA.'
         return prefix

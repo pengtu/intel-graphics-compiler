@@ -33,7 +33,7 @@ namespace IGCLLVM
 #if LLVM_VERSION_MAJOR <= 10
         return llvm::cast<llvm::VectorType>(pType)->getBitWidth();
 #else
-        return (uint32_t)pType->getPrimitiveSizeInBits().getFixedSize();
+        return (uint32_t)pType->getPrimitiveSizeInBits().getFixedValue();
 #endif
     }
 
