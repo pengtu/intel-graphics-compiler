@@ -129,63 +129,6 @@ def translate_attribute_list(attribute):
     }
     return attribute_map[attribute]
 
-def translate_attribute_list_func_attribute(attribute):
-    if ',' in attribute:
-        attributes = attribute.split(",")
-        return set(ID for attribute in attributes for ID in translate_attribute_list_func_attribute(attribute))
-    attribute_map = {
-        "None": set([ AttributeID.NoUnwind ]),
-        "NoMem": set([ AttributeID.NoUnwind ]),
-        "ReadMem": set([ AttributeID.NoUnwind]),
-        "ReadArgMem": set([ AttributeID.NoUnwind ]),
-        "WriteArgMem": set([ AttributeID.NoUnwind ]),
-        "WriteMem": set([ AttributeID.NoUnwind ]),
-        "ReadWriteArgMem": set([ AttributeID.NoUnwind ]),
-        "NoReturn": set([ AttributeID.NoUnwind, AttributeID.NoReturn ]),
-        "NoDuplicate": set([ AttributeID.NoUnwind, AttributeID.NoDuplicate ]),
-        "Convergent": set([ AttributeID.NoUnwind, AttributeID.Convergent ]),
-        "InaccessibleMemOnly": set([ AttributeID.NoUnwind ])
-    }
-    return attribute_map[attribute]
-
-def translate_attribute_list_parameter_attribute(attribute):
-    if ',' in attribute:
-        attributes = attribute.split(",")
-        return set(ID for attribute in attributes for ID in translate_attribute_list_func_attribute(attribute))
-    attribute_map = {
-        "None": set([ ]),
-        "NoMem": set([ ParameterAttributeID.ReadNone ]),
-        "ReadMem": set([ ParameterAttributeID.ReadOnly]),
-        "ReadArgMem": set([ ParameterAttributeID.ReadOnly ]),
-        "WriteArgMem": set([ ParameterAttributeID.WriteOnly ]),
-        "WriteMem": set([ ParameterAttributeID.WriteOnly ]),
-        "ReadWriteArgMem": set([ ]),
-        "NoReturn": set([ ]),
-        "NoDuplicate": set([ ]),
-        "Convergent": set([ ]),
-        "InaccessibleMemOnly": set([ ])
-    }
-    return attribute_map[attribute]
-
-def translate_attribute_list_memory_effect(attribute):
-    if ',' in attribute:
-        attributes = attribute.split(",")
-        return set(ID for attribute in attributes for ID in translate_attribute_list_memory_effect(attribute))
-    attribute_map = {
-        "None": set([ ]),
-        "NoMem": set([ ]),
-        "ReadMem": set([ ]),
-        "ReadArgMem": set([ MemoryEffectID.ArgMemOnly ]),
-        "WriteArgMem": set([ MemoryEffectID.ArgMemOnly ]),
-        "WriteMem": set([ ]),
-        "ReadWriteArgMem": set([ MemoryEffectID.ArgMemOnly ]),
-        "NoReturn": set([ ]),
-        "NoDuplicate": set([ ]),
-        "Convergent": set([ ]),
-        "InaccessibleMemOnly": set([ MemoryEffectID.InaccessibleMemOnly ])
-    }
-    return attribute_map[attribute]
-
 def generate_type_definitions_from_modules(inputs):
     intrinsics = dict()
     for el in inputs:
@@ -210,10 +153,8 @@ def generate_type_definitions_from_modules(inputs):
         argument_types = []
         for type_str in argument_type_strs:
             argument_types.append(ArgumentTypeDefinition(translate_type_definition(type_str[0]), type_str[1]))
-        attributes = translate_attribute_list_func_attribute(func_type_def[2])
-        parameter_attributes = translate_attribute_list_parameter_attribute(func_type_def[2])
-        memory_effects = translate_attribute_list_memory_effect(func_type_def[2])
-        intrinsic_definitions.append(IntrinsicDefinition(name, comment, return_type, argument_types, attributes, parameter_attributes, memory_effects))
+        attributes = translate_attribute_list(func_type_def[2])
+        intrinsic_definitions.append(IntrinsicDefinition(name, comment, return_type, argument_types, attributes))
     return intrinsic_definitions
 
 if __name__ == '__main__':

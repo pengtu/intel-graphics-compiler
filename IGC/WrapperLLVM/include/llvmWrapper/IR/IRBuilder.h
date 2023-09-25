@@ -31,28 +31,28 @@ namespace IGCLLVM
     public:
         IRBuilder(llvm::LLVMContext &C, const T &F, InserterTyDef() I = InserterTyDef()(),
             llvm::MDNode *FPMathTag = nullptr,
-            llvm::ArrayRef<llvm::OperandBundleDef> OpBundles = std::nullopt)
+            llvm::ArrayRef<llvm::OperandBundleDef> OpBundles = llvm::None)
             : llvm::IRBuilder<T, InserterTyDef()>(C, F, I, FPMathTag, OpBundles) {}
 
         explicit IRBuilder(llvm::LLVMContext &C, llvm::MDNode *FPMathTag = nullptr,
-            llvm::ArrayRef<llvm::OperandBundleDef> OpBundles = std::nullopt)
+            llvm::ArrayRef<llvm::OperandBundleDef> OpBundles = llvm::None)
             : llvm::IRBuilder<T, InserterTyDef()>(C, FPMathTag, OpBundles) {}
 
         explicit IRBuilder(llvm::BasicBlock *TheBB, llvm::MDNode *FPMathTag = nullptr)
             : llvm::IRBuilder<T, InserterTyDef()>(TheBB, FPMathTag) {}
 
         explicit IRBuilder(llvm::Instruction *IP, llvm::MDNode *FPMathTag = nullptr,
-            llvm::ArrayRef<llvm::OperandBundleDef> OpBundles = std::nullopt)
+            llvm::ArrayRef<llvm::OperandBundleDef> OpBundles = llvm::None)
             : llvm::IRBuilder<T, InserterTyDef()>(IP, FPMathTag, OpBundles) {}
 
         IRBuilder(llvm::BasicBlock *TheBB, llvm::BasicBlock::iterator IP, const T &F,
             llvm::MDNode *FPMathTag = nullptr,
-            llvm::ArrayRef<llvm::OperandBundleDef> OpBundles = std::nullopt)
+            llvm::ArrayRef<llvm::OperandBundleDef> OpBundles = llvm::None)
             : llvm::IRBuilder<T, InserterTyDef()>(TheBB, IP, F, FPMathTag, OpBundles) {}
 
         IRBuilder(llvm::BasicBlock *TheBB, llvm::BasicBlock::iterator IP,
             llvm::MDNode *FPMathTag = nullptr,
-            llvm::ArrayRef<llvm::OperandBundleDef> OpBundles = std::nullopt)
+            llvm::ArrayRef<llvm::OperandBundleDef> OpBundles = llvm::None)
             : llvm::IRBuilder<T, InserterTyDef()>(TheBB, IP, FPMathTag, OpBundles) {}
 
         const T& getFolder() {
@@ -166,8 +166,7 @@ namespace IGCLLVM
 #endif
 
 #if LLVM_VERSION_MAJOR >= 11
-#if 0
-      inline llvm::CallInst* CreateCall(llvm::Value* Callee, llvm::ArrayRef<llvm::Value*> Args = std::nullopt,
+      inline llvm::CallInst* CreateCall(llvm::Value* Callee, llvm::ArrayRef<llvm::Value*> Args = llvm::None,
                                            const llvm::Twine& Name = "", llvm::MDNode* FPMathTag = nullptr) {
             return llvm::IRBuilder<T, InserterTyDef()>::CreateCall(
                                                            llvm::cast<llvm::FunctionType>(IGCLLVM::getNonOpaquePtrEltTy(Callee->getType())), Callee,
@@ -184,10 +183,10 @@ namespace IGCLLVM
                   IGCLLVM::getNonOpaquePtrEltTy(Callee->getType())),
               Callee, Args, OpBundles, Name, FPMathTag);
         }
-#endif
+
         inline llvm::CallInst *
         CreateCall(llvm::FunctionType *FTy, llvm::Value *Callee,
-                   llvm::ArrayRef<llvm::Value *> Args = std::nullopt,
+                   llvm::ArrayRef<llvm::Value *> Args = llvm::None,
                    const llvm::Twine &Name = "",
                    llvm::MDNode *FPMathTag = nullptr) {
           return llvm::IRBuilder<T, InserterTyDef()>::CreateCall(FTy, Callee, Args,
@@ -196,7 +195,6 @@ namespace IGCLLVM
 #endif
 
 #if LLVM_VERSION_MAJOR >= 13
-#if 0
         inline llvm::LoadInst* CreateLoad(llvm::Value* Ptr, const char *Name)
         {
             llvm::Type* ptrType = IGCLLVM::getNonOpaquePtrEltTy(Ptr->getType());
@@ -245,27 +243,25 @@ namespace IGCLLVM
         {
             return llvm::IRBuilder<T, InserterTyDef()>::CreateConstGEP1_32(IGCLLVM::getNonOpaquePtrEltTy(Ptr->getType()), Ptr, Idx0, Name);
         }
-#endif
 
         using llvm::IRBuilder<T, InserterTyDef()>::CreateConstGEP1_32;
-#if 0
+
         inline llvm::Value* CreateInBoundsGEP(llvm::Value *Ptr, llvm::ArrayRef<llvm::Value*> IdxList,
                            const llvm::Twine &Name = "") {
             llvm::Type *Ty = IGCLLVM::getNonOpaquePtrEltTy(Ptr->getType()->getScalarType());
             return llvm::IRBuilder<T, InserterTyDef()>::CreateInBoundsGEP(Ty, Ptr, IdxList, Name);
         }
-#endif
+
         using llvm::IRBuilder<T, InserterTyDef()>::CreateInBoundsGEP;
-#if 0
+
         inline llvm::Value* CreateGEP(llvm::Value* Ptr, llvm::ArrayRef<llvm::Value*> IdxList,
             const llvm::Twine& Name = "") {
             llvm::Type* Ty = IGCLLVM::getNonOpaquePtrEltTy(Ptr->getType()->getScalarType());
             return llvm::IRBuilder<T, InserterTyDef()>::CreateGEP(Ty, Ptr, IdxList, Name);
         }
-#endif
 
         using llvm::IRBuilder<T, InserterTyDef()>::CreateGEP;
-#if 0
+
         llvm::CallInst *CreateMaskedGather(llvm::Value *Ptrs, Align Alignment, llvm::Value *Mask,
                                      llvm::Value *PassThru, const llvm::Twine &Name) {
           auto *PtrsTy = llvm::cast<llvm::FixedVectorType>(Ptrs->getType());
@@ -275,7 +271,6 @@ namespace IGCLLVM
           return llvm::IRBuilder<T, InserterTyDef()>::CreateMaskedGather(
               Ty, Ptrs, Alignment, Mask, PassThru, Name);
         }
-#endif
 
         llvm::AtomicCmpXchgInst *
         CreateAtomicCmpXchg(llvm::Value *Ptr, llvm::Value *Cmp, llvm::Value *New,
@@ -291,7 +286,7 @@ namespace IGCLLVM
                                        llvm::SyncScope::ID SSID = llvm::SyncScope::System) {
           return createAtomicRMW(*this, Op, Ptr, Val, Ordering, SSID);
         }
-#if 0
+
         llvm::CallInst *CreateMaskedLoad(llvm::Value *Ptr, Align Alignment, llvm::Value *Mask,
                                    llvm::Value *PassThru, const llvm::Twine &Name) {
           auto *PtrTy = llvm::cast<llvm::PointerType>(Ptr->getType());
@@ -299,7 +294,6 @@ namespace IGCLLVM
           return llvm::IRBuilder<T, InserterTyDef()>::CreateMaskedLoad(
               Ty, Ptr, Alignment, Mask, PassThru, Name);
         }
-#endif
 
 #endif
 
@@ -320,7 +314,6 @@ namespace IGCLLVM
 #endif
         }
 
-#if 0
         inline llvm::Value* CreateConstInBoundsGEP2_64(
             llvm::Value* Ptr,
             uint64_t Idx0,
@@ -335,7 +328,7 @@ namespace IGCLLVM
         }
 
         using llvm::IRBuilder<T, InserterTyDef()>::CreateConstInBoundsGEP2_64;
-#endif
+
     };
 
     template <typename T = llvm::ConstantFolder,

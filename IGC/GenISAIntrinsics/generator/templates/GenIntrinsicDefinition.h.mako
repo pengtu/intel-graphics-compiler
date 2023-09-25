@@ -13,7 +13,6 @@ SPDX-License-Identifier: MIT
 
 #include "common/LLVMWarningsPush.hpp"
 #include "llvm/IR/Attributes.h"
-#include "llvm/Support/ModRef.h"
 #include "common/LLVMWarningsPop.hpp"
 
 #include <string_view>
@@ -66,22 +65,6 @@ public:
         % endfor
     };
     % endif
-
-    static constexpr std::vector scParameterAttributeKinds = {
-        % if hasattr(el, 'parameter_attributes') and el.parameter_attributes and len(el.parameter_attributes) >0:
-            % for attr in el.parameter_attributes:
-            ${IntrinsicFormatter.get_parameter_attribute_entry(attr, loop.last)}
-            % endfor
-        % endif
-    };
-
-    static constexpr std::vector scMemoryEffectKinds = {
-        % if hasattr(el, 'memory_effects') and el.memory_effects and len(el.memory_effects) >0:
-            % for attr in el.memory_effects:
-            ${IntrinsicFormatter.get_memory_effect_entry(attr, loop.last)}
-            % endfor
-        % endif
-    };
 };
 
 % endfor

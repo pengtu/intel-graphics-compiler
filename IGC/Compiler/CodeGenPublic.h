@@ -554,7 +554,7 @@ namespace IGC
         // This is the default shader that is executed when the RTUnit
         // encounters a null shader. It is optional because there is
         // no need to compile it for collection state objects.
-        std::optional<SBindlessProgram> callStackHandler;
+        llvm::Optional<SBindlessProgram> callStackHandler;
 
         typedef llvm::SmallVector<SBindlessProgram, 8> BindlessShaderVec;
         // These are the raygen shaders
@@ -1138,8 +1138,8 @@ namespace IGC
 
         uint64_t GetSIMDInfo() { return m_SIMDInfo; }
 
-        virtual std::optional<SIMDMode> knownSIMDSize() const {
-            return std::nullopt;
+        virtual llvm::Optional<SIMDMode> knownSIMDSize() const {
+            return llvm::None;
         }
 
         // This can be paired with `EncodeAS4GFXResource()` to get a unique
