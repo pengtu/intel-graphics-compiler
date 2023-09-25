@@ -246,9 +246,8 @@ private:
         llvm::AttributeList AS[1];
         AS[0] = llvm::AttributeList::get(ctx, llvm::AttributeList::FunctionIndex, attributeKinds);
         unsigned NumAttrs = attributeKinds.size() > 0 ? 1 : 0;
-        return llvm::AttributeList::get(ctx, llvm::ArrayRef<llvm::AttributeList>(AS, NumAttrs));
+        return llvm::AttributeList::get(ctx, makeArrayRef(AS, NumAttrs));
     }
-
 };
 
 template<uint32_t ...Is>

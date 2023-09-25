@@ -13,7 +13,6 @@ SPDX-License-Identifier: MIT
 
 #include "common/LLVMWarningsPush.hpp"
 #include "llvm/IR/Attributes.h"
-#include "llvm/Support/ModRef.h"
 #include "common/LLVMWarningsPop.hpp"
 
 #include <string_view>

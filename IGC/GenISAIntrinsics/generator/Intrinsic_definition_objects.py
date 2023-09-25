@@ -51,9 +51,14 @@ class AddressSpace(Enum):
 
 class AttributeID(Enum):
     NoUnwind = 0,
-    NoReturn = 1,
-    NoDuplicate = 2,
-    Convergent = 3,
+    ReadNone = 1,
+    ReadOnly = 2,
+    ArgMemOnly = 3,
+    WriteOnly = 4,
+    NoReturn = 5,
+    NoDuplicate = 6,
+    Convergent = 7,
+    InaccessibleMemOnly = 8
 
     def __str__(self):
         return self.name
@@ -65,6 +70,7 @@ class AttributeID(Enum):
                 return val
         else:
             raise ValueError("{value} is not present in {cls.__name__}")
+
 
 class MemoryEffectID(Enum):
     Undef = 0,
@@ -208,7 +214,6 @@ class IntrinsicDefinition:
         self.argument_types = argument_types
         self.attributes = sorted(list(attributes), key=lambda x: x.__str__())
         self.memory_effects = sorted(list(memory_effects), key=lambda x: x.__str__())
-
     def to_dict(self):
         res = {
             "name": self.name,
