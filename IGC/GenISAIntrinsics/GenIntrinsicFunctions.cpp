@@ -155,6 +155,31 @@ private:
         // is global and hence this approach suffices.
         pFunc->setAttributes(attribs);
 
+        // Set MemoryEffects
+        constexpr auto& memoryEffectKinds = IntrinsicDefinitionT::scMemoryEffectKinds;
+        for (const auto& el : memoryEffectKinds) {
+            switch (el) {
+                case Undef:
+                    break;
+                case ReadNone:
+                    pFunc->setDoesNotAccessMemory();
+                    break;
+                case ReadOnly:
+                    pFunc->setOnlyReadsMemory();
+                    break;
+                case WriteOnly:
+                    pFunc->setOnlyWritesMemory();
+                    break;
+                case ArgMemOnly:
+                    pFunc->setOnlyAccessesArgMemory();
+                    break;
+                case InaccessibleMemOnly:
+                    pFunc->setOnlyAccessesInaccessibleMemory();
+                    break;
+                default:
+                    IGC_ASSERT_MESSAGE(false, "Unknown memory side effect kind!");
+            }
+        }
         return pFunc;
     }
 
