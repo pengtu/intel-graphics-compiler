@@ -155,6 +155,31 @@ private:
         // is global and hence this approach suffices.
         pFunc->setAttributes(attribs);
 
+        // Set MemoryEffects
+        constexpr auto& memoryEffectKinds = IntrinsicDefinitionT::scMemoryEffectKinds;
+        for (const auto& el : memoryEffectKinds) {
+            switch (el) {
+                case Undef:
+                    break;
+                case ReadNone:
+                    pFunc->setDoesNotAccessMemory();
+                    break;
+                case ReadOnly:
+                    pFunc->setOnlyReadsMemory();
+                    break;
+                case WriteOnly:
+                    pFunc->setOnlyWritesMemory();
+                    break;
+                case ArgMemOnly:
+                    pFunc->setOnlyAccessesArgMemory();
+                    break;
+                case InaccessibleMemOnly:
+                    pFunc->setOnlyAccessesInaccessibleMemory();
+                    break;
+                default:
+                    IGC_ASSERT_MESSAGE(false, "Unknown memory side effect kind!");
+            }
+        }
         return pFunc;
     }
 
@@ -221,7 +246,7 @@ private:
         llvm::AttributeList AS[1];
         AS[0] = llvm::AttributeList::get(ctx, llvm::AttributeList::FunctionIndex, attributeKinds);
         unsigned NumAttrs = attributeKinds.size() > 0 ? 1 : 0;
-        return llvm::AttributeList::get(ctx, makeArrayRef(AS, NumAttrs));
+        return llvm::AttributeList::get(ctx, llvm::ArrayRef<llvm::AttributeList>(AS, NumAttrs));
     }
 };
 

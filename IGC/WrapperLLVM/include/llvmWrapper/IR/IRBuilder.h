@@ -31,28 +31,28 @@ namespace IGCLLVM
     public:
         IRBuilder(llvm::LLVMContext &C, const T &F, InserterTyDef() I = InserterTyDef()(),
             llvm::MDNode *FPMathTag = nullptr,
-            llvm::ArrayRef<llvm::OperandBundleDef> OpBundles = llvm::None)
+            llvm::ArrayRef<llvm::OperandBundleDef> OpBundles = std::nullopt)
             : llvm::IRBuilder<T, InserterTyDef()>(C, F, I, FPMathTag, OpBundles) {}
 
         explicit IRBuilder(llvm::LLVMContext &C, llvm::MDNode *FPMathTag = nullptr,
-            llvm::ArrayRef<llvm::OperandBundleDef> OpBundles = llvm::None)
+            llvm::ArrayRef<llvm::OperandBundleDef> OpBundles = std::nullopt)
             : llvm::IRBuilder<T, InserterTyDef()>(C, FPMathTag, OpBundles) {}
 
         explicit IRBuilder(llvm::BasicBlock *TheBB, llvm::MDNode *FPMathTag = nullptr)
             : llvm::IRBuilder<T, InserterTyDef()>(TheBB, FPMathTag) {}
 
         explicit IRBuilder(llvm::Instruction *IP, llvm::MDNode *FPMathTag = nullptr,
-            llvm::ArrayRef<llvm::OperandBundleDef> OpBundles = llvm::None)
+            llvm::ArrayRef<llvm::OperandBundleDef> OpBundles = std::nullopt)
             : llvm::IRBuilder<T, InserterTyDef()>(IP, FPMathTag, OpBundles) {}
 
         IRBuilder(llvm::BasicBlock *TheBB, llvm::BasicBlock::iterator IP, const T &F,
             llvm::MDNode *FPMathTag = nullptr,
-            llvm::ArrayRef<llvm::OperandBundleDef> OpBundles = llvm::None)
+            llvm::ArrayRef<llvm::OperandBundleDef> OpBundles = std::nullopt)
             : llvm::IRBuilder<T, InserterTyDef()>(TheBB, IP, F, FPMathTag, OpBundles) {}
 
         IRBuilder(llvm::BasicBlock *TheBB, llvm::BasicBlock::iterator IP,
             llvm::MDNode *FPMathTag = nullptr,
-            llvm::ArrayRef<llvm::OperandBundleDef> OpBundles = llvm::None)
+            llvm::ArrayRef<llvm::OperandBundleDef> OpBundles = std::nullopt)
             : llvm::IRBuilder<T, InserterTyDef()>(TheBB, IP, FPMathTag, OpBundles) {}
 
         const T& getFolder() {
@@ -166,7 +166,7 @@ namespace IGCLLVM
 #endif
 
 #if LLVM_VERSION_MAJOR >= 11
-      inline llvm::CallInst* CreateCall(llvm::Value* Callee, llvm::ArrayRef<llvm::Value*> Args = llvm::None,
+      inline llvm::CallInst* CreateCall(llvm::Value* Callee, llvm::ArrayRef<llvm::Value*> Args = std::nullopt,
                                            const llvm::Twine& Name = "", llvm::MDNode* FPMathTag = nullptr) {
             return llvm::IRBuilder<T, InserterTyDef()>::CreateCall(
                                                            llvm::cast<llvm::FunctionType>(IGCLLVM::getNonOpaquePtrEltTy(Callee->getType())), Callee,
@@ -186,7 +186,7 @@ namespace IGCLLVM
 
         inline llvm::CallInst *
         CreateCall(llvm::FunctionType *FTy, llvm::Value *Callee,
-                   llvm::ArrayRef<llvm::Value *> Args = llvm::None,
+                   llvm::ArrayRef<llvm::Value *> Args = std::nullopt,
                    const llvm::Twine &Name = "",
                    llvm::MDNode *FPMathTag = nullptr) {
           return llvm::IRBuilder<T, InserterTyDef()>::CreateCall(FTy, Callee, Args,

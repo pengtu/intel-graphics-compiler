@@ -23,6 +23,16 @@ namespace IGC
 
 static constexpr std::string_view scIntrinsicPrefix = "${IntrinsicFormatter.get_prefix()}";
 
+enum MemorySideEffects : uint8_t
+{
+    Undef = 0,
+    ReadNone = 1,
+    ReadOnly = 2,
+    WriteOnly = 3,
+    ArgMemOnly = 4,
+    InaccessibleMemOnly = 5
+};
+
 template<llvm::GenISAIntrinsic::ID id>
 struct IntrinsicDefinition;
 
@@ -62,6 +72,14 @@ public:
     static constexpr std::array scAttributeKinds = {
         % for attr in el.attributes:
         ${IntrinsicFormatter.get_attribute_entry(attr, loop.last)}
+        % endfor
+    };
+    % endif
+    % if hasattr(el, 'memory_effects') and el.memory_effects and len(el.memory_effects) > 0:
+
+    static constexpr std::array scMemoryEffectKinds = {
+        % for attr in el.memory_effects:
+        ${IntrinsicFormatter.get_memory_effect_entry(attr, loop.last)}
         % endfor
     };
     % endif

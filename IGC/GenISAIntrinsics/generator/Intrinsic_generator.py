@@ -150,6 +150,13 @@ class IntrinsicFormatter:
         return output
 
     @staticmethod
+    def get_memory_effect_entry(effect, is_last):
+        output = 'MemorySideEffects::{}'.format(effect)
+        if not is_last:
+            output = "{},".format(output)
+        return output   
+
+    @staticmethod
     def get_prefix():
         prefix = 'llvm.genx.GenISA.'
         return prefix

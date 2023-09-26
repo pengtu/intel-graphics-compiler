@@ -71,6 +71,34 @@ class AttributeID(Enum):
         else:
             raise ValueError("{value} is not present in {cls.__name__}")
 
+
+class MemoryEffectID(Enum):
+    Undef = 0,
+    ReadNone = 1,
+    ReadOnly = 2,
+    WriteOnly = 3
+    ArgMemOnly = 4,
+    InaccessibleMemOnly = 5
+
+    def __str__(self):
+        effect_to_string = {
+            MemoryEffectID.Undef: "Undef",
+            MemoryEffectID.ReadNone: "ReadNone",
+            MemoryEffectID.ReadOnly: "ReadOnly",
+            MemoryEffectID.WriteOnly: "WriteOnly",
+            MemoryEffectID.ArgMemOnly: "ArgMemOnly",
+            MemoryEffectID.InaccessibleMemOnly: "InaccessibleMemOnly"
+        }
+        return effect_to_string[self]
+
+    @classmethod
+    def from_str(cls, value : str):
+        for key, val in cls.__members__.items():
+            if key == value:
+                return val
+        else:
+            raise ValueError("{value} is not present in {cls.__name__}")
+
 class TypeDefinition:
     def __init__(self, typeID : TypeID, bit_width : int  = 0, num_elements : int = 0,
                 address_space : AddressSpace = AddressSpace.Undefined, internal_type = None,
@@ -179,20 +207,21 @@ class ArgumentTypeDefinition:
 
 class IntrinsicDefinition:
     def __init__(self, name : str, comment : str, return_type : ArgumentTypeDefinition,
-                 argument_types : List[ArgumentTypeDefinition], attributes : Set[AttributeID]):
+                 argument_types : List[ArgumentTypeDefinition], attributes : Set[AttributeID], memory_effects : Set[MemoryEffectID]):
         self.name = name
         self.comment = comment
         self.return_type = return_type
         self.argument_types = argument_types
         self.attributes = sorted(list(attributes), key=lambda x: x.__str__())
-
+        self.memory_effects = sorted(list(memory_effects), key=lambda x: x.__str__())
     def to_dict(self):
         res = {
             "name": self.name,
             "comment": self.comment,
             "return_type": self.return_type.to_dict(),
             "argument_types":[ el.to_dict() for el in self.argument_types],
-            "attributes": [str(el) for el in self.attributes]
+            "attributes": [str(el) for el in self.attributes],
+            "memory_effects": [str(el) for el in self.memory_effects]
         }
         return res
 
@@ -203,5 +232,6 @@ class IntrinsicDefinition:
         for arg in json_dct['argument_types']:
             argument_types.append(ArgumentTypeDefinition.from_dict(arg))
         attributes = set(AttributeID.from_str(el) for el in json_dct['attributes'])
+        memory_effects = set(MemoryEffectID.from_str(el) for el in json_dct['memory_effects'])
         return IntrinsicDefinition(json_dct['name'], json_dct['comment'], return_type,
-                                   argument_types, attributes)
+                                   argument_types, attributes, memory_effects)
