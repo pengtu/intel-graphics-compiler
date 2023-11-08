@@ -101,7 +101,7 @@ public:
   size_type count() const {
     unsigned NumBits = 0;
     for (unsigned i = 0; i < BITWORDS_PER_ELEMENT; ++i)
-      NumBits += llvm::countPopulation(Bits[i]);
+      NumBits += llvm::popcount(Bits[i]);
     return NumBits;
   }
 
@@ -109,7 +109,7 @@ public:
   int find_first() const {
     for (unsigned i = 0; i < BITWORDS_PER_ELEMENT; ++i)
       if (Bits[i] != 0)
-        return i * BITWORD_SIZE + llvm::countTrailingZeros(Bits[i]);
+        return i * BITWORD_SIZE + llvm::countr_zero(Bits[i]);
     vISA_ASSERT(false, "Illegal empty element");
     // Following should be unreachable
     return -1;
@@ -144,12 +144,12 @@ public:
     Copy &= (~((BitWord)0)) << (BitWord)BitPos;
 
     if (Copy != 0)
-      return WordPos * BITWORD_SIZE + llvm::countTrailingZeros(Copy);
+      return WordPos * BITWORD_SIZE + llvm::countr_zero(Copy);
 
     // Check subsequent words.
     for (unsigned i = WordPos + 1; i < BITWORDS_PER_ELEMENT; ++i)
       if (Bits[i] != 0)
-        return i * BITWORD_SIZE + llvm::countTrailingZeros(Bits[i]);
+        return i * BITWORD_SIZE + llvm::countr_zero(Bits[i]);
     return -1;
   }
 

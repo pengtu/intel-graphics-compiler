@@ -352,7 +352,7 @@ inline typename std::enable_if<
         "int_cast<>() should be used only for conversions between integer types.");
 
     IGC_ASSERT(value.getFixedSize() <= static_cast<typename std::make_unsigned<TDst>::type>(std::numeric_limits<TDst>::max()));
-    return static_cast<TDst>(value.getFixedSize());
+    return static_cast<TDst>(value.getFixedValue());
 }
 
 #endif
