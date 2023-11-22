@@ -42,6 +42,7 @@ SPDX-License-Identifier: MIT
 #   pragma GCC diagnostic push
 #   if __GNUC__ > 8
 #       pragma GCC diagnostic ignored "-Winit-list-lifetime"
+#       pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 #   endif
 #endif
 

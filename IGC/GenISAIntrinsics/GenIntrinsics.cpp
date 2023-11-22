@@ -5,8 +5,8 @@ Copyright (C) 2017-2022 Intel Corporation
 SPDX-License-Identifier: MIT
 
 ============================= end_copyright_notice ===========================*/
-
 #include "GenIntrinsics.h"
+
 #include "GenIntrinsicFunctions.h"
 #include "GenIntrinsicLookup.h"
 #include "Probe/Assertion.h"

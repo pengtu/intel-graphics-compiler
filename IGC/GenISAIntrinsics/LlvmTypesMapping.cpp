@@ -9,7 +9,9 @@ SPDX-License-Identifier: MIT
 #include "LlvmTypesMapping.h"
 #include "StringMacros.hpp"
 #include "Probe/Assertion.h"
+#include "common/LLVMWarningsPush.hpp"
 #include "llvmWrapper/IR/Type.h"
+#include "common/LLVMWarningsPop.hpp"
 #include "llvmWrapper/IR/DerivedTypes.h"
 
 
