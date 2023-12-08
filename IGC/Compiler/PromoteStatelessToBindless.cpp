@@ -103,12 +103,7 @@ void PromoteStatelessToBindless::GetAccessInstToSrcPointerMap(Instruction* inst,
             case GenISAIntrinsic::GenISA_simdBlockRead:
             case GenISAIntrinsic::GenISA_simdBlockWrite:
                 break;
-            case GenISAIntrinsic::GenISA_intatomicrawA64:
-                // Ignore a buffer in this intrinsic, keep it stateless.
-                canPromoteAccess = false;
-                break;
             default:
-                IGC_ASSERT_MESSAGE(0, "Unsupported Instruction");
                 canPromoteAccess = false;
                 break;
             }
@@ -182,7 +177,7 @@ void PromoteStatelessToBindless::PromoteStatelessToBindlessBuffers(Function& F) 
 
     bool supportDynamicBTIsAllocation = ctx->platform.supportDynamicBTIsAllocation();
 
-    for (auto iter : m_SrcPtrToAccessMap)
+    for (auto &iter : m_SrcPtrToAccessMap)
     {
         Argument* srcPtr = cast<Argument>(iter.first);
 
@@ -195,8 +190,16 @@ void PromoteStatelessToBindless::PromoteStatelessToBindlessBuffers(Function& F) 
             // Do this only for legacy mode, since the resource type of the original
             // kernel arg needs to be bindless for it to be reinterpreted as a bindless offset.
             // In advanced mode, always keep the original kernel arg as stateless, and use the
-            // IMPLICIT_BUFFER_OFFSET arg for bindless access.
+            // BINDLESS_OFFSET arg for bindless access.
             argInfo->type = ResourceTypeEnum::BindlessUAVResourceType;
+        }
+        else
+        {
+            // In advanced mode, there must be a corresponding implicit arg BINDLESS_OFFSET for every
+            // explicit buffer arg for it to be promoted to bindless. Check if this implcit arg exists,
+            // and skip promotion if we can't find it.
+            if (!implicitArgs.isImplicitArgExistForNumberedArg(ImplicitArg::BINDLESS_OFFSET, srcPtr->getArgNo()))
+                continue;
         }
 
         if (supportDynamicBTIsAllocation)
@@ -207,7 +210,7 @@ void PromoteStatelessToBindless::PromoteStatelessToBindlessBuffers(Function& F) 
         }
 
         // Loop through all access instructions for srcPtr
-        for (auto insts : iter.second)
+        for (auto &insts : iter.second)
         {
             Instruction* accessInst = cast<Instruction>(insts.first);
             Instruction* addrUsedInst = cast<Instruction>(insts.second);

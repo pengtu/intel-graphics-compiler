@@ -23,6 +23,7 @@ using namespace vISA;
 // all the gunk related to extended send descriptors
 struct SendExDescOpts {
   SendDesc exDesc;
+  uint32_t exDescImmOff = 0;
   int xlen = -1;
   InstOptSet extraOpts;
 };
@@ -93,6 +94,7 @@ private:
   static Region::Width getIGAWidth(int width);
   static Region::Horz getIGAHorz(int hstride);
   static Region getIGARegion(G4_SrcRegRegion *srcRegion, int srcPos);
+  SWSB_ENCODE_MODE getIGASWSBEncodeMode() const;
 
   MathMacroExt getIGAImplAcc(G4_AccRegSel accSel) const {
     switch (accSel) {
@@ -360,11 +362,15 @@ BinaryEncodingIGA::getIGAInternalPlatform(TARGET_PLATFORM genxPlatform) {
     break;
   case Xe_DG2:
   case Xe_MTL:
+  case Xe_ARL:
     platform = Platform::XE_HPG;
     break;
   case Xe_PVC:
   case Xe_PVCXT:
     platform = Platform::XE_HPC;
+    break;
+  case Xe2:
+    platform = Platform::XE2;
     break;
   default:
     break;
@@ -377,6 +383,14 @@ BinaryEncodingIGA::BinaryEncodingIGA(vISA::G4_Kernel &k, std::string fname)
       m_kernelBufferSize(0), platform(k.fg.builder->getPlatform()) {
   platformModel = Model::LookupModel(getIGAInternalPlatform(platform));
   IGAKernel = new Kernel(*platformModel);
+}
+
+SWSB_ENCODE_MODE BinaryEncodingIGA::getIGASWSBEncodeMode() const {
+
+  if (platform == TARGET_PLATFORM::Xe_MTL)
+    return SWSB_ENCODE_MODE::ThreeDistPipeDPMath;
+
+  return platformModel->getSWSBEncodeMode();
 }
 
 InstOptSet BinaryEncodingIGA::getIGAInstOptSet(G4_INST *inst) const {
@@ -525,7 +539,6 @@ iga::SFID BinaryEncodingIGA::getSFID(const G4_INST *inst) {
 }
 MathFC BinaryEncodingIGA::getMathFC(const G4_INST *inst) {
   G4_MathOp mathControlValue = inst->asMathInst()->getMathCtrl();
-
   switch (mathControlValue) {
   case MATH_INV:
     return MathFC::INV;
@@ -982,8 +995,7 @@ void BinaryEncodingIGA::SetSWSB(G4_INST *inst, SWSB &sw) {
   // This workaround can be removed once vISA doesn't produce such SWSB.
   // Currently this could happen only on EOT send.
   if (inst->isSend() && !sw.hasBothDistAndToken() &&
-      !sw.verify(IGAKernel->getModel().getSWSBEncodeMode(),
-                 SWSB::InstType::SEND)) {
+      !sw.verify(getIGASWSBEncodeMode(), SWSB::InstType::SEND)) {
     sw.tokenType = SWSB::TokenType::SET;
     if (sw.hasDist()) {
       // if the distance type cannot be combined with SBID.set, force
@@ -1101,7 +1113,7 @@ void BinaryEncodingIGA::Encode() {
   std::list<std::pair<Instruction *, G4_INST *>> encodedInsts;
   Block *bbNew = nullptr;
 
-  SWSB_ENCODE_MODE swsbEncodeMode = IGAKernel->getModel().getSWSBEncodeMode();
+  SWSB_ENCODE_MODE swsbEncodeMode = getIGASWSBEncodeMode();
 
   for (auto bb : this->kernel.fg) {
     for (auto inst : *bb) {
@@ -1149,6 +1161,11 @@ void BinaryEncodingIGA::Encode() {
 #endif
       vASSERT(currBB);
       currBB->appendInstruction(igaInst);
+
+      if (inst->requireNopAfter()) {
+        Instruction *igaInst = IGAKernel->createNopInstruction();
+        currBB->appendInstruction(igaInst);
+      }
 
       if (bbNew) {
         // Fall through block is created.
@@ -1272,6 +1289,7 @@ Instruction *BinaryEncodingIGA::translateInstruction(G4_INST *g4inst,
 
       igaInst = IGAKernel->createSendInstruction(
           *opSpec, sf.send, pred, flagReg, execSize, chOff, maskCtrl,
+          sdos.exDescImmOff,
           sdos.exDesc, desc);
 
       vISA_ASSERT(igaInst, "Instruction is NULL");
@@ -1561,9 +1579,9 @@ static SendDesc encodeExDescSendUnary(G4_InstSend *sendInst, int &xlen,
 // vISA_ShaderDataBaseStats key a requirement to use
 void BinaryEncodingIGA::printSendDataToFile(const G4_SendDescRaw *descG4,
                                             const char *filePath) const {
-  uint32_t src0Len = descG4->getSrc0LenBytes() / 32;
-  uint32_t src1Len = descG4->getSrc1LenBytes() / 32;
-  uint32_t dstLen = descG4->getDstLenBytes() / 32;
+  uint32_t src0Len = descG4->getSrc0LenRegs();
+  uint32_t src1Len = descG4->getSrc1LenRegs();
+  uint32_t dstLen = descG4->getDstLenRegs();
   FILE *f = fopen(filePath, "a");
   if (f) {
     uint32_t namePos = fileName.find_last_of('\\', fileName.size());
@@ -1673,8 +1691,17 @@ SendDesc BinaryEncodingIGA::encodeExDescRegA0(G4_INST *sendInst,
   const bool isLscBti = isLsc && descG4->getLscAddrType() == LSC_ADDR_TYPE_BTI;
   const bool isUgm = sendInst->getMsgDesc()->getSFID() == vISA::SFID::UGM;
   encodeExBso &= !isLscBti;
+  encodeExBso &= (platform < Xe2 || !isUgm);
   if (encodeExBso)
     sdos.extraOpts.add(InstOpt::EXBSO);
+  if (isLsc && isUgm && !encodeExBso) {
+    bool isLscBssOrSs = descG4->getLscAddrType() == LSC_ADDR_TYPE_BSS ||
+                        descG4->getLscAddrType() == LSC_ADDR_TYPE_SS;
+    if (isLscBssOrSs && descG4->getBti() != nullptr) {
+      // BSS/SS with a0 reg (ExDesc.IsReg) with UGM
+      sdos.exDescImmOff = descG4->getExDescImmOff();
+    }
+  }
 
   // G4 IR keeps Src1.Length (xlen) separate.  So it's known,
   // (even with a reg desc in nonExBSO mode)

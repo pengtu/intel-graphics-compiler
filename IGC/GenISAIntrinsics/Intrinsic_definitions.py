@@ -378,7 +378,8 @@ Imported_Intrinsics = \
      (0,                               "2: source z"),
      (0,                               "3: source w"),
      ("int",                           "4: usage (color/texcoord/pos)"),
-     ("int",                           "5: index & mask")],
+     ("int",                           "5: index"),
+     ("int",                           "6: mask")],
     "NoDuplicate"]],
 ####################################################################################################
 "GenISA_OUTPUTGS": ["",
@@ -389,22 +390,8 @@ Imported_Intrinsics = \
      ("float",                         "w"),
      ("int",                           "type"),
      ("int",                           "idx_mask"),
-     ("int",                           "emitCount")],
-    "None"]],
-####################################################################################################
-"GenISA_OUTPUTGS2": ["",
-    [("void",                          ""),
-    [("float",                         "x"),
-     ("float",                         "y"),
-     ("float",                         "z"),
-     ("float",                         "w"),
-     ("float",                         "x2"),
-     ("float",                         "y2"),
-     ("float",                         "z2"),
-     ("float",                         "w2"),
-     ("int",                           "type"),
-     ("int",                           "idx_mask"),
-     ("int",                           "emitCount")],
+     ("int",                           "emitCount"),
+     ("int",                           "mask")],
     "None"]],
 ####################################################################################################
 "GenISA_OuterScalarTessFactors": ["",
@@ -1308,6 +1295,16 @@ Imported_Intrinsics = \
      (0,                               "src1")],
     "ReadWriteArgMem"]],
 ####################################################################################################
+"GenISA_fcmpxchgatomictyped": ["Floating point atomic compare exchange operation on a typed image",
+    [("anyfloat",                      ""),
+    [("anyptr",                        "Dst Buffer"),
+     ("int",                           "coordinates u"),
+     ("int",                           "coordinates v"),
+     ("int",                           "coordinates r"),
+     (0,                               "src0"),
+     (0,                               "src1")],
+    "ReadWriteArgMem"]],
+####################################################################################################
 "GenISA_imulH": ["",
     [("anyint",                        "result"),
     [(0,                               "source0"),
@@ -1338,6 +1335,16 @@ Imported_Intrinsics = \
      ("int",                           "coordinates r"),
      (0,                               "src0"),
      ("int",                           "Instruction type (add, or, xor etc)")],
+    "ReadWriteArgMem"]],
+####################################################################################################
+"GenISA_floatatomictyped": ["Floating point atomic operation on a typed image",
+    [("anyfloat",                      ""),
+    [("anyptr",                        "Dst Buffer"),
+     ("int",                           "coordinates u"),
+     ("int",                           "coordinates v"),
+     ("int",                           "coordinates r"),
+     (0,                               "src0"),
+     ("int",                           "Instruction type (fadd, fsub, fmin, fmax etc)")],
     "ReadWriteArgMem"]],
 ####################################################################################################
 "GenISA_is_uniform": ["",
@@ -2208,7 +2215,8 @@ Imported_Intrinsics = \
      ("int",                           "V - num blocks (2 for simple 2d block read)"),
      ("bool",                          "transpose"),
      ("bool",                          "vnni transform (for transpose+transform use transpose "+\
-                                       "only and elemSize 32)")],
+                                       "only and elemSize 32)"),
+     ("int",                           "cache controls options (LSC_CACHE_OPTS)")],
     "None"]],
 ####################################################################################################
 "GenISA_LSC2DBlockWrite": ["LSC 2d block write",
@@ -2226,6 +2234,7 @@ Imported_Intrinsics = \
      ("bool",                          "transpose"),
      ("bool",                          "vnni transform (for transpose+transform use transpose "+\
                                        "only and elemSize 32)"),
+     ("int",                           "cache controls options (LSC_CACHE_OPTS)"),
      ("anyint",                        "stored value")],
     "None"]],
 ####################################################################################################

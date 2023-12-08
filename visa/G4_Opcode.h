@@ -22,6 +22,7 @@ SPDX-License-Identifier: MIT
 #define G4_DSIZE 4 // 4 bytes 32 bits
 #define IS_FTYPE(x) ((x) == Type_F)
 #define IS_HFTYPE(x) ((x) == Type_HF)
+#define IS_BFTYPE(x) ((x) == Type_BF)
 #define IS_DFTYPE(x) ((x) == Type_DF || (x) == Type_NF)
 #define IS_DTYPE(x) ((x) == Type_D || (x) == Type_UD)
 #define IS_VINTTYPE(x) ((x) == Type_V || (x) == Type_UV)
@@ -61,7 +62,8 @@ enum class BankAlign {
   Odd = 3,      // old align
   Even2GRF = 4, // 2-GRF even align 1100
   Odd2GRF = 5,  // 2-GRF old align, 0011
-  Align_NUM = 6 // Num of alignment
+  QuadGRF = 6,  // 4-GRF align
+  Align_NUM = 7 // Num of alignment
 };
 
 // An instruction's execution width
@@ -349,7 +351,7 @@ typedef struct _G4_InstOptInfo {
 #define HANDLE_INST(op, nsrc, ndst, type, plat, attr) G4_##op,
 
 enum G4_opcode {
-#include "G4Instruction.h"
+#include "G4_Instruction.h"
   G4_NUM_OPCODE
 };
 
@@ -443,8 +445,6 @@ enum G4_AccRegSel : unsigned char {
 };
 
 // global functions
-inline unsigned int getNumAddrRegisters(void) { return 16; }
-
 uint8_t roundDownPow2(uint8_t n);
 
 // G4_type related global functions

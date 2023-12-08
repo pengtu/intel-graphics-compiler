@@ -230,6 +230,9 @@ void GenXRegionCollapsing::runOnBasicBlock(BasicBlock *BB) {
     }
 
     if (Value *V = simplifyRegionInst(Inst, DL)) {
+      if (isa<Instruction>(V) &&
+          !genx::isSafeToReplaceInstCheckAVLoadKill(Inst, cast<Instruction>(V)))
+        continue;
       Inst->replaceAllUsesWith(V);
       Modified = true;
       continue;
@@ -527,7 +530,7 @@ void GenXRegionCollapsing::processRdRegion(Instruction *InnerRd)
   for (;;) {
     Instruction *OuterRd = dyn_cast<Instruction>(InnerRd->getOperand(0));
 
-    if (OuterRd && !genx::isSafeToMoveInstCheckGVLoadClobber(OuterRd, InnerRd))
+    if (OuterRd && !genx::isSafeToMoveInstCheckAVLoadKill(OuterRd, InnerRd))
       break;
 
     // Go through any bitcasts and up to one sext/zext if necessary to find the
@@ -752,10 +755,19 @@ void GenXRegionCollapsing::processWrRegionElim(Instruction *OuterWr)
       OuterWr->getOperand(GenXIntrinsic::GenXRegion::OldValueOperandNum));
   if (!GenXIntrinsic::isWrRegion(InnerWr))
     return;
+
   // Only perform this optimisation if the only use is with outer - otherwise
   // this seems to make the code spill more
   IGC_ASSERT(InnerWr);
+
   if (!InnerWr->hasOneUse())
+    return;
+
+  auto *InnerWrOldV =
+      InnerWr->getOperand(GenXIntrinsic::GenXRegion::OldValueOperandNum);
+
+  if (auto *I = dyn_cast<Instruction>(InnerWrOldV);
+      I && !genx::isSafeToUseAtPosCheckAVLoadKill(I, OuterWr))
     return;
 
   Region InnerR = genx::makeRegionFromBaleInfo(InnerWr, BaleInfo(),
@@ -765,7 +777,7 @@ void GenXRegionCollapsing::processWrRegionElim(Instruction *OuterWr)
     return;
   // Create the combined wrregion.
   Instruction *CombinedWr = OuterR.createWrRegion(
-      InnerWr->getOperand(0),
+      InnerWrOldV,
       OuterWr->getOperand(GenXIntrinsic::GenXRegion::NewValueOperandNum),
       OuterWr->getName() + ".regioncollapsed", OuterWr, OuterWr->getDebugLoc());
   OuterWr->replaceAllUsesWith(CombinedWr);
@@ -795,6 +807,7 @@ Instruction *GenXRegionCollapsing::processWrRegionBitCast(Instruction *WrRegion)
           GenXIntrinsic::GenXRegion::NewValueOperandNum))) {
     if (BC->getType()->getScalarType()
         == BC->getOperand(0)->getType()->getScalarType()) {
+
       // The bitcast is from scalar to 1-vector, or vice versa.
       Region R = makeRegionFromBaleInfo(WrRegion, BaleInfo());
       auto NewInst =
@@ -865,44 +878,6 @@ void GenXRegionCollapsing::processWrRegionBitCast2(Instruction *WrRegion)
   WrRegion->replaceAllUsesWith(Res);
 }
 
-// Check whether two values are bitwise identical.
-static bool isBitwiseIdentical(Value *V1, Value *V2, const DominatorTree *DT) {
-  IGC_ASSERT_MESSAGE(V1, "null value");
-  IGC_ASSERT_MESSAGE(V2, "null value");
-  if (V1 == V2)
-    return true;
-  if (BitCastInst *BI = dyn_cast<BitCastInst>(V1))
-    V1 = BI->getOperand(0);
-  if (BitCastInst *BI = dyn_cast<BitCastInst>(V2))
-    V2 = BI->getOperand(0);
-
-  // Special case arises from vload/vstore.
-  if (GenXIntrinsic::isVLoad(V1) && GenXIntrinsic::isVLoad(V2)) {
-    auto L1 = cast<CallInst>(V1);
-    auto L2 = cast<CallInst>(V2);
-
-    // Loads from global variables.
-    auto *GV1 = vc::getUnderlyingGlobalVariable(L1->getOperand(0));
-    auto *GV2 = vc::getUnderlyingGlobalVariable(L2->getOperand(0));
-    Value *Addr = L1->getOperand(0);
-    if (GV1 && GV1 == GV2)
-      // OK.
-      Addr = GV1;
-    else if (L1->getOperand(0) != L2->getOperand(0))
-      // Check if loading from the same location.
-      return false;
-    else if (!isa<AllocaInst>(Addr))
-      // Check if this pointer is local and only used in vload/vstore.
-      return false;
-
-    // Check if there is no store to the same location in between.
-    return !genx::hasMemoryDeps(L1, L2, Addr, DT);
-  }
-
-  // Cannot prove.
-  return false;
-}
-
 /***********************************************************************
  * processWrRegion : process a wrregion
  *
@@ -930,50 +905,67 @@ static bool isBitwiseIdentical(Value *V1, Value *V2, const DominatorTree *DT) {
 Instruction *GenXRegionCollapsing::processWrRegion(Instruction *OuterWr)
 {
   IGC_ASSERT(OuterWr);
+
   // Find the inner wrregion, skipping bitcasts.
-  auto InnerWr = dyn_cast<Instruction>(
+  auto *InnerWr = dyn_cast<Instruction>(
       OuterWr->getOperand(GenXIntrinsic::GenXRegion::NewValueOperandNum));
-  while (InnerWr && isa<BitCastInst>(InnerWr))
-    InnerWr = dyn_cast<Instruction>(InnerWr->getOperand(0));
-  if (!GenXIntrinsic::isWrRegion(InnerWr))
+
+  if (!InnerWr)
     return OuterWr;
+
+  InnerWr =
+      dyn_cast<Instruction>(genx::getBitCastedValue(cast<Value>(InnerWr)));
+
+  if (!GenXIntrinsic::isWrRegion(InnerWr) ||
+      !genx::isSafeToMoveInstCheckAVLoadKill(InnerWr, OuterWr))
+    return OuterWr;
+
   // Process inner wrregions first, recursively.
   InnerWr = processWrRegion(InnerWr);
+
   // Now process this one.
   // Find the associated rdregion of the outer region, skipping bitcasts,
   // and check it has the right region parameters.
-  IGC_ASSERT(InnerWr);
-  auto OuterRd = dyn_cast<Instruction>(InnerWr->getOperand(0));
-  while (OuterRd && isa<BitCastInst>(OuterRd))
-    OuterRd = dyn_cast<Instruction>(OuterRd->getOperand(0));
-  if (!GenXIntrinsic::isRdRegion(OuterRd))
+  auto *OuterRd = dyn_cast<Instruction>(InnerWr->getOperand(0));
+
+  if (!OuterRd)
     return OuterWr;
-  IGC_ASSERT(OuterRd);
-  if (!isBitwiseIdentical(OuterRd->getOperand(0), OuterWr->getOperand(0), DT))
+
+  OuterRd =
+      dyn_cast<Instruction>(genx::getBitCastedValue(cast<Value>(OuterRd)));
+
+  if (!GenXIntrinsic::isRdRegion(OuterRd) ||
+      !genx::isBitwiseIdentical(OuterRd->getOperand(0), OuterWr->getOperand(0),
+                                DT) ||
+      GenXIntrinsic::isReadPredefReg(OuterRd->getOperand(0)))
     return OuterWr;
-  if (GenXIntrinsic::isReadPredefReg(OuterRd->getOperand(0)))
-    return OuterWr;
+
   Region InnerR = genx::makeRegionWithOffset(InnerWr, /*WantParentWidth=*/true);
   Region OuterR = genx::makeRegionWithOffset(OuterWr);
   if (OuterR != genx::makeRegionWithOffset(OuterRd))
     return OuterWr;
+
   // See if the regions can be combined.
   LLVM_DEBUG(debugPrintInnerOuter("GenXRegionCollapsing::processWrRegion\n",
                                   InnerWr, OuterWr));
+
   if (!normalizeElementType(&OuterR, &InnerR)) {
     LLVM_DEBUG(dbgs() << "Cannot normalize element type\n");
     return OuterWr;
   }
+
   Region CombinedR;
   if (!combineRegions(&OuterR, &InnerR, &CombinedR))
     return OuterWr; // cannot combine
+
   // Calculate index if necessary.
-  if (InnerR.Indirect) {
+  if (InnerR.Indirect)
     calculateIndex(&OuterR, &InnerR, &CombinedR,
         InnerWr->getOperand(GenXIntrinsic::GenXRegion::WrIndexOperandNum),
         InnerWr->getName() + ".indexcollapsed", OuterWr, InnerWr->getDebugLoc());
-  }
+
   IGC_ASSERT(DL);
+
   // Bitcast inputs if necessary.
   Value *OldValInput = OuterRd->getOperand(GenXIntrinsic::GenXRegion::OldValueOperandNum);
   OldValInput = createBitCastToElementType(
@@ -1031,12 +1023,19 @@ Instruction *GenXRegionCollapsing::processWrRegionSplat(Instruction *OuterWr)
 {
   IGC_ASSERT(OuterWr);
   // Find the inner wrregion, skipping bitcasts.
-  auto InnerWr = dyn_cast<Instruction>(
+  auto *InnerWr = dyn_cast<Instruction>(
       OuterWr->getOperand(GenXIntrinsic::GenXRegion::NewValueOperandNum));
-  while (InnerWr && isa<BitCastInst>(InnerWr))
-    InnerWr = dyn_cast<Instruction>(InnerWr->getOperand(0));
-  if (!GenXIntrinsic::isWrRegion(InnerWr))
+
+  if (!InnerWr)
     return OuterWr;
+
+  InnerWr =
+      dyn_cast<Instruction>(genx::getBitCastedValue(cast<Value>(InnerWr)));
+
+  if (!GenXIntrinsic::isWrRegion(InnerWr) ||
+      !genx::isSafeToMoveInstCheckAVLoadKill(InnerWr, OuterWr))
+    return OuterWr;
+
   // Process inner wrregions first, recursively.
   InnerWr = processWrRegionSplat(InnerWr);
 
@@ -1252,6 +1251,7 @@ bool GenXRegionCollapsing::combineRegions(const Region *OuterR,
       }
     }
     unsigned BeyondEndEl = EndEl + InnerR->Stride;
+    IGC_ASSERT_EXIT(InnerR->Stride != 0);
     if (BeyondEndEl % OuterR->Width == StartEl % OuterR->Width
         && !(OuterR->Width % InnerR->Stride)) {
       // The 1D inner region is evenly split between N adjacent rows of the

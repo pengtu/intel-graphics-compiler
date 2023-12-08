@@ -72,6 +72,11 @@ static void* loadBinFile(
 
     fseek(fp, 0, SEEK_END);
     binSize = int_cast<int>(ftell(fp));
+    if(binSize <= 0)
+    {
+        fclose(fp);
+        return nullptr;
+    }
     rewind(fp);
 
     void* buf = malloc(sizeof(char)* binSize);
@@ -153,6 +158,11 @@ iga_gen_t GetIGAPlatform(PLATFORM const & platform)
         else if (ProductFamily == IGFX_PVC)
         {
             return IGA_XE_HPC;
+        }
+    case IGFX_XE2_LPG_CORE:
+        if (ProductFamily == IGFX_LUNARLAKE)
+        {
+            return IGA_XE2;
         }
     default:
         IGC_ASSERT_MESSAGE(0, "unsupported platform");

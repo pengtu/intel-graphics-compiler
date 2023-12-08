@@ -86,6 +86,8 @@ enum class XELatencyInfo : uint16_t {
   LSC_TYPED_L1 = 75,      // LSC typed L1 cache hit
   LSC_TYPED_L3 = 200,     // LSC typed L3 cache hit
   LSC_TYPED_FENCE = 60,   // LSC typed fence
+  ADDR_MOV = 2,
+  SEND_ARB = 8,          //The cycles for arbitration acquire and release of send
   UNKNOWN = std::numeric_limits<uint16_t>::max(),
 
   //
@@ -109,6 +111,7 @@ public:
   virtual uint16_t getOccupancy(const G4_INST *Inst) const = 0;
   // Implement different platform overrides for DPAS
   virtual uint16_t getDPASLatency(uint8_t repeatCount) const = 0;
+  virtual uint16_t getSendSrcReadLatency(const G4_INST *Inst) const = 0;
 
 protected:
   const IR_Builder &m_builder;

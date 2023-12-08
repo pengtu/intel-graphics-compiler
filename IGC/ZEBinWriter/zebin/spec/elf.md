@@ -47,7 +47,11 @@ EI_MAG3:    'F'
 EI_CLASS:   ELFCLASS32/ELFCLASS64 (for 32/64 objects)
 EI_DATA:    ELFDATA2LSB (2's complement, little endian)
 EI_VERSION: 1 (EV_CURRENT)
+EI_OSABI:   0 (ELFOSABI_NONE)
+EI_ABIVERSION: (See Below)
 EI_PAD:     0 (Start of padding bytes of e_ident)
+
+Value of `EI_ABIVERSION` is 1.
 ~~~
 
 **e_machine**
@@ -202,6 +206,6 @@ enum GenRelocType {
 In ZEBinary file for each kernel there is a corresponding ELF symbol with the
 same name as the kernel emitted in the .symtab. The kernel symbol is local and
 points to offset 0 of the section. Currently for each kernel a local symbol
-"_entry" is emitted to represent the actul kernel start. A kernel may start
-with some prolog code and it is useful to know the actual kernel start offset
-in some cases.
+"_entry" is emitted to represent the actual kernel start, and the symbol type is
+STT_NOTYPE and the size is 0. A kernel may start with some prolog code and it
+is useful to know the actual kernel start offset in some cases.

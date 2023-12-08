@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2017-2022 Intel Corporation
+Copyright (C) 2017-2023 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -17,6 +17,7 @@ SPDX-License-Identifier: MIT
 #include "llvm/IR/InstIterator.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/GenericDomTree.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/Linker/Linker.h"
@@ -632,11 +633,12 @@ bool PreCompiledFuncImport::runOnModule(Module& M)
     m_changed = false;
 
     // When we test it, we need to set emuKind
-    if (IGC_IS_FLAG_ENABLED(TestIGCPreCompiledFunctions))
+    if (IGC_GET_FLAG_VALUE(TestIGCPreCompiledFunctions) == 1)
     {
-        m_emuKind = EmuKind::EMU_DP;
+        m_emuKind = IGC_GET_FLAG_VALUE(ForceEmuKind) ? IGC_GET_FLAG_VALUE(ForceEmuKind) : EmuKind::EMU_DP;
         checkAndSetEnableSubroutine();
     }
+
     // sanity check
     if (m_emuKind == 0) {
         // Nothing to emulate
@@ -750,15 +752,15 @@ bool PreCompiledFuncImport::runOnModule(Module& M)
                 for (auto& I : BB) {
                     if (CallInst* CI = dyn_cast<CallInst>(&I)) {
                         if (Function* calledFunc = CI->getCalledFunction()) {
-                            if (calledFunc->getName().equals("GenISA_fma_rtz"))
+                            if (calledFunc->getName().startswith("GenISA_fma_rtz"))
                             {
                                 createIntrinsicCall(CI, GenISAIntrinsic::GenISA_fma_rtz);
                             }
-                            else if (calledFunc->getName().equals("GenISA_fma_rtp"))
+                            else if (calledFunc->getName().startswith("GenISA_fma_rtp"))
                             {
                                 createIntrinsicCall(CI, GenISAIntrinsic::GenISA_fma_rtp);
                             }
-                            else if (calledFunc->getName().equals("GenISA_fma_rtn"))
+                            else if (calledFunc->getName().startswith("GenISA_fma_rtn"))
                             {
                                 createIntrinsicCall(CI, GenISAIntrinsic::GenISA_fma_rtn);
                             }
@@ -788,15 +790,15 @@ bool PreCompiledFuncImport::runOnModule(Module& M)
                         {
                             if (Function* calledFunc = CI->getCalledFunction())
                             {
-                                if (calledFunc->getName().equals("GenISA_mul_rtz"))
+                                if (calledFunc->getName().startswith("GenISA_mul_rtz"))
                                 {
                                     createIntrinsicCall(CI, GenISAIntrinsic::GenISA_mul_rtz);
                                 }
-                                else if (calledFunc->getName().equals("GenISA_add_rtz"))
+                                else if (calledFunc->getName().startswith("GenISA_add_rtz"))
                                 {
                                     createIntrinsicCall(CI, GenISAIntrinsic::GenISA_add_rtz);
                                 }
-                                else if (calledFunc->getName().equals("GenISA_uitof_rtz"))
+                                else if (calledFunc->getName().startswith("GenISA_uitof_rtz"))
                                 {
                                     createIntrinsicCall(CI, GenISAIntrinsic::GenISA_uitof_rtz);
                                 }
@@ -808,7 +810,7 @@ bool PreCompiledFuncImport::runOnModule(Module& M)
         }
     }
 
-    for (auto p : replaceInsts)
+    for (const auto &p : replaceInsts)
     {
         p.first->replaceAllUsesWith(p.second);
         p.first->eraseFromParent();
@@ -826,12 +828,11 @@ bool PreCompiledFuncImport::runOnModule(Module& M)
         }
     }
 
-    unsigned totalNumberOfInlinedInst = 0;
+    llvm::SmallVector<ImportedFunction, 32> importedFunctions;
+    unsigned totalNumberOfInlinedInst = 0, totalNumberOfPotentiallyInlinedInst = 0;
     int emuFC = (int)IGC_GET_FLAG_VALUE(EmulationFunctionControl);
 
-    // Post processing, set those imported functions as internal linkage
-    // and alwaysinline. Also count how many instructions would be added
-    // to the shader if inlining occurred.
+    // Post processing, set those imported functions as internal linkage.
     for (auto II = M.begin(), IE = M.end(); II != IE; )
     {
         Function* Func = &(*II);
@@ -853,40 +854,8 @@ bool PreCompiledFuncImport::runOnModule(Module& M)
                 continue;
             }
 
-            // Remove noinline/AlwaysInline attr if present.
-            Func->removeFnAttr(llvm::Attribute::NoInline);
-            Func->removeFnAttr(llvm::Attribute::AlwaysInline);
-
-            if (m_enableCallForEmulation &&
-                emuFC != FLAG_FCALL_DEFAULT &&
-                emuFC != FLAG_FCALL_FORCE_INLINE)
-            {
-                // Disable inlining completely.
-                continue;
-            }
-
-            if (Func->hasOneUse() || emuFC == FLAG_FCALL_FORCE_INLINE)
-            {
-                Func->addFnAttr(llvm::Attribute::AlwaysInline);
-                continue;
-            }
-
-            // Count number of instructions in the function
-            unsigned NumInst = 0;
-            for (BasicBlock& BB : Func->getBasicBlockList()) {
-                NumInst += BB.getInstList().size();
-            }
-
-            // Don't want to subroutine small functions
-            if (NumInst <= 5)
-            {
-                // Add AlwaysInline attribute to force inlining all calls.
-                Func->addFnAttr(llvm::Attribute::AlwaysInline);
-
-                continue;
-            }
-
-            totalNumberOfInlinedInst += NumInst * Func->getNumUses();
+            if (std::find(importedFunctions.begin(), importedFunctions.end(), Func) == importedFunctions.end())
+                importedFunctions.push_back(Func);
         }
         else
         {
@@ -895,42 +864,88 @@ bool PreCompiledFuncImport::runOnModule(Module& M)
         }
     }
 
-    // If true, it is a slow version of DP emu functions. Those functions
-    // are the original ones for just passing conformance, not for perf.
-    auto isSlowDPEmuFunc = [](Function* F) {
-        StringRef FN = F->getName();
-        if (FN.equals("__igcbuiltin_dp_add") ||
-            FN.equals("__igcbuiltin_dp_sub") ||
-            FN.equals("__igcbuiltin_dp_fma") ||
-            FN.equals("__igcbuiltin_dp_mul") ||
-            FN.equals("__igcbuiltin_dp_div") ||
-            FN.equals("__igcbuiltin_dp_cmp") ||
-            FN.equals("__igcbuiltin_dp_to_int32") ||
-            FN.equals("__igcbuiltin_dp_to_uint32") ||
-            FN.equals("__igcbuiltin_int32_to_dp") ||
-            FN.equals("__igcbuiltin_uint32_to_dp") ||
-            FN.equals("__igcbuiltin_dp_to_sp") ||
-            FN.equals("__igcbuiltin_sp_to_dp") ||
-            FN.equals("__igcbuiltin_dp_sqrt")) {
-            return true;
-        }
-        return false;
-    };
+    // Sort imported instructions in preferred inlining order.
+    std::sort(importedFunctions.begin(), importedFunctions.end(), ImportedFunction::compare);
 
-    for (auto II = M.begin(), IE = M.end(); II != IE; )
+    // Post processing, set those imported functions as alwaysinline.
+    // Also count how many instructions would be added to the shader
+    // if inlining occurred.
+    for (auto II = importedFunctions.begin(), IE = importedFunctions.end(); II != IE; ++II)
     {
-        Function* Func = &(*II);
-        ++II;
-        if (!Func || Func->isDeclaration())
+        Function* Func = II->F;
+
+        // Remove noinline/AlwaysInline attr if present.
+        Func->removeFnAttr(llvm::Attribute::NoInline);
+        Func->removeFnAttr(llvm::Attribute::AlwaysInline);
+
+        if (m_enableCallForEmulation &&
+            emuFC != FLAG_FCALL_DEFAULT &&
+            emuFC != FLAG_FCALL_FORCE_INLINE)
         {
+            // Disable inlining completely.
             continue;
         }
 
-        if (!origFunctions.count(Func) && !Func->hasFnAttribute(llvm::Attribute::AlwaysInline))
+        if (Func->hasOneUse() || emuFC == FLAG_FCALL_FORCE_INLINE)
+        {
+            Func->addFnAttr(llvm::Attribute::AlwaysInline);
+            continue;
+        }
+
+        // Don't want to subroutine small functions
+        if (II->funcInstructions <= 5)
+        {
+            // Add AlwaysInline attribute to force inlining all calls.
+            Func->addFnAttr(llvm::Attribute::AlwaysInline);
+
+            continue;
+        }
+
+        // Don't inline original slow DP emu functions, they are only for passing
+        // conformance, not for perf.
+        if (isDPEmu() && II->isSlowDPEmuFunc())
+            continue;
+
+        totalNumberOfPotentiallyInlinedInst += II->totalInstructions;
+
+        // If function fits in threshold, always inline.
+        if (totalNumberOfInlinedInst + II->totalInstructions <= (unsigned)IGC_GET_FLAG_VALUE(InlinedEmulationThreshold))
+        {
+            totalNumberOfInlinedInst += II->totalInstructions;
+            Func->addFnAttr(llvm::Attribute::AlwaysInline);
+        }
+    }
+
+    // Check if more functions can fit in threshold if they would be split into inline/noinline copies.
+    if (m_enableCallForEmulation && emuFC == FLAG_FCALL_DEFAULT && totalNumberOfInlinedInst < (unsigned)IGC_GET_FLAG_VALUE(InlinedEmulationThreshold))
+    {
+        for (auto II = importedFunctions.begin(); II != importedFunctions.end(); ++II)
+        {
+            Function* Func = II->F;
+
+            if (Func->hasFnAttribute(llvm::Attribute::AlwaysInline) || (isDPEmu() && II->isSlowDPEmuFunc()))
+                continue;
+
+            unsigned calls = ((unsigned)IGC_GET_FLAG_VALUE(InlinedEmulationThreshold) - totalNumberOfInlinedInst) / II->funcInstructions;
+            if (calls > 0)
+            {
+                // Split function into inline/no-inline copies.
+                ImportedFunction copy = createInlinedCopy(*II, calls);
+                importedFunctions.push_back(copy);
+                totalNumberOfInlinedInst += copy.totalInstructions;
+            }
+        }
+    }
+
+    for (auto II = importedFunctions.begin(), IE = importedFunctions.end(); II != IE; ++II)
+    {
+        Function* Func = II->F;
+
+        if (!Func->hasFnAttribute(llvm::Attribute::AlwaysInline))
         {
             // Special handling of DP functions: any one that has not been marked as inline
             // at this point, it will be either subroutine or stackcall.
-            const bool isDPCallFunc = (isDPEmu() && isSlowDPEmuFunc(Func));
+            const bool isDPCallFunc = (isDPEmu() && II->isSlowDPEmuFunc());
 
             // Use subroutine/stackcall for some DP emulation functions if
             // EmulationFunctionControl is set so, or
@@ -938,7 +953,7 @@ bool PreCompiledFuncImport::runOnModule(Module& M)
             // all emulated functions are inlined exceed InlinedEmulationThreshold.
             // If Func is a slow version of DP emu func, perf isn't important.
             if (m_enableCallForEmulation &&
-                (totalNumberOfInlinedInst > (unsigned)IGC_GET_FLAG_VALUE(InlinedEmulationThreshold) ||
+                (totalNumberOfPotentiallyInlinedInst > (unsigned)IGC_GET_FLAG_VALUE(InlinedEmulationThreshold) ||
                  isDPCallFunc))
             {
                 Func->addFnAttr(llvm::Attribute::NoInline);
@@ -983,7 +998,7 @@ bool PreCompiledFuncImport::runOnModule(Module& M)
         }
 
         // free FuncsImpArgs
-        for (auto I : FuncsImpArgs) {
+        for (const auto &I : FuncsImpArgs) {
             ImplicitArgs* IA = I.second;
             delete IA;
         }
@@ -1001,6 +1016,128 @@ bool PreCompiledFuncImport::runOnModule(Module& M)
 #endif
 
     return m_changed;
+}
+
+PreCompiledFuncImport::ImportedFunction::ImportedFunction(Function* F)
+    : F(F), type(EmuType::OTHER), funcInstructions(0), totalInstructions(0)
+{
+    // Count number of new instructions added by inlining.
+    for (BasicBlock& BB : F->getBasicBlockList())
+        funcInstructions += BB.getInstList().size();
+
+    updateUses();
+
+    // Get type of imported function.
+    StringRef name = F->getName();
+
+    if (name.equals("__igcbuiltin_dp_div_nomadm_ieee") ||
+        name.equals("__igcbuiltin_dp_div_nomadm_fast") ||
+        name.equals("__igcbuiltin_dp_sqrt_nomadm_ieee") ||
+        name.equals("__igcbuiltin_dp_sqrt_nomadm_fast"))
+    {
+        type = EmuType::FASTDP;
+    }
+    else if (name.equals("__igcbuiltin_dp_add") ||
+        name.equals("__igcbuiltin_dp_sub") ||
+        name.equals("__igcbuiltin_dp_fma") ||
+        name.equals("__igcbuiltin_dp_mul") ||
+        name.equals("__igcbuiltin_dp_div") ||
+        name.equals("__igcbuiltin_dp_cmp") ||
+        name.equals("__igcbuiltin_dp_to_int32") ||
+        name.equals("__igcbuiltin_dp_to_uint32") ||
+        name.equals("__igcbuiltin_int32_to_dp") ||
+        name.equals("__igcbuiltin_uint32_to_dp") ||
+        name.equals("__igcbuiltin_dp_to_sp") ||
+        name.equals("__igcbuiltin_sp_to_dp") ||
+        name.equals("__igcbuiltin_dp_sqrt"))
+    {
+        // If true, it is a slow version of DP emu functions. Those functions
+        // are the original ones for just passing conformance, not for perf.
+        type = EmuType::SLOWDP;
+    }
+    else
+    {
+        for (int i = 0; i < NUM_FUNCTIONS && type == EmuType::OTHER; ++i)
+        {
+            for (int j = 0; j < NUM_TYPES && type == EmuType::OTHER; ++j)
+            {
+                if (name.equals(m_Int64SpDivRemFunctionNames[i][j]) ||
+                    name.equals(m_Int64DpDivRemFunctionNames[i][j]))
+                {
+                    type = EmuType::INT64;
+                }
+            }
+        }
+    }
+}
+
+void PreCompiledFuncImport::ImportedFunction::updateUses()
+{
+    totalInstructions = funcInstructions * F->getNumUses();
+}
+
+PreCompiledFuncImport::ImportedFunction PreCompiledFuncImport::ImportedFunction::copy(ImportedFunction& other)
+{
+    ValueToValueMapTy VM;
+    Function* copy = CloneFunction(other.F, VM);
+    return PreCompiledFuncImport::ImportedFunction(copy, other.type, other.funcInstructions, 0);
+}
+
+// Compare two imported functions in order preferred for inlining.
+bool PreCompiledFuncImport::ImportedFunction::compare(ImportedFunction& L, ImportedFunction& R)
+{
+    // First sort by preferred type of emulation.
+    if (L.type != R.type)
+        return L.type < R.type;
+
+    // Then sort by number of inlined instructions.
+    return L.totalInstructions < R.totalInstructions;
+};
+
+PreCompiledFuncImport::ImportedFunction PreCompiledFuncImport::createInlinedCopy(ImportedFunction& IF, unsigned n)
+{
+    std::vector<CallInst*> toDelete;
+
+    // Make copy that is always inlined.
+    ImportedFunction copy = ImportedFunction::copy(IF);
+    copy.F->setName(IF.F->getName() + "_always_inline");
+    copy.F->addFnAttr(llvm::Attribute::AlwaysInline);
+
+    // Collect first n calls to replace with copy.
+    llvm::SmallVector<CallInst*, 8> calls;
+    auto it = IF.F->user_begin();
+    for (unsigned i = 0; i < n; ++i)
+    {
+        CallInst* oldCall = dyn_cast<CallInst>(*(it++));
+        IGC_ASSERT(oldCall);
+        calls.push_back(oldCall);
+    }
+
+    // Replace with always inlined copy.
+    for (CallInst* oldCall : calls)
+    {
+        std::vector<Value*> args;
+        for (unsigned arg = 0; arg < IGCLLVM::getNumArgOperands(oldCall); ++arg)
+            args.push_back(oldCall->getArgOperand(arg));
+
+        // Create new call and insert it before old one
+        CallInst* newCall = CallInst::Create(copy.F, args, "", oldCall);
+
+        newCall->setCallingConv(copy.F->getCallingConv());
+        newCall->setAttributes(oldCall->getAttributes());
+        newCall->setDebugLoc(oldCall->getDebugLoc());
+
+        oldCall->replaceAllUsesWith(newCall);
+        toDelete.push_back(oldCall);
+    }
+
+    for (auto C : toDelete)
+        C->eraseFromParent();
+
+    copy.updateUses();
+    IF.updateUses();
+
+    return copy;
 }
 
 void PreCompiledFuncImport::visitBinaryOperator(BinaryOperator& I)
@@ -2351,11 +2488,11 @@ bool PreCompiledFuncImport::usePrivateMemory(Function* F)
 
 void PreCompiledFuncImport::addMDFuncEntryForEmulationFunc(Function* F)
 {
-    FunctionInfoMetaDataHandle FH = FunctionInfoMetaDataHandle(FunctionInfoMetaData::get());
+    FunctionInfoMetaDataHandle FH = FunctionInfoMetaDataHandle(new FunctionInfoMetaData());
     FH->setType(FunctionTypeMD::UserFunction);
     for (auto arg = F->arg_begin(); arg != F->arg_end(); ++arg)
     {
-        ArgInfoMetaDataHandle AH = ArgInfoMetaDataHandle(ArgInfoMetaData::get());
+        ArgInfoMetaDataHandle AH = ArgInfoMetaDataHandle(new ArgInfoMetaData());
         AH->setExplicitArgNum(arg->getArgNo());
         FH->addArgInfoListItem(AH);
     }
@@ -2365,10 +2502,10 @@ void PreCompiledFuncImport::addMDFuncEntryForEmulationFunc(Function* F)
         return;
 
     // Add private base
-    ArgInfoMetaDataHandle arg_R0 = ArgInfoMetaDataHandle(ArgInfoMetaData::get());
+    ArgInfoMetaDataHandle arg_R0 = ArgInfoMetaDataHandle(new ArgInfoMetaData());
     arg_R0->setArgId(ImplicitArg::R0);
     FH->addImplicitArgInfoListItem(arg_R0);
-    ArgInfoMetaDataHandle arg_PBase = ArgInfoMetaDataHandle(ArgInfoMetaData::get());
+    ArgInfoMetaDataHandle arg_PBase = ArgInfoMetaDataHandle(new ArgInfoMetaData());
     arg_PBase->setArgId(ImplicitArg::PRIVATE_BASE);
     FH->addImplicitArgInfoListItem(arg_PBase);
 
@@ -2547,6 +2684,7 @@ void PreCompiledFuncImport::checkAndSetEnableSubroutine()
     bool SPDiv = isSPDiv();
     bool DPEmu = isDPEmu();
     bool DPDivSqrtEmu = isDPDivSqrtEmu();
+    bool I64DivRem = isI64DivRem();
 
     Module* M = m_pCtx->getModule();
     for (auto FI = M->begin(), FE = M->end(); FI != FE; ++FI)
@@ -2585,6 +2723,15 @@ void PreCompiledFuncImport::checkAndSetEnableSubroutine()
             case Instruction::UIToFP:
             case Instruction::FPExt:
                 if (DPEmu && I->getType()->isDoubleTy())
+                {
+                    m_enableCallForEmulation = true;
+                }
+                break;
+            case Instruction::UDiv:
+            case Instruction::URem:
+            case Instruction::SDiv:
+            case Instruction::SRem:
+                if (I64DivRem && I->getOperand(0)->getType()->isIntegerTy(64))
                 {
                     m_enableCallForEmulation = true;
                 }

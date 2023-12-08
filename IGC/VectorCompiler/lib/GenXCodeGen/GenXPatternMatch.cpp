@@ -198,6 +198,7 @@ private:
   bool simplifyNullDst(CallInst *Inst);
   // Transform logic operation with a mask from <N x iM> to <N/(32/M) x i32>
   bool extendMask(BinaryOperator *BO);
+  bool mergeApply(CallInst *CI);
 };
 
 } // namespace
@@ -428,11 +429,8 @@ private:
 // the jitter to produce better code for these cases.
 class MinMaxMatcher {
 public:
-  explicit MinMaxMatcher(Instruction *I)
-      : SelInst(I), CmpInst(nullptr), ID(GenXIntrinsic::not_any_intrinsic) {
-    IGC_ASSERT_MESSAGE(I, "null instruction");
-    Srcs[0] = Srcs[1] = nullptr;
-    Annotation = 0;
+  explicit MinMaxMatcher(Instruction *I) : SelInst(I) {
+    IGC_ASSERT_EXIT_MESSAGE(I, "null instruction");
   }
 
   // Match select instruction that are equivalent to min/max
@@ -446,26 +444,21 @@ private:
   // Return true if changes are made.
   bool emit();
 
-  void setSelInst(Instruction *I) { SelInst = I; }
+  Type *getMinMaxType() const;
 
 private:
   // The select instruction
-  Instruction *SelInst;
-
+  Instruction *SelInst = nullptr;
   // The compare instruction
-  llvm::CmpInst *CmpInst;
-
+  llvm::CmpInst *CmpInst = nullptr;
   // The min/max intrinsic ID.
-  unsigned ID;
-
+  unsigned ID = GenXIntrinsic::not_any_intrinsic;
   // Source operands for the min/max intrinsic call
-  Value *Srcs[2];
-
+  Value *Srcs[2]{nullptr};
   // Effective operands for the cmp ignoring some casts
-  Value *CmpSrcs[2];
-
+  Value *CmpSrcs[2]{nullptr};
   // Annotation for the min/max call
-  const char *Annotation;
+  const char *Annotation = nullptr;
 };
 
 } // namespace
@@ -717,6 +710,7 @@ void GenXPatternMatch::visitICmpInst(ICmpInst &I) {
           IGC_ASSERT(OpStack.size() >= 1);
           LHS = OpStack.pop_back_val();
           OpStack.push_back(Builder.CreateNot(LHS));
+          continue;
         }
         IGC_ASSERT_MESSAGE(0, "Unhandled logic op!");
       }
@@ -1071,6 +1065,10 @@ bool FmaMatcher::isProfitable() const {
   if (AddSub->use_empty())
     return false;
 
+  // Do not match x * y +/- 0.0f
+  if (const auto *C = dyn_cast<Constant>(Srcs[2]); C && C->isZeroValue())
+    return false;
+
   unsigned IndirectCount =
       count_if(Srcs, [](auto *Src) { return isIndirectRdRegion(Src); });
 
@@ -1121,11 +1119,10 @@ bool MadMatcher::isProfitable() const {
   // multiple use cases. May need to revisit. if (!MInst->hasOneUse())
   //   return false;
 
-  // Do not match x * y +/- 0.0f
-  // FIXME: specify fp mode. ICL certainly is not strict in general.
-  if (Constant *C = dyn_cast<Constant>(Srcs[2]))
-    if (C->isZeroValue())
-      return false;
+  // Do not match constant add. I was getting bad results from allowing this,
+  // although it may have been largely from scalar address computations.
+  if (isa<Constant>(Srcs[2]))
+    return false;
 
   // Ignores upward which usually will be performed by copy
   // propagation within jitter.
@@ -1144,12 +1141,6 @@ bool MadMatcher::isProfitable() const {
       (isIndirectRdRegion(Vals[0]) && isIndirectRdRegion(Vals[1])))
     // For integer mad, we only support indirect access on one of
     // multiplicative operands.
-    return false;
-
-  // This is an integer mad.
-  // Do not match constant add. I was getting bad results from allowing this,
-  // although it may have been largely from scalar address computations.
-  if (isa<Constant>(Srcs[2]))
     return false;
 
   // Do not match unless both of multiplicants are of type *B/*W
@@ -1851,10 +1842,8 @@ bool MinMaxMatcher::valuesMatch(llvm::Value *Op1, llvm::Value *Op2) {
 
   if (C1Ty->isFloatingPointTy() && C2Ty->isFloatingPointTy()) {
     for (unsigned i = 0, e = C1->getNumElements(); i < e; ++i) {
-      double C1Val = C1Ty->isFloatTy() ? C1->getElementAsFloat(i)
-                                       : C1->getElementAsDouble(i);
-      double C2Val = C2Ty->isFloatTy() ? C2->getElementAsFloat(i)
-                                       : C2->getElementAsDouble(i);
+      double C1Val = C1->getElementAsAPFloat(i).convertToDouble();
+      double C2Val = C2->getElementAsAPFloat(i).convertToDouble();
       if (C1Val != C2Val)
         return false;
     }
@@ -1953,18 +1942,41 @@ bool MinMaxMatcher::matchMinMax() {
   return emit();
 }
 
+Type *MinMaxMatcher::getMinMaxType() const {
+  switch (ID) {
+  default:
+    break;
+  case GenXIntrinsic::genx_fmin:
+  case GenXIntrinsic::genx_fmax:
+    return CmpInst->getOperand(0)->getType();
+  case GenXIntrinsic::genx_smax:
+  case GenXIntrinsic::genx_smin:
+  case GenXIntrinsic::genx_umax:
+  case GenXIntrinsic::genx_umin:
+    return SelInst->getType();
+  }
+  return nullptr;
+}
+
 bool MinMaxMatcher::emit() {
   if ((ID == GenXIntrinsic::not_any_intrinsic) || (Srcs[0] == nullptr) ||
       (Srcs[1] == nullptr))
     return false;
 
   IRBuilder<> Builder(SelInst);
-  Module *M = SelInst->getModule();
-  Type *Tys[2] = {SelInst->getType(), Srcs[0]->getType()};
-  Function *Fn = GenXIntrinsic::getAnyDeclaration(M, ID, Tys);
-  CallInst *CI = Builder.CreateCall(Fn, Srcs, Annotation);
-  CI->setDebugLoc(SelInst->getDebugLoc());
-  SelInst->replaceAllUsesWith(CI);
+  auto *M = SelInst->getModule();
+
+  auto *Ty = getMinMaxType();
+  IGC_ASSERT_EXIT(Ty);
+
+  auto *Func = GenXIntrinsic::getAnyDeclaration(M, ID, {Ty, Ty});
+  SmallVector<Value *, 2> Args = {Builder.CreateBitCast(Srcs[0], Ty),
+                                  Builder.CreateBitCast(Srcs[1], Ty)};
+
+  auto *CI = Builder.CreateCall(Func, Args, Annotation);
+  auto *Cast = Builder.CreateBitCast(CI, SelInst->getType());
+
+  SelInst->replaceAllUsesWith(Cast);
 
   NumOfMinMaxMatched++;
   return true;
@@ -2022,58 +2034,19 @@ findOptimalInsertionPos(Instruction *I, Instruction *Ref, DominatorTree *DT,
   return Pos;
 }
 
-// For the specified constant, calculate its reciprocal if it's safe;
-// otherwise, return null.
-static Constant *getReciprocal(Constant *C, bool HasAllowReciprocal) {
-  IGC_ASSERT_MESSAGE(C->getType()->isFPOrFPVectorTy(),
-                     "Floating point value is expected!");
-
-  // TODO: remove this and use ConstantExpr::getFDiv.
-
-  // Reciprocal of undef can be undef.
-  if (isa<UndefValue>(C))
-    return C;
-
-  if (ConstantFP *CFP = dyn_cast<ConstantFP>(C)) {
-    // Compute the reciprocal of C.
-    const APFloat &Divisor = CFP->getValueAPF();
-    APFloat Rcp(Divisor.getSemantics(), 1U);
-    APFloat::opStatus Status =
-        Rcp.divide(Divisor, APFloat::rmNearestTiesToEven);
-    // Only fold it if it's safe.
-    if (Status == APFloat::opOK ||
-        (HasAllowReciprocal && Status == APFloat::opInexact))
-      return ConstantFP::get(C->getType()->getContext(), Rcp);
-    return nullptr;
-  }
-
-  auto *VTy = cast<IGCLLVM::FixedVectorType>(C->getType());
-  IntegerType *ITy = Type::getInt32Ty(VTy->getContext());
-
-  SmallVector<Constant *, 16> Result;
-  for (unsigned i = 0, e = VTy->getNumElements(); i != e; ++i) {
-    Constant *Elt =
-        ConstantExpr::getExtractElement(C, ConstantInt::get(ITy, i));
-    Constant *Rcp = getReciprocal(Elt, HasAllowReciprocal);
-    // Skip if any of elements fails to be folded as reciprocal.
-    if (!Rcp)
-      return nullptr;
-    Result.push_back(Rcp);
-  }
-  return ConstantVector::get(Result);
-}
-
 // For the given value, calculate its reciprocal and performance constant
 // folding if allowed.
 static Value *getReciprocal(IRBuilder<> &IRB, Value *V,
                             bool HasAllowReciprocal = true) {
+  Module *M = IRB.GetInsertBlock()->getModule();
   if (Constant *C = dyn_cast<Constant>(V))
-    return getReciprocal(C, HasAllowReciprocal);
+    return ConstantFoldBinaryOpOperands(Instruction::FDiv,
+                                        ConstantFP::get(C->getType(), 1.0), C,
+                                        M->getDataLayout());
 
   if (!HasAllowReciprocal)
     return nullptr;
 
-  Module *M = IRB.GetInsertBlock()->getModule();
   Twine Name = V->getName() + ".inv";
   auto Func = GenXIntrinsic::getGenXDeclaration(M, GenXIntrinsic::genx_inv,
                                                 V->getType());
@@ -2112,7 +2085,8 @@ void GenXPatternMatch::visitFDiv(BinaryOperator &I) {
   Value *Op1 = I.getOperand(1);
   // Constant folding Op1 if it's safe.
   if (Constant *C1 = dyn_cast<Constant>(Op1)) {
-    Constant *Rcp = getReciprocal(C1, I.hasAllowReciprocal());
+    Constant *Rcp = ConstantFoldBinaryOpOperands(
+        Instruction::FDiv, ConstantFP::get(C1->getType(), 1.0), C1, *DL);
     if (!Rcp)
       return;
     IRB.setFastMathFlags(I.getFastMathFlags());
@@ -2122,6 +2096,10 @@ void GenXPatternMatch::visitFDiv(BinaryOperator &I) {
     Changed |= true;
     return;
   }
+
+  // Skip if FP64 emulation is required for this platform
+  if (ST->emulateFDivFSqrt64() && I.getType()->getScalarType()->isDoubleTy())
+    return;
 
   // Skip if reciprocal optimization is not allowed.
   if (!I.hasAllowReciprocal())
@@ -3077,7 +3055,7 @@ bool GenXPatternMatch::decomposeSelect(Function *F) {
   return SD.run();
 }
 
-bool mergeApply(CallInst *CI) {
+bool GenXPatternMatch::mergeApply(CallInst *CI) {
   auto IID = vc::InternalIntrinsic::getInternalIntrinsicID(CI);
   switch (IID) {
   default:
@@ -3110,9 +3088,13 @@ bool mergeApply(CallInst *CI) {
   if (Select->getCondition() != Pred || Select->getTrueValue() != CI)
     return false;
 
+  auto *PassthruVal = Select->getFalseValue();
+  if (auto *FalseValInst = dyn_cast<Instruction>(PassthruVal))
+    if (!DT->dominates(FalseValInst, CI))
+      return false;
+
   // Passthru argument is always last for lsc_* intrinsics
   auto PassthruIndex = IGCLLVM::getNumArgOperands(CI) - 1;
-  auto *PassthruVal = Select->getFalseValue();
   CI->setArgOperand(PassthruIndex, PassthruVal);
   Select->replaceAllUsesWith(CI);
 

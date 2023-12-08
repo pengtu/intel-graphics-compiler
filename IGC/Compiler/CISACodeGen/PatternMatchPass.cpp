@@ -165,12 +165,14 @@ namespace IGC
     {
         if (llvm::isa<llvm::DbgInfoIntrinsic>(&inst))
         {
+            // FIXME: We probably don't need that.
             return true;
         }
-        if (DebugMetadataInfo::hasDashGOption(m_ctx) &&
-            inst.getMetadata("perThreadOffset") != nullptr)
+        // perThreadOffset is special variable we should be alive for O0 runs.
+        // This is intended for debug, but we do it for non-debug too to
+        // avoid altering generated code by adding -g.
+        if (m_ctx->getModuleMetaData()->compOpt.OptDisable && inst.getMetadata("perThreadOffset"))
         {
-            // debugging needs this
             return true;
         }
         return false;
@@ -1277,6 +1279,8 @@ namespace IGC
             case GenISAIntrinsic::GenISA_icmpxchgatomictyped:
             case GenISAIntrinsic::GenISA_typedread:
             case GenISAIntrinsic::GenISA_typedwrite:
+            case GenISAIntrinsic::GenISA_floatatomictyped:
+            case GenISAIntrinsic::GenISA_fcmpxchgatomictyped:
             case GenISAIntrinsic::GenISA_ldstructured:
             case GenISAIntrinsic::GenISA_storestructured1:
             case GenISAIntrinsic::GenISA_storestructured2:
@@ -1289,9 +1293,12 @@ namespace IGC
             case GenISAIntrinsic::GenISA_ldraw_indexed:
             case GenISAIntrinsic::GenISA_storerawvector_indexed:
             case GenISAIntrinsic::GenISA_storeraw_indexed:
-                match = supportsLSCImmediateGlobalBaseOffset() ?
-                    MatchImmOffsetLSC(I) || MatchSingleInstruction(I) :
-                    MatchSingleInstruction(I);
+                if (supportsLSCImmediateGlobalBaseOffset()) {
+                    match = MatchImmOffsetLSC(I);
+                    if (match)
+                        return;
+                }
+                match = MatchSingleInstruction(I);
                 break;
             case GenISAIntrinsic::GenISA_GradientX:
             case GenISAIntrinsic::GenISA_GradientY:
@@ -1805,7 +1812,7 @@ namespace IGC
             }
         };
         bool match = false;
-        e_modifier mod;
+        e_modifier mod{};
         Value* source = nullptr;
         if (GetModifier(I, mod, source))
         {
@@ -4504,8 +4511,8 @@ namespace IGC
                 return false;
             }
 
-            llvm::Value* selSources[2];
-            e_modifier   selMod[2];
+            llvm::Value* selSources[2] = {};
+            e_modifier   selMod[2] = {};
             selSources[0] = I.getOperand(1);
             selSources[1] = I.getOperand(2);
 
@@ -4940,8 +4947,8 @@ namespace IGC
         };
 
         bool found = false;
-        llvm::Value* sources[2];
-        e_modifier   src_mod[2];
+        llvm::Value* sources[2] = {};
+        e_modifier   src_mod[2] = {};
 
         IGC_ASSERT(I.getOpcode() == Instruction::SDiv || I.getOpcode() == Instruction::UDiv || I.getOpcode() == Instruction::AShr);
 

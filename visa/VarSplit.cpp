@@ -42,7 +42,7 @@ void LoopVarSplit::run() {
   //    b. if decision is to split, then check which loop(s) to split around
 
   std::list<std::pair<G4_Declare *, float>> sortedDcls;
-  for (auto item : dclSpillCost) {
+  for (const auto &item : dclSpillCost) {
     if (spilledDclSet.find(item.first) != spilledDclSet.end())
       sortedDcls.push_back(std::pair(item.first, item.second));
   }
@@ -60,7 +60,7 @@ void LoopVarSplit::run() {
   // cases, it is beneficial to split the variable around such loops. To
   // accommodate such cases, we should be looking at reference count of
   // variables in loops and iterate in an order based on that.
-  for (auto var : sortedDcls) {
+  for (const auto &var : sortedDcls) {
     const auto &loops = getLoopsToSplitAround(var.first);
     for (auto &loop : loops) {
       split(var.first, *loop);
@@ -74,7 +74,7 @@ std::vector<G4_SrcRegRegion *> LoopVarSplit::getReads(G4_Declare *dcl,
   std::unordered_set<G4_INST *> duplicates;
 
   const auto &uses = references.getUses(dcl);
-  for (auto use : *uses) {
+  for (const auto &use : *uses) {
     auto bb = std::get<1>(use);
     if (loop.contains(bb)) {
       auto inst = std::get<0>(use);
@@ -100,7 +100,7 @@ std::vector<G4_DstRegRegion *> LoopVarSplit::getWrites(G4_Declare *dcl,
   std::vector<G4_DstRegRegion *> writes;
 
   const auto &defs = references.getDefs(dcl);
-  for (auto def : *defs) {
+  for (const auto &def : *defs) {
     auto bb = std::get<1>(def);
     if (loop.contains(bb)) {
       auto dst = std::get<0>(def)->getDst();
@@ -131,9 +131,9 @@ unsigned int LoopVarSplit::getMaxRegPressureInLoop(Loop &loop) {
 }
 
 void LoopVarSplit::dump(std::ostream &of) {
-  for (auto dcl : splitResults) {
+  for (const auto &dcl : splitResults) {
     of << "Spilled dcl: " << dcl.first->getName() << "\n";
-    for (auto split : dcl.second) {
+    for (const auto &split : dcl.second) {
       of << "\tSplit dcl: " << split.first->getName() << ", for loop L"
          << split.second->id << "\n";
     }
@@ -207,7 +207,7 @@ void LoopVarSplit::removeSplitInsts(GlobalRA *gra, G4_Declare *spillDcl,
     return;
 
   auto &bbInstsToRemove = (*it).second.insts;
-  for (auto entry : bbInstsToRemove) {
+  for (const auto &entry : bbInstsToRemove) {
     auto currBB = entry.first;
 
     if (currBB == bb) {
@@ -301,14 +301,16 @@ bool LoopVarSplit::split(G4_Declare *dcl, Loop &loop) {
   splitData.origDcl = dcl;
   bool isDefault32bMask = coloring->getGRA().getAugmentationMask(dcl) ==
                           AugmentationMasks::Default32Bit;
+  bool isDefault64bMask = coloring->getGRA().getAugmentationMask(dcl) ==
+                          AugmentationMasks::Default64Bit;
 
   // emit TMP = dcl in preheader
-  copy(loop.preHeader, splitDcl, dcl, &splitData, isDefault32bMask);
+  copy(loop.preHeader, splitDcl, dcl, &splitData, isDefault32bMask, isDefault64bMask);
 
   // emit dcl = TMP in loop exit
   if (dsts.size() > 0) {
     copy(loop.getLoopExits().front(), dcl, splitDcl, &splitData,
-         isDefault32bMask, /*pushBack*/ false);
+         isDefault32bMask, isDefault64bMask, /*pushBack*/ false);
   }
 
   // replace all occurences of dcl in loop with TMP
@@ -325,7 +327,7 @@ bool LoopVarSplit::split(G4_Declare *dcl, Loop &loop) {
 
 void LoopVarSplit::copy(G4_BB *bb, G4_Declare *dst, G4_Declare *src,
                         SplitResults *splitData, bool isDefault32bMask,
-                        bool pushBack) {
+                        bool isDefault64bMask, bool pushBack) {
   // create mov instruction to copy dst->src
   // multiple mov instructions may be created depending on size of dcls
   // all mov instructions are appended to inst list of bb
@@ -337,6 +339,7 @@ void LoopVarSplit::copy(G4_BB *bb, G4_Declare *dst, G4_Declare *src,
   src = src->getRootDeclare();
   unsigned int numRows = dst->getNumRows();
   unsigned int bytesRemaining = dst->getByteSize();
+  const unsigned int maxDstSize = 2;
 
   auto insertCopy = [&](G4_INST *inst) {
     if (pushBack || bb->size() == 0) {
@@ -385,9 +388,10 @@ void LoopVarSplit::copy(G4_BB *bb, G4_Declare *dst, G4_Declare *src,
       const RegionDesc *rd = kernel.fg.builder->getRegionStride1();
       G4_ExecSize execSize{kernel.numEltPerGRF<Type_UD>()};
 
-      // copy 2 GRFs at a time if byte size permits
       unsigned int rowsCopied = 1;
+      G4_Type movType = Type_F;
       if (bytesRemaining >= kernel.numEltPerGRF<Type_UB>() * 2) {
+        // copy 2 GRFs at a time if byte size permits
         if (instOption == InstOpt_WriteEnable ||
             kernel.getSimdSize() >= execSize * 2) {
           // When instruction uses default EM, max # of rows to be
@@ -398,24 +402,25 @@ void LoopVarSplit::copy(G4_BB *bb, G4_Declare *dst, G4_Declare *src,
           // GRF platform under SIMD8, we should emit 2 movs, each
           // writing 1 row and both movs must use default EM. Emitting
           // single SIMD16 mov with default EM is illegal is this case.
-          execSize = G4_ExecSize(kernel.numEltPerGRF<Type_UD>() * 2);
           rowsCopied = 2;
+          movType = Type_F;
         }
       }
+      execSize = G4_ExecSize(kernel.numEltPerGRF(movType) * rowsCopied);
 
       auto dstRgn = kernel.fg.builder->createDst(dst->getRegVar(), (short)i, 0,
-                                                 1, Type_F);
+                                                 1, movType);
       auto srcRgn = kernel.fg.builder->createSrc(src->getRegVar(), (short)i, 0,
-                                                 rd, Type_F);
+                                                 rd, movType);
       auto inst = kernel.fg.builder->createMov(execSize, dstRgn, srcRgn,
                                                instOption, false);
 
       insertCopy(inst);
       vISA_ASSERT(
           bytesRemaining >=
-              (unsigned int)(execSize.value * G4_Type_Table[Type_F].byteSize),
+              (unsigned int)(execSize.value * G4_Type_Table[movType].byteSize),
           "Invalid copy exec size");
-      bytesRemaining -= (execSize.value * G4_Type_Table[Type_F].byteSize);
+      bytesRemaining -= (execSize.value * G4_Type_Table[movType].byteSize);
 
       i += rowsCopied;
 

@@ -13,6 +13,7 @@ SPDX-License-Identifier: MIT
 #include "Compiler/CISACodeGen/GenCodeGenModule.h"
 #include "Compiler/CISACodeGen/AdvCodeMotion.h"
 #include "Compiler/CISACodeGen/RematAddressArithmetic.h"
+#include "Compiler/CISACodeGen/IGCLivenessAnalysis.h"
 #include "Compiler/CISACodeGen/AdvMemOpt.h"
 #include "Compiler/CISACodeGen/Emu64OpsPass.h"
 #include "Compiler/CISACodeGen/PullConstantHeuristics.hpp"
@@ -21,10 +22,12 @@ SPDX-License-Identifier: MIT
 #include "Compiler/CISACodeGen/CodeSinking.hpp"
 #include "Compiler/CISACodeGen/AddressArithmeticSinking.hpp"
 #include "Compiler/CISACodeGen/AtomicOptPass.hpp"
+#include "Compiler/CISACodeGen/BlockMemOpAddrScalarizationPass.hpp"
 #include "Compiler/CISACodeGen/SinkCommonOffsetFromGEP.h"
 #include "Compiler/CISACodeGen/ConstantCoalescing.hpp"
 #include "Compiler/CISACodeGen/CheckInstrTypes.hpp"
 #include "Compiler/CISACodeGen/EstimateFunctionSize.h"
+#include "Compiler/CISACodeGen/GenerateFrequencyData.hpp"
 #include "Compiler/CISACodeGen/PassTimer.hpp"
 #include "Compiler/CISACodeGen/FixAddrSpaceCast.h"
 #include "Compiler/CISACodeGen/FixupExtractValuePair.h"
@@ -37,6 +40,7 @@ SPDX-License-Identifier: MIT
 #include "Compiler/CISACodeGen/PreRARematFlag.h"
 #include "Compiler/CISACodeGen/PreRAScheduler.hpp"
 #include "Compiler/CISACodeGen/PromoteConstantStructs.hpp"
+#include "Compiler/Optimizer/OpenCLPasses/AlignmentAnalysis/AlignmentAnalysis.hpp"
 #include "Compiler/Optimizer/OpenCLPasses/GenericAddressResolution/GASResolving.h"
 #include "Compiler/CISACodeGen/ResolvePredefinedConstant.h"
 #include "Compiler/CISACodeGen/Simd32Profitability.hpp"
@@ -63,8 +67,6 @@ SPDX-License-Identifier: MIT
 #include "Compiler/CISACodeGen/DpasScan.hpp"
 
 #include "Compiler/CISACodeGen/SLMConstProp.hpp"
-#include "Compiler/Optimizer/OpenCLPasses/DebuggerSupport/ImplicitGIDPass.hpp"
-#include "Compiler/Optimizer/OpenCLPasses/DebuggerSupport/ImplicitGIDRestoring.hpp"
 #include "Compiler/Optimizer/OpenCLPasses/GenericAddressResolution/GenericAddressDynamicResolution.hpp"
 #include "Compiler/Optimizer/OpenCLPasses/PrivateMemory/PrivateMemoryUsageAnalysis.hpp"
 #include "Compiler/Optimizer/OpenCLPasses/PrivateMemory/PrivateMemoryResolution.hpp"
@@ -84,6 +86,7 @@ SPDX-License-Identifier: MIT
 #include "Compiler/Optimizer/OpenCLPasses/WIFuncs/WIFuncResolution.hpp"
 #include "Compiler/Optimizer/OpenCLPasses/ScalarArgAsPointer/ScalarArgAsPointer.hpp"
 #include "Compiler/Optimizer/OpenCLPasses/GEPLoopStrengthReduction/GEPLoopStrengthReduction.hpp"
+#include "Compiler/Optimizer/OpenCLPasses/StackOverflowDetection/StackOverflowDetection.hpp"
 #include "Compiler/Optimizer/MCSOptimization.hpp"
 #include "Compiler/Optimizer/GatingSimilarSamples.hpp"
 #include "Compiler/Optimizer/IntDivConstantReduction.hpp"
@@ -123,6 +126,7 @@ SPDX-License-Identifier: MIT
 #include "common/LLVMWarningsPush.hpp"
 #include "llvm/Config/llvm-config.h"
 #include "llvm/ADT/PostOrderIterator.h"
+#include <llvm/IR/DebugInfo.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/Analysis/CFGPrinter.h>
@@ -138,6 +142,9 @@ SPDX-License-Identifier: MIT
 #include <llvm/Linker/Linker.h>
 #include <llvm/Analysis/ScopedNoAliasAA.h>
 #include <llvm/Analysis/TargetLibraryInfo.h>
+#include <llvm/Analysis/BlockFrequencyInfo.h>
+#include <llvm/Analysis/BranchProbabilityInfo.h>
+#include <llvm/Analysis/LoopInfo.h>
 #include <llvm/ADT/StringExtras.h>
 #include <llvm/IRReader/IRReader.h>
 #include <llvm/Support/MathExtras.h>
@@ -227,7 +234,10 @@ void AddAnalysisPasses(CodeGenContext& ctx, IGCPassManager& mpm)
     // only limited code-sinking to several shader-type
     // vs input has the URB-reuse issue to be resolved.
     // Also need to understand the performance benefit better.
-    mpm.add(new CodeSinking(true));
+    if (!isOptDisabled)
+    {
+        mpm.add(new CodeSinking(true));
+    }
 
 
     // Run flag re-materialization if it's beneficial.
@@ -317,6 +327,11 @@ void AddAnalysisPasses(CodeGenContext& ctx, IGCPassManager& mpm)
     // collect stats after all the optimization. This info can be dumped to the cos file
     mpm.add(new CheckInstrTypes(true, false));
 
+    if (IGC_IS_FLAG_ENABLED(StaticProfileGuidedSpillCostAnalysis))
+    {
+        mpm.add(createGenerateFrequencyDataPass());
+    }
+
     //
     // Generally, passes that change IR should be prior to this place!
     //
@@ -397,13 +412,15 @@ void AddLegalizationPasses(CodeGenContext& ctx, IGCPassManager& mpm, PSSignature
         ctx.m_instrTypes.hasUnmaskedRegion) {
         IGC_SET_FLAG_VALUE(allowLICM, false);
     }
-
-    if (IGC_IS_FLAG_ENABLED(ForceAllPrivateMemoryToSLM) ||
+    bool disableConvergentInstructionsHoisting =
+        ctx.m_DriverInfo.DisableConvergentInstructionsHoisting() &&
+        ctx.m_instrTypes.numWaveIntrinsics > 0;
+    if (disableConvergentInstructionsHoisting ||
+        IGC_IS_FLAG_ENABLED(ForceAllPrivateMemoryToSLM) ||
         IGC_IS_FLAG_ENABLED(ForcePrivateMemoryToSLMOnBuffers))
     {
-        DummyPass* dummypass = new DummyPass();
         TargetIRAnalysis GenTTgetIIRAnalysis([&](const Function& F) {
-            GenIntrinsicsTTIImpl GTTI(&ctx, dummypass);
+            GenIntrinsicsTTIImpl GTTI(&ctx);
             return TargetTransformInfo(GTTI);
             });
         mpm.add(new TargetTransformInfoWrapperPass(GenTTgetIIRAnalysis));
@@ -627,6 +644,11 @@ void AddLegalizationPasses(CodeGenContext& ctx, IGCPassManager& mpm, PSSignature
         mpm.add(createLoopSimplifyPass());
     }
 
+    if (IGC_IS_FLAG_ENABLED(StackOverflowDetection)) {
+        // Cleanup stack overflow detection calls if necessary.
+        mpm.add(new StackOverflowDetectionPass());
+    }
+
     if  (ctx.enableFunctionCall() || ctx.type == ShaderType::RAYTRACING_SHADER)
     {
         // Sort functions if subroutine/indirect fcall is enabled.
@@ -654,22 +676,36 @@ void AddLegalizationPasses(CodeGenContext& ctx, IGCPassManager& mpm, PSSignature
     if (!isOptDisabled &&
         ctx.m_instrTypes.hasLoadStore && IGC_IS_FLAG_DISABLED(DisableMemOpt) && !ctx.getModuleMetaData()->disableMemOptforNegativeOffsetLoads) {
 
+#if LLVM_VERSION_MAJOR <= 10
+        if (ctx.type == ShaderType::OPENCL_SHADER)
+        {
+            // Some LLVM passes may produce load/store instructions without alignment set,
+            // for example SROA. LLVM API has been changed to ensure that alignment is never
+            // missing, it has been changed in LLVM11: https://reviews.llvm.org/D77454.
+            // Merging loads/stores without alignment set results in producing loads/stores
+            // that operate on a bigger types, hence loosing an information about actual alignment.
+            // AlignmentAnalysis restores alignments based on data-flow analysis, so that MemOpt
+            // can propagate the correct alignment to the merged instructions.
+            mpm.add(new AlignmentAnalysis());
+        }
+#endif
+
         if ((ctx.type == ShaderType::RAYTRACING_SHADER || ctx.hasSyncRTCalls()) &&
             IGC_IS_FLAG_DISABLED(DisablePrepareLoadsStores))
         {
             mpm.add(createPrepareLoadsStoresPass());
         }
 
-        // run AdvMemOpt and MemOPt back-to-back so that we only
+        // run AdvMemOpt and MemOPt back-to-back so that we only
         // need to run WIAnalysis once
         if (IGC_IS_FLAG_ENABLED(EnableAdvMemOpt))
             mpm.add(createAdvMemOptPass());
 
-        if (IGC_IS_FLAG_ENABLED(EnableLdStCombine) &&
-            ctx.type == ShaderType::OPENCL_SHADER)
-        {
-            // start with OCL, will apply to others.
-            //   Once it is stable, no split 64bit store/load anymore.
+        if(IGC_IS_FLAG_SET(DumpRegPressureEstimate))
+            mpm.add(createIGCEarlyRegEstimator(/*UseWiAnalysis = */ true, /* DumpToFile = */ true, "final"));
+
+        if (doLdStCombine(&ctx)) {
+            // Once it is stable, no split 64bit store/load anymore.
             mpm.add(createLdStCombinePass());
         }
 
@@ -692,11 +728,6 @@ void AddLegalizationPasses(CodeGenContext& ctx, IGCPassManager& mpm, PSSignature
         }
 
         mpm.add(createIGCInstructionCombiningPass());
-        if (ctx.type == ShaderType::OPENCL_SHADER &&
-            static_cast<OpenCLProgramContext&>(ctx).m_InternalOptions.KernelDebugEnable)
-        {
-            mpm.add(new ImplicitGIDRestoring());
-        }
     }
 
     if (ctx.hasSyncRTCalls())
@@ -807,16 +838,6 @@ void AddLegalizationPasses(CodeGenContext& ctx, IGCPassManager& mpm, PSSignature
         // Last instruction combining pass needs to be before Legalization pass, as it can produce illegal instructions.
         mpm.add(new RemoveCodeAssumptions());
         mpm.add(createIGCInstructionCombiningPass());
-
-        // Optimize lower-level IR
-        if (!fastCompile && !highAllocaPressure && !isPotentialHPCKernel)
-        {
-            if (ctx.type == ShaderType::OPENCL_SHADER &&
-                static_cast<OpenCLProgramContext&>(ctx).m_InternalOptions.KernelDebugEnable)
-            {
-                mpm.add(new ImplicitGIDRestoring());
-            }
-        }
         mpm.add(new GenSpecificPattern());
         // Cases with DPDivSqrtEmu grow significantly.
         // We can disable EarlyCSE when m_hasDPDivSqrtEmu is true,
@@ -872,7 +893,8 @@ void AddLegalizationPasses(CodeGenContext& ctx, IGCPassManager& mpm, PSSignature
     // Run address remat after GVN as it may hoist address calculations and
     // create PHI nodes with addresses.
 
-    if (IGC_IS_FLAG_ENABLED(EnableRemat)) {
+    if (IGC_IS_FLAG_ENABLED(EnableRemat) || (ctx.m_retryManager.AllowCloneAddressArithmetic() && ctx.type == ShaderType::OPENCL_SHADER)) {
+
 
       // TODO: This is a workaround that helps to reduce amount of instructions for clone address arithmetic
       // it helps with chain of instructions like this
@@ -1195,17 +1217,9 @@ void OptimizeIR(CodeGenContext* const pContext)
     IGC_ASSERT(nullptr != pContext->getModuleMetaData());
     bool NoOpt = pContext->getModuleMetaData()->compOpt.OptDisable;
 
-    alwaysInlineForNoOpt(pContext, NoOpt);
+    DumpHashToOptions(pContext->hash, pContext->type);
 
-    if (pContext->type == ShaderType::OPENCL_SHADER)
-    {
-        if (((OpenCLProgramContext*)pContext)->m_InternalOptions.KernelDebugEnable)
-        {
-            IGCPassManager mpm(pContext, "CleanImplicitId");
-            mpm.add(new CleanImplicitIds());
-            mpm.run(*pContext->getModule());
-        }
-    }
+    alwaysInlineForNoOpt(pContext, NoOpt);
 
     // Insert per-func optimization metadata
     for (auto& F : *pContext->getModule())
@@ -1246,10 +1260,8 @@ void OptimizeIR(CodeGenContext* const pContext)
         mpm.add(new MetaDataUtilsWrapper(pMdUtils, pContext->getModuleMetaData()));
 
         mpm.add(new CodeGenContextWrapper(pContext));
-        DummyPass* dummypass = new DummyPass();
-        mpm.add(dummypass);
             TargetIRAnalysis GenTTgetIIRAnalysis([&](const Function& F) {
-            GenIntrinsicsTTIImpl GTTI(pContext, dummypass);
+            GenIntrinsicsTTIImpl GTTI(pContext);
             return TargetTransformInfo(GTTI);
         });
 
@@ -1350,6 +1362,9 @@ void OptimizeIR(CodeGenContext* const pContext)
 
         mpm.add(new BreakConstantExpr());
         mpm.add(new IGCConstProp());
+
+        mpm.add(new BlockMemOpAddrScalarizationPass());
+
         mpm.add(new CustomSafeOptPass());
         if (!pContext->m_DriverInfo.WADisableCustomPass())
         {
@@ -1362,11 +1377,6 @@ void OptimizeIR(CodeGenContext* const pContext)
         }
 
         mpm.add(createIGCInstructionCombiningPass());
-        if (pContext->type == ShaderType::OPENCL_SHADER &&
-            static_cast<OpenCLProgramContext*>(pContext)->m_InternalOptions.KernelDebugEnable)
-        {
-            mpm.add(new ImplicitGIDRestoring());
-        }
         mpm.add(new FCmpPaternMatch());
         mpm.add(llvm::createDeadCodeEliminationPass()); // this should be done both before/after constant propagation
 
@@ -1424,12 +1434,6 @@ void OptimizeIR(CodeGenContext* const pContext)
                 if (IGC_IS_FLAG_ENABLED(EnableLoopHoistConstant))
                 {
                     mpm.add(createLoopHoistConstant());
-                }
-
-                if (pContext->type == ShaderType::OPENCL_SHADER &&
-                    static_cast<OpenCLProgramContext*>(pContext)->m_InternalOptions.KernelDebugEnable)
-                {
-                    mpm.add(new ImplicitGIDRestoring());
                 }
                 if (IGC_IS_FLAG_ENABLED(EnableAdvCodeMotion) &&
                     pContext->type == ShaderType::OPENCL_SHADER &&
@@ -1558,7 +1562,8 @@ void OptimizeIR(CodeGenContext* const pContext)
             }
             GFX_ONLY_PASS { mpm.add(new GenUpdateCB()); }
 
-            if (!pContext->m_instrTypes.hasAtomics && !extensiveShader(pContext))
+            if (IGC_IS_FLAG_ENABLED(EnableJumpThreading) &&
+                !pContext->m_instrTypes.hasAtomics && !extensiveShader(pContext))
             {
                 if (pContext->type == ShaderType::OPENCL_SHADER)
                 {
@@ -1597,7 +1602,8 @@ void OptimizeIR(CodeGenContext* const pContext)
 
             // Conditions apply just as above due to problems with atomics
             // (see comment above for details).
-            if (!pContext->m_instrTypes.hasAtomics && !extensiveShader(pContext))
+            if (IGC_IS_FLAG_ENABLED(EnableJumpThreading) &&
+                !pContext->m_instrTypes.hasAtomics && !extensiveShader(pContext))
             {
                 // After lowering 'switch', run jump threading to remove redundant jumps.
                 mpm.add(llvm::createJumpThreadingPass());
@@ -1605,11 +1611,6 @@ void OptimizeIR(CodeGenContext* const pContext)
 
             // run instruction combining to clean up the code after CFG optimizations
             mpm.add(createIGCInstructionCombiningPass());
-            if (pContext->type == ShaderType::OPENCL_SHADER &&
-                static_cast<OpenCLProgramContext*>(pContext)->m_InternalOptions.KernelDebugEnable)
-            {
-                mpm.add(new ImplicitGIDRestoring());
-            }
 
             mpm.add(llvm::createDeadCodeEliminationPass());
             mpm.add(llvm::createEarlyCSEPass());

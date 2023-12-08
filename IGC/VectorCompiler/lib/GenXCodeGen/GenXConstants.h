@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2020-2021 Intel Corporation
+Copyright (C) 2020-2023 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -10,6 +10,8 @@ SPDX-License-Identifier: MIT
 #define LIB_GENXCODEGEN_GENXCONSTANTS_H
 
 #include "GenXSubtarget.h"
+#include "GenXUtil.h"
+
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Constant.h"
 #include "llvm/IR/Constants.h"
@@ -41,11 +43,11 @@ class ConstantLoader {
   SmallVectorImpl<Instruction *> *AddedInstructions;
   // Info from analyzing for possible packed vector constant.
   int64_t PackedIntScale = 0;  // amount to scale packed int vector by
-  int64_t PackedIntAdjust; // amount to adjust by, special casing 0 or -8
-                           //  when PackedIntScale is 1
-  unsigned PackedIntMax;   // max value in packed vector, used when scale is
-                           //  1 and adjust is 0 to tell whether it would fit
-                           //  in 0..7
+  int64_t PackedIntAdjust = 0; // amount to adjust by, special casing 0 or -8
+                               //  when PackedIntScale is 1
+  unsigned PackedIntMax = 0;   // max value in packed vector, used when scale is
+                               //  1 and adjust is 0 to tell whether it would fit
+                               //  in 0..7
   bool PackedFloat = false;
 
 public:
@@ -101,6 +103,13 @@ private:
                                    const SmallVectorImpl<Constant *> &Elements,
                                    unsigned UndefBits, unsigned RemainingBits,
                                    Instruction *Result);
+
+  unsigned getMaxSIMDSize(const Instruction *InsertBefore) const {
+    if (vc::canUseSIMD32(*(InsertBefore->getModule()), Subtarget.hasFusedEU()))
+      return 32;
+    else
+      return 16;
+  }
 };
 
 // Some instructions force their operands to be constants.
@@ -109,7 +118,8 @@ inline bool opMustBeConstant(Instruction *I, unsigned OpNum) {
   // Mask of shufflevector should always be constant.
   if (isa<ShuffleVectorInst>(I))
     return OpNum == 2;
-  return false;
+  // Cache controls operand must be constant
+  return vc::InternalIntrinsic::getMemoryCacheControlOperandIndex(I) == OpNum;
 }
 
 // Check whether types of two contsants are bitcastable and

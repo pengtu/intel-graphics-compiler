@@ -475,7 +475,7 @@ G4_Kernel::G4_Kernel(const PlatformInfo &pInfo, INST_LIST_NODE_ALLOCATOR &alloc,
   } else {
     gtPinInfo = nullptr;
   }
-  regSharingHeuristics = m_options->getOption(vISA_RegSharingHeuristics);
+  autoGRFSelection = m_options->getOption(vISA_AutoGRFSelection);
   // NoMask WA
   m_EUFusionNoMaskWAInfo = nullptr;
 
@@ -620,11 +620,11 @@ void G4_Kernel::calculateSimdSize() {
 // Updates kernel's related structures to large GRF
 //
 bool G4_Kernel::updateKernelToLargerGRF() {
-  if (numRegTotal == grfMode.getVRTMaxGRF())
+  if (numRegTotal == grfMode.getMaxGRF())
     return false;
 
   // Scale number of GRFs, Acc, SWSB tokens.
-  setKernelParameters(grfMode.getVRTLargerGRF());
+  setKernelParameters(grfMode.moveToLargerGRF());
   fg.builder->rebuildPhyRegPool(getNumRegTotal());
   return true;
 }
@@ -633,11 +633,11 @@ bool G4_Kernel::updateKernelToLargerGRF() {
 // Updates kernel's related structures to smaller GRF
 //
 bool G4_Kernel::updateKernelToSmallerGRF() {
-  if (numRegTotal == grfMode.getVRTMinGRF())
+  if (numRegTotal == grfMode.getMinGRF())
     return false;
 
   // Scale number of GRFs, Acc, SWSB tokens.
-  setKernelParameters(grfMode.getVRTSmallerGRF());
+  setKernelParameters(grfMode.moveToSmallerGRF());
   fg.builder->rebuildPhyRegPool(getNumRegTotal());
   return true;
 }
@@ -653,7 +653,7 @@ void G4_Kernel::updateKernelByRegPressure(unsigned regPressure) {
     largestInputReg = std::max(largestInputReg, maxRegPayloadDispatch);
   }
 
-  unsigned newGRF = grfMode.findModeByRegPressure(regPressure, largestInputReg);
+  unsigned newGRF = grfMode.setModeByRegPressure(regPressure, largestInputReg);
 
   if (newGRF == numRegTotal)
     return;
@@ -676,7 +676,7 @@ bool G4_Kernel::updateKernelFromNumGRFAttr() {
   if (numRegTotal == attrNumGRF)
     return true;
 
-  regSharingHeuristics = false;
+  autoGRFSelection = false;
   // Scale number of GRFs, Acc, SWSB tokens.
   setKernelParameters(attrNumGRF);
   fg.builder->rebuildPhyRegPool(getNumRegTotal());
@@ -756,11 +756,15 @@ static iga_gen_t getIGAPlatform(TARGET_PLATFORM genPlatform) {
     break;
   case Xe_DG2:
   case Xe_MTL:
+  case Xe_ARL:
     platform = IGA_XE_HPG;
     break;
   case Xe_PVC:
   case Xe_PVCXT:
     platform = IGA_XE_HPC;
+    break;
+  case Xe2:
+    platform = IGA_XE2;
     break;
   default:
     break;
@@ -990,11 +994,11 @@ void G4_Kernel::setKernelParameters(unsigned newGRF) {
     // Forcing a specific number of threads
     grfMode.setModeByNumThreads(overrideNumThreads);
     overrideGRFNum = 0;
-    regSharingHeuristics = false;
-  } else if (overrideGRFNum != grfMode.getDefaultGRF()) {
+    autoGRFSelection = false;
+  } else if (overrideGRFNum > 0) {
     // Forcing a specific number of GRFs
     grfMode.setModeByNumGRFs(overrideGRFNum);
-    regSharingHeuristics = false;
+    autoGRFSelection = false;
   } else {
     // Use default value
     grfMode.setDefaultGRF();
@@ -1697,26 +1701,35 @@ static BlockOffsets precomputeBlockOffsets(std::ostream &os, G4_Kernel &g4k,
         lastInstSize = kv.getInstSize(currPc);
 
         G4_INST *inst = (*itInst);
-        if (g4k.fg.builder->hasDPASFuseRSWA() && inst->isCachelineAligned()) {
-          iga::Op opcode = kv.getOpcode(currPc);
-          iga::SWSB sw =
-              kv.getSWSBInfo(currPc, iga::SWSB_ENCODE_MODE::ThreeDistPipe);
 
-          while (opcode == iga::Op::SYNC && !sw.hasDist() && !sw.hasSWSB() &&
-                 !sw.hasSpecialToken() && !sw.hasToken()) {
-            // For HW WA.
-            // In which, the sync instruction is used to make instruction
-            // aligned.  However, due to compaction, we don't know the location
-            // of the instruction, the sync instruction insertion has to happen
-            // during encoding, which is unknow for the instruction size of
-            // kernel in the decoding. That's the issue we have to make
-            // these changes.
+        // For HW WA.
+        // In which, vISA may ask IGA to emit some additional instructions.
+        // For example, sync is used to make instruction aligned, and nop is
+        // used to support stepping in debugger.
+        // However, due to compaction, we might not know the exact location of
+        // the instruction, the sync instruction insertion has to happen during
+        // encoding, which is unknown for the instruction size of kernel in the
+        // decoding. That's the issue we have to make these changes.
+        if (inst->isCachelineAligned()) {
+          iga::Op opcode = kv.getOpcode(currPc);
+          // There could be multiple sync.nop instructions emitted by IGA to
+          // make the instruction aligned. Here we continue to advance PC when
+          // seeing sync.nop so that vISA inst and IGA inst could match again.
+          while (opcode == iga::Op::SYNC) {
             currPc += lastInstSize;
             opcode = kv.getOpcode(currPc);
-            sw = kv.getSWSBInfo(currPc, iga::SWSB_ENCODE_MODE::ThreeDistPipe);
             lastInstSize = kv.getInstSize(currPc);
           }
         }
+
+        // When the inst requires an additional nop after it, again we need to
+        // advance PC to consume NOP to make vISA inst and IGA inst match later.
+        if (inst->requireNopAfter()) {
+          currPc += lastInstSize;
+          lastInstSize = kv.getInstSize(currPc);
+          vASSERT(kv.getOpcode(currPc) == iga::Op::NOP);
+        }
+
         currPc += lastInstSize;
       }
     }
@@ -1935,19 +1948,25 @@ void G4_Kernel::emitDeviceAsmInstructionsIga(std::ostream &os,
         }
       };
 
-      if (fg.builder->hasDPASFuseRSWA() && i->isCachelineAligned()) {
+      // Advance PC when the vISA instruction needs to be cacheline-aligned or
+      // requires a Nop after. See comments in precomputeBlockOffsets for
+      // details.
+      if (i->isCachelineAligned()) {
         iga::Op opcode = kv.getOpcode(pc);
-        iga::SWSB sw = kv.getSWSBInfo(pc, iga::SWSB_ENCODE_MODE::ThreeDistPipe);
-        while (opcode == iga::Op::SYNC && !sw.hasDist() && !sw.hasSWSB() &&
-               !sw.hasSpecialToken() && !sw.hasToken()) {
-          // What's going on here???  Someone please give us a clue.
+        while (opcode == iga::Op::SYNC) {
           formatToInstToStream(pc, os);
           os << "\n";
           pc += kv.getInstSize(pc);
           opcode = kv.getOpcode(pc);
-          sw = kv.getSWSBInfo(pc, iga::SWSB_ENCODE_MODE::ThreeDistPipe);
         }
       }
+      if (i->requireNopAfter()) {
+        formatToInstToStream(pc, os);
+        os << "\n";
+        pc += kv.getInstSize(pc);
+        vASSERT(kv.getOpcode(pc) == iga::Op::NOP);
+      }
+
       formatToInstToStream(pc, os);
 
       (*itBB)->emitBasicInstructionComment(os, itInst, suppressRegs, lastRegs);
@@ -2060,6 +2079,7 @@ GRFMode::GRFMode(const TARGET_PLATFORM platform, Options *op) : options(op) {
   case Xe_XeHPSDV:
   case Xe_DG2:
   case Xe_MTL:
+  case Xe_ARL:
     configs.resize(2);
     // Configurations with <numGRF, numThreads, SWSBTokens, numAcc>
     configs[0] = Config(128, 8, 16, 4);
@@ -2068,6 +2088,7 @@ GRFMode::GRFMode(const TARGET_PLATFORM platform, Options *op) : options(op) {
     break;
   case Xe_PVC:
   case Xe_PVCXT:
+  case Xe2:
     configs.resize(2);
     // Configurations with <numGRF, numThreads, SWSBTokens, numAcc>
     configs[0] = Config(128, 8, 16, 4);
@@ -2084,9 +2105,8 @@ GRFMode::GRFMode(const TARGET_PLATFORM platform, Options *op) : options(op) {
   currentMode = defaultMode;
 }
 
-unsigned GRFMode::findModeByRegPressure(unsigned maxRP, unsigned largestInputReg) {
-  unsigned size = configs.size();
-  unsigned i = 0, newGRF = 0;
+unsigned GRFMode::setModeByRegPressure(unsigned maxRP, unsigned largestInputReg) {
+  unsigned size = configs.size(), i = 0;
   // find appropiate GRF based on reg pressure
   for (; i < size; i++) {
     if (configs[i].VRTEnable && maxRP <= configs[i].numGRF &&
@@ -2094,15 +2114,20 @@ unsigned GRFMode::findModeByRegPressure(unsigned maxRP, unsigned largestInputReg
         // those blocked for kernel input. This helps cases
         // where an 8 GRF variable shows up in entry BB.
         (largestInputReg + 8) <= configs[i].numGRF) {
-      newGRF = configs[i].numGRF;
+      currentMode = i;
       break;
     }
   }
-
-  // if not found, pressure is too high
-  // set largest grf mode
   if (i == size)
-    newGRF = getVRTMaxGRF();
+    return getMaxGRF();
+  return configs[currentMode].numGRF;
+}
 
-  return newGRF;
+// Check if next larger GRF has the same number of threads per EU
+bool GRFMode::hasLargerGRFSameThreads() const {
+  unsigned largerGrfIdx = currentMode + 1;
+  if (largerGrfIdx == configs.size() || !configs[largerGrfIdx].VRTEnable)
+    return false;
+
+  return configs[currentMode].numThreads == configs[largerGrfIdx].numThreads;
 }

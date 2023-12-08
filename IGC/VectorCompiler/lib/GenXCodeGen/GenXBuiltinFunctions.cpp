@@ -360,8 +360,10 @@ Value *GenXBuiltinFunctions::visitCallInst(CallInst &II) {
       return nullptr;
     auto *Opcode = cast<ConstantInt>(II.getArgOperand(1));
     auto *VTy = cast<IGCLLVM::FixedVectorType>(Ty);
+    auto *CacheOpts = vc::InternalIntrinsic::getMemoryCacheControlOperand(&II);
+    auto *CacheOptsTy = CacheOpts->getType();
 
-    Func = getBuiltinDeclaration(M, "atomic_slm", false, {VTy});
+    Func = getBuiltinDeclaration(M, "atomic_slm", false, {VTy, CacheOptsTy});
 
     auto *MaskVTy = IGCLLVM::FixedVectorType::get(Builder.getInt8Ty(),
                                                   VTy->getNumElements());
@@ -379,8 +381,10 @@ Value *GenXBuiltinFunctions::visitCallInst(CallInst &II) {
 
     auto *Opcode = cast<ConstantInt>(II.getArgOperand(1));
     auto *VTy = cast<IGCLLVM::FixedVectorType>(Ty);
+    auto *CacheOpts = vc::InternalIntrinsic::getMemoryCacheControlOperand(&II);
+    auto *CacheOptsTy = CacheOpts->getType();
 
-    Func = getBuiltinDeclaration(M, "atomic_ugm", false, {VTy});
+    Func = getBuiltinDeclaration(M, "atomic_ugm", false, {VTy, CacheOptsTy});
 
     auto *MaskVTy = IGCLLVM::FixedVectorType::get(Builder.getInt8Ty(),
                                                   VTy->getNumElements());
@@ -401,7 +405,7 @@ Value *GenXBuiltinFunctions::visitCallInst(CallInst &II) {
 
 static std::string getMangledTypeStr(Type *Ty) {
   std::string Result;
-  if (auto *VTy = dyn_cast<IGCLLVM::FixedVectorType>(Ty))
+  if (auto *VTy = dyn_cast_or_null<IGCLLVM::FixedVectorType>(Ty))
     Result += "v" + utostr(VTy->getNumElements()) +
               getMangledTypeStr(VTy->getElementType());
   else if (Ty)

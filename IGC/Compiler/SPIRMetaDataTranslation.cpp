@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2017-2021 Intel Corporation
+Copyright (C) 2017-2023 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -49,12 +49,23 @@ bool IGC::isLegalOCLVersion(int major, int minor)
     return false;
 }
 
+// Khronos SPIRV-LLVM Translator attaches kernel metadata directly to LLVM function, example:
+// define spir_kernel void @bar() !reqd_work_group_size !0
+// ...
+// !0 = !{i32 1, i32 1, i32 1}
 
-// With Clang 4.0 there was added Function Metadata so in order for us to be able
-// to compile both Clang <= 3.8 and Clang 4.0, the below function had to be added.
-// TODO: Explore using just Function Metadata going forward.
+// But SPIRMetaDataTranslation pass expects them in the following form:
 
-void SPIRMetaDataTranslation::WarpFunctionMetadata(Module& M)
+// !opencl.kernels = !{!0}
+// !0 = !{void ()* @bar, !1}
+// !1 = !{!"reqd_work_group_size", i32 1, i32 1, i32 1}
+
+// Below function translates the first form into the second one.
+
+// TODO: Reimplement SPIRMetaDataTranslation pass to be able to work directly on Khronos Translator's
+// output, without producing opencl.kernels metadata.
+
+void SPIRMetaDataTranslation::translateKernelMetadataIntoOpenCLKernelsMD(Module& M)
 {
     llvm::NamedMDNode* opencl_kernels = M.getOrInsertNamedMetadata("opencl.kernels");
 
@@ -84,7 +95,7 @@ void SPIRMetaDataTranslation::WarpFunctionMetadata(Module& M)
             Func.getContext().getMDKindNames(Names);
             Func.getAllMetadata(Info);
             Args.push_back(ConstantAsMetadata::get(&Func));
-            for (auto i : Info)
+            for (const auto &i : Info)
             {
                 llvm::SmallVector<Metadata*, 2> Mdvector;
                 auto firstElem = MDString::get(M.getContext(), Names[i.first]);
@@ -102,7 +113,7 @@ void SPIRMetaDataTranslation::WarpFunctionMetadata(Module& M)
 
 bool SPIRMetaDataTranslation::runOnModule(Module& M)
 {
-    WarpFunctionMetadata(M);
+    translateKernelMetadataIntoOpenCLKernelsMD(M);
     MetaDataUtilsWrapper& mduw = getAnalysis<MetaDataUtilsWrapper>();
     MetaDataUtils* pIgcMDUtils = mduw.getMetaDataUtils();
     ModuleMetaData* modMD = mduw.getModuleMetaData();
@@ -145,13 +156,16 @@ bool SPIRMetaDataTranslation::runOnModule(Module& M)
     SPIRMD::SpirMetaDataUtils::KernelsList::const_iterator ke = spirMDUtils.end_Kernels();
     for (; ki != ke; ++ki)
     {
-        IGCMD::FunctionInfoMetaDataHandle fHandle = IGCMD::FunctionInfoMetaDataHandle(IGCMD::FunctionInfoMetaData::get());
+        IGCMD::FunctionInfoMetaDataHandle fHandle = IGCMD::FunctionInfoMetaDataHandle(new IGCMD::FunctionInfoMetaData());
         SPIRMD::KernelMetaDataHandle spirKernel = *ki;
+        // TODO: Null metadata entries are only expected in the event of a
+        // partial recompilation. Once the retry manager learns to clean
+        // up such metadata entries for unneeded kernels, we should simply
+        // assert on the function's validity instead.
+        if (spirKernel->getFunction() == nullptr)
+            continue;
         IGC::FunctionMetaData& funcMD = modMD->FuncMD[spirKernel->getFunction()];
         fHandle->setType(FunctionTypeMD::KernelFunction);
-
-        if(spirKernel->getFunction() == nullptr)
-            continue;
 
         // Handling Thread Group Size
         SPIRMD::WorkGroupDimensionsMetaDataHandle reqdWorkGroupSize = spirKernel->getRequiredWorkGroupSize();
@@ -178,7 +192,7 @@ bool SPIRMetaDataTranslation::runOnModule(Module& M)
         if (reqdSubGroupSize->hasValue())
         {
             IGCMD::SubGroupSizeMetaDataHandle sgHandle = fHandle->getSubGroupSize();
-            int simd_size = reqdSubGroupSize->getSIMD_Size();
+            int simd_size = reqdSubGroupSize->getSIMDSize();
             if (!((simd_size == 8) || (simd_size == 16) || (simd_size == 32)))
             {
                 getAnalysis<CodeGenContextWrapper>().getCodeGenContext()->EmitError("Unsupported required sub group size", spirKernel->getFunction());
@@ -190,7 +204,7 @@ bool SPIRMetaDataTranslation::runOnModule(Module& M)
                     "Kernel compiled with required subgroup size 8, which is unsupported on this platform", spirKernel->getFunction());
                 return false;
             }
-            sgHandle->setSIMD_size(simd_size);
+            sgHandle->setSIMDSize(simd_size);
         }
 
         // Handling Sub Group Size
@@ -307,6 +321,7 @@ bool SPIRMetaDataTranslation::runOnModule(Module& M)
             enum OCL_OPTIONS
             {
                 DENORM_ARE_ZERO,
+                BF_TF_DENORMS_ARE_ZERO,
                 CORRECTLY_ROUNDED_SQRT,
                 OPT_DISABLE,
                 MAD_ENABLE,
@@ -321,6 +336,7 @@ bool SPIRMetaDataTranslation::runOnModule(Module& M)
             };
             int igc_compiler_option = llvm::StringSwitch<OCL_OPTIONS>(co)
                 .Case("-denorms-are-zero", DENORM_ARE_ZERO)
+                .Case("-bf-tf-denorms-are-zero", BF_TF_DENORMS_ARE_ZERO)
                 .Case("-fp32-correctly-rounded-divide-sqrt", CORRECTLY_ROUNDED_SQRT)
                 .Case("-opt-disable", OPT_DISABLE)
                 .Case("-mad-enable", MAD_ENABLE)
@@ -337,6 +353,8 @@ bool SPIRMetaDataTranslation::runOnModule(Module& M)
             switch (igc_compiler_option)
             {
             case DENORM_ARE_ZERO: modMD->compOpt.DenormsAreZero = true;
+                break;
+            case BF_TF_DENORMS_ARE_ZERO: modMD->compOpt.BFTFDenormsAreZero = true;
                 break;
             case CORRECTLY_ROUNDED_SQRT: modMD->compOpt.CorrectlyRoundedDivSqrt = true;
                 break;

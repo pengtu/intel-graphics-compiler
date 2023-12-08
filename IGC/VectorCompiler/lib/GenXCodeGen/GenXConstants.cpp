@@ -83,7 +83,6 @@ SPDX-License-Identifier: MIT
 #include "GenXConstants.h"
 #include "GenXGotoJoin.h"
 #include "GenXIntrinsics.h"
-#include "GenXUtil.h"
 
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/SmallSet.h"
@@ -191,10 +190,6 @@ bool genx::loadNonSimpleConstants(
   if (CI)
     NumArgs = IGCLLVM::getNumArgOperands(CI);
   unsigned IID = vc::getAnyIntrinsicID(Inst);
-  // Do not proceed loading of genx.alloca argument since its value doesn't
-  // needed (only type matters) and always null.
-  if (IID == GenXIntrinsic::genx_alloca)
-    return Modified;
   for (unsigned i = 0; i != NumArgs; ++i) {
     if (isa<Constant>(Inst->getOperand(i))) {
       Use *U = &Inst->getOperandUse(i);
@@ -480,7 +475,7 @@ bool genx::loadConstants(Instruction *Inst, const GenXSubtarget &Subtarget,
       if (II.isNull())
         return Modified;
       unsigned MaxRawOperands = II.getTrailingNullZoneStart(CI);
-      for (auto AI : II.getInstDesc()) {
+      for (auto &AI : II.getInstDesc()) {
         if (!AI.isArgOrRet() || AI.isRet())
           continue;
         // This field relates to an operand.
@@ -495,6 +490,8 @@ bool genx::loadConstants(Instruction *Inst, const GenXSubtarget &Subtarget,
           continue;
         // Allow constant if intrinsic descriptor allows it for this arg.
         if (!AI.isImmediateDisallowed())
+          continue;
+        if (AI.getCategory() == GenXIntrinsicInfo::CACHEOPTS)
           continue;
         // If it is a RAW operand, allow the constant if it's in the trailing
         // null region (it must be a null constant if so), or if the value
@@ -1275,9 +1272,7 @@ unsigned ConstantLoader::getRegionBits(unsigned NeededBits,
 Instruction *ConstantLoader::loadSplatConstant(Instruction *InsertPos) {
   // Skip scalar types, vector type with just one element, or boolean vector.
   auto *VTy = dyn_cast<IGCLLVM::FixedVectorType>(C->getType());
-  if (!VTy ||
-      VTy->getNumElements() == 1 ||
-      VTy->getScalarType()->isIntegerTy(1))
+  if (!VTy || VTy->getNumElements() == 1 || VTy->getScalarType()->isIntegerTy(1))
     return nullptr;
   // Skip non-splat vector.
   Constant *C1 = IGCLLVM::Constant::getSplatValue(C, /* AllowUndefs */ true);
@@ -1289,15 +1284,38 @@ Instruction *ConstantLoader::loadSplatConstant(Instruction *InsertPos) {
   ConstantLoader L(CV, Subtarget, DL);
   Value *V = L.load(InsertPos);
   // Broadcast through rdregion.
-  Region R(V, &DL);
-  R.Width = R.NumElements = VTy->getNumElements();
-  R.Stride = 0;
-  R.VStride = 0;
-  R.Offset = 0;
-  Instruction *NewInst = R.createRdRegion(V, ".constsplat", InsertPos, DebugLoc());
-  if (AddedInstructions)
-    AddedInstructions->push_back(NewInst);
-  return NewInst;
+  Instruction *Result = nullptr;
+  Region RdR(V, &DL);
+  RdR.Stride = 0;
+  RdR.VStride = 0;
+  RdR.Offset = 0;
+  unsigned NumElements = VTy->getNumElements();
+  unsigned MaxSize = getMaxSIMDSize(InsertPos);
+  if (NumElements <= MaxSize) {
+    RdR.Width = RdR.NumElements = NumElements;
+    Result = RdR.createRdRegion(V, ".constsplat", InsertPos, DebugLoc());
+    if (AddedInstructions)
+      AddedInstructions->push_back(Result);
+  } else {
+    unsigned Idx = 0;
+    while (Idx < NumElements) {
+      unsigned Size = std::min(1U << genx::log2(NumElements - Idx), MaxSize);
+      RdR.Width = RdR.NumElements = Size;
+      auto *Splat = RdR.createRdRegion(V, ".constsplat.split" + Twine(Idx),
+                                       InsertPos, DebugLoc());
+      Region WrR(C, &DL);
+      WrR.getSubregion(Idx, Size);
+      Result = WrR.createWrRegion(
+          Result ? (Value *)Result : (Value *)UndefValue::get(C->getType()),
+          Splat, "constantsplat.join" + Twine(Idx), InsertPos, DebugLoc());
+      if (AddedInstructions) {
+        AddedInstructions->push_back(Splat);
+        AddedInstructions->push_back(Result);
+      }
+      Idx += Size;
+    }
+  }
+  return Result;
 }
 
 /***********************************************************************
@@ -1537,6 +1555,7 @@ Instruction *ConstantLoader::loadCyclicConstruct(
     //     <       C                >
     //     <                      C >
     // giving five wrregion instructions rather than six.
+    IGC_ASSERT_EXIT(RemainingBits > 0);
     unsigned BestSplatSetBits = 1 << genx::log2(RemainingBits);
     unsigned BestSplatSetUsefulBits = BestSplatSetBits;
     unsigned BestSplatSetCount = 1;
@@ -1554,7 +1573,9 @@ Instruction *ConstantLoader::loadCyclicConstruct(
         BestSplatSetBits = Bits;
         BestSplatSetUsefulBits = Bits & SplatSets[i];
         BestSplatSetCount = Count;
-        BestSplatSetConst = Elements[genx::log2(SplatSets[i])];
+        auto Id = genx::log2(SplatSets[i]);
+        IGC_ASSERT_EXIT(Id >= 0);
+        BestSplatSetConst = Elements[Id];
       }
     }
     // Now BestSplatSetBits is a bitmap of the vector elements to include in
@@ -1613,7 +1634,7 @@ Instruction *ConstantLoader::loadBig(Instruction *InsertBefore) {
   const unsigned GRFWidthInBits = Subtarget.getGRFByteSize() * genx::ByteBits;
   const unsigned ElementBits = DL.getTypeSizeInBits(VT->getElementType());
   unsigned MaxSize = 2 * GRFWidthInBits / ElementBits;
-  MaxSize = std::min(MaxSize, 32U);
+  MaxSize = std::min(MaxSize, getMaxSIMDSize(InsertBefore));
   Instruction *Result = nullptr;
   for (unsigned Idx = 0; Idx != NumElements; ) {
     unsigned Size = std::min(1U << genx::log2(NumElements - Idx), MaxSize);

@@ -42,6 +42,7 @@ CShader::CShader(Function* pFunc, CShaderProgram* pProgram)
     m_DL = nullptr;
     m_FGA = nullptr;
     m_VRA = nullptr;
+    m_RLA = nullptr;
     m_EmitPass = nullptr;
     m_HW_TID = nullptr;
 
@@ -205,33 +206,6 @@ void CShader::EOTURBWrite()
     encoder.Push();
 }
 
-void CShader::EOTRenderTarget(CVariable* r1, bool isPerCoarse)
-{
-    CVariable* src[4] = { nullptr, nullptr, nullptr, nullptr };
-    bool isUndefined[4] = { true, true, true, true };
-    CVariable* const nullSurfaceBti = ImmToVariable(m_pBtiLayout->GetNullSurfaceIdx(), ISA_TYPE_D);
-    CVariable* const blendStateIndex = ImmToVariable(0, ISA_TYPE_D);
-    SetBindingTableEntryCountAndBitmap(true, BUFFER_TYPE_UNKNOWN, 0, m_pBtiLayout->GetNullSurfaceIdx());
-    encoder.RenderTargetWrite(
-        src,
-        isUndefined,
-        true,  // lastRenderTarget,
-        true,  // Null RT
-        false, // perSample,
-        isPerCoarse, // coarseMode,
-        false, // isHeaderMaskFromCe0,
-        nullSurfaceBti,
-        blendStateIndex,
-        nullptr, // source0Alpha,
-        nullptr, // oMaskOpnd,
-        nullptr, // outputDepthOpnd,
-        nullptr, // stencilOpnd,
-        nullptr, // cpscounter,
-        nullptr, // sampleIndex,
-        r1);
-    encoder.Push();
-}
-
 // Creates a URB Fence message.
 // If return value is not a nullptr, the returned variable is a send message
 // writeback variable that must be read in order to wait for URB Fence
@@ -280,6 +254,35 @@ void CShader::EOTGateway(CVariable* payload)
 
     encoder.SetSimdSize(SIMDMode::SIMD1);
     encoder.Send(nullptr, payload, exDesc, ImmToVariable(desc, ISA_TYPE_D));
+    encoder.Push();
+}
+
+
+void CShader::EOTRenderTarget(CVariable* r1,
+    bool isPerCoarse)
+{
+    CVariable* src[4] = { nullptr, nullptr, nullptr, nullptr };
+    bool isUndefined[4] = { true, true, true, true };
+    CVariable* const nullSurfaceBti = ImmToVariable(m_pBtiLayout->GetNullSurfaceIdx(), ISA_TYPE_D);
+    CVariable* const blendStateIndex = ImmToVariable(0, ISA_TYPE_D);
+    SetBindingTableEntryCountAndBitmap(true, BUFFER_TYPE_UNKNOWN, 0, m_pBtiLayout->GetNullSurfaceIdx());
+    encoder.RenderTargetWrite(
+        src,
+        isUndefined,
+        true,  // lastRenderTarget,
+        true,  // Null RT
+        false, // perSample,
+        isPerCoarse, // coarseMode,
+        false, // isHeaderMaskFromCe0,
+        nullSurfaceBti,
+        blendStateIndex,
+        nullptr, // source0Alpha,
+        nullptr, // oMaskOpnd,
+        nullptr, // outputDepthOpnd,
+        nullptr, // stencilOpnd,
+        nullptr, // cpscounter,
+        nullptr, // sampleIndex,
+        r1);
     encoder.Push();
 }
 
@@ -642,7 +645,7 @@ void CShader::AllocateSimplePushConstants(uint& offset)
 {
     for (unsigned int i = 0; i < pushInfo.simplePushBufferUsed; i++)
     {
-        for (auto I : pushInfo.simplePushInfoArr[i].simplePushLoads)
+        for (const auto &I : pushInfo.simplePushInfoArr[i].simplePushLoads)
         {
             uint subOffset = I.first;
             CVariable* var = GetSymbol(m_argListCache[I.second]);
@@ -969,8 +972,7 @@ CVariable* CShader::GetPrivateBase()
     unsigned numFuncArgs = entry->arg_size() - numImplicitArgs - numPushArgs;
 
     Argument* kerArg = nullptr;
-    llvm::Function::arg_iterator arg = entry->arg_begin();
-    for (unsigned i = 0; i < numFuncArgs; ++i, ++arg);
+    llvm::Function::arg_iterator arg = std::next(entry->arg_begin(), numFuncArgs);
     for (unsigned i = 0; i < numImplicitArgs; ++i, ++arg) {
         ImplicitArg implicitArg = implicitArgs[i];
         if (implicitArg.getArgType() == ImplicitArg::ArgType::PRIVATE_BASE)
@@ -2496,6 +2498,14 @@ e_alignment IGC::GetPreferredAlignment(llvm::Value* V, WIAnalysis* WIA,
         return (Align == EALIGN_AUTO) ? (pContext->platform.getGRFSize() == 64) ? EALIGN_32WORD : EALIGN_HWORD : Align;
     }
 
+    if (GenIntrinsicInst* inst = dyn_cast<GenIntrinsicInst>(V))
+    {
+        if (inst->getIntrinsicID() == GenISAIntrinsic::GenISA_URBRead ||
+            inst->getIntrinsicID() == GenISAIntrinsic::GenISA_URBReadOutput)
+        {
+            return pContext->platform.getGRFSize() == 64 ? EALIGN_32WORD : EALIGN_HWORD;
+        }
+    }
 
     // Check how that value is used.
     return GetPreferredAlignmentOnUse(V, WIA, pContext);
@@ -2681,8 +2691,7 @@ CVariable* CShader::getOrCreateArgumentSymbol(
         IGC_ASSERT_MESSAGE(F->arg_size() >= (numImplicitArgs + numPushArgs), "Function arg size does not match meta data and push args.");
         unsigned numFuncArgs = F->arg_size() - numImplicitArgs - numPushArgs;
 
-        llvm::Function::arg_iterator arg = F->arg_begin();
-        std::advance(arg, numFuncArgs);
+        llvm::Function::arg_iterator arg = std::next(F->arg_begin(), numFuncArgs);
         for (unsigned i = 0; i < numImplicitArgs; ++i, ++arg)
         {
             Argument* argVal = &(*arg);
@@ -2714,8 +2723,7 @@ CVariable* CShader::getOrCreateArgumentSymbol(
                     if (isEntryFunc(m_pMdUtils, &K) && !isNonEntryMultirateShader(&K)) {
                         argIx = argIx - numPushArgsEntry;
                     }
-                    Function::arg_iterator arg = K.arg_begin();
-                    for (uint32_t j = 0; j < argIx; ++j, ++arg);
+                    Function::arg_iterator arg = std::next(K.arg_begin(), argIx);
                     Argument* kerArg = &(*arg);
 
                     // Pre-condition: all kernel arguments have been created already.
@@ -3212,6 +3220,11 @@ CVariable* CShader::GetSymbol(llvm::Value* value, bool fromConstantPool)
             {
                 mult = 2;
             }
+            if (m_Platform->isCoreChildOf(IGFX_XE2_LPG_CORE) && value->getType()->isIntegerTy(16) && m_SIMDSize == SIMDMode::SIMD16)
+            {
+                IGC_ASSERT(m_Platform->getGRFSize() == 64);
+                mult = 2;
+            }
 
             //FIXME: Could improve by copying types from value
 
@@ -3278,7 +3291,12 @@ CVariable* CShader::GetSymbol(llvm::Value* value, bool fromConstantPool)
         {
             if (auto Inst = dyn_cast<Instruction>(value))
             {
-                var = GetSymbolFromSource(Inst, preferredAlign);
+                // cannot reuse source variable
+                // when the instruction is inside a resource-loop
+                if (m_RLA->GetResourceLoopMarker(Inst) ==
+                    ResourceLoopAnalysis::MarkResourceLoopOutside) {
+                    var = GetSymbolFromSource(Inst, preferredAlign);
+                }
             }
         }
     }
@@ -4045,6 +4063,8 @@ Tristate CShader::shouldGenerateLSCQuery(
     {
         if (inst->getIntrinsicID() == GenISAIntrinsic::GenISA_typedread ||
             inst->getIntrinsicID() == GenISAIntrinsic::GenISA_typedwrite ||
+            inst->getIntrinsicID() == GenISAIntrinsic::GenISA_floatatomictyped ||
+            inst->getIntrinsicID() == GenISAIntrinsic::GenISA_fcmpxchgatomictyped ||
             inst->getIntrinsicID() == GenISAIntrinsic::GenISA_intatomictyped ||
             inst->getIntrinsicID() == GenISAIntrinsic::GenISA_icmpxchgatomictyped)
         {

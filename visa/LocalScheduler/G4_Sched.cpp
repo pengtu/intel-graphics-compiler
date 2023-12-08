@@ -67,6 +67,9 @@ public:
     }
     return false;
   }
+  bool isFlowDep() const {
+    return (mType == DepType::RAW || mType == DepType::WAW);
+  }
 
   void setLatency(int L) { mLatency = L; }
   int getLatency() { return isDataDep() ? mLatency : 0; }
@@ -176,6 +179,10 @@ private:
 
   /* The following data may be overwritten by a scheduler. */
 
+  // height by counting edges not by summing latency
+  // not used as priority in latency-scheduling
+  unsigned Height = 0;
+
   // Tuple node, which should be schedule in pair with this node.
   preNode *TupleLead = nullptr;
   unsigned TupleParts = 0;
@@ -191,8 +198,6 @@ private:
 
   // True once scheduled.
   bool isScheduled = false;
-  bool isClustered = false;
-  bool isClusterLead = false;
   bool ACCCandidate = false;
 
   friend class preDDD;
@@ -367,7 +372,10 @@ struct RegisterPressure {
   }
 
   void recompute(G4_BB *BB) { rpe->runBB(BB); }
-  void recompute() { rpe->run(); }
+  void recompute() {
+    rpe->resetMaxRP();
+    rpe->run();
+  }
 
   // Return the register pressure in GRF for an instruction.
   unsigned getPressure(G4_INST *Inst) const {
@@ -431,23 +439,23 @@ struct SchedConfig {
   enum {
     MASK_DUMP = 1U << 0,
     MASK_LATENCY = 1U << 1,
-    MASK_SETHI_ULLMAN = 1U << 2,
-    MASK_CLUSTTERING = 1U << 3,
+    MASK_MIN_REG = 1U << 2,
+    MASK_SKIP_CLUSTER = 1U << 3,
     MASK_SKIP_HOLD = 1U << 4,
     MASK_NOT_ITERATE = 1U << 5,
   };
   unsigned Dump : 1;
   unsigned UseLatency : 1;
-  unsigned UseSethiUllman : 1;
-  unsigned DoClustering : 1;
+  unsigned UseMinReg  : 1;
+  unsigned SkipClustering : 1; // default 0 i.e. try min-reg with clustering
   unsigned SkipHoldList : 1; // default 0 i.e. use hold list in latency-hiding
   unsigned DoNotIterate : 1; // default 0 i.e. iterative latency-scheduling
 
   explicit SchedConfig(unsigned Config)
       : Dump((Config & MASK_DUMP) != 0),
         UseLatency((Config & MASK_LATENCY) != 0),
-        UseSethiUllman((Config & MASK_SETHI_ULLMAN) != 0),
-        DoClustering((Config & MASK_CLUSTTERING) != 0),
+        UseMinReg((Config & MASK_MIN_REG) != 0),
+        SkipClustering((Config & MASK_SKIP_CLUSTER) != 0),
         SkipHoldList((Config & MASK_SKIP_HOLD) != 0),
         DoNotIterate((Config & MASK_NOT_ITERATE) != 0) {}
 };
@@ -489,6 +497,8 @@ public:
     schedule.clear();
     OrigInstList.clear();
   }
+  BB_Scheduler(const BB_Scheduler&) = delete;
+  BB_Scheduler& operator=(const BB_Scheduler&) = delete;
 
   G4_Kernel &getKernel() const { return kernel; }
   G4_BB *getBB() const { return ddd.getBB(); }
@@ -501,9 +511,9 @@ public:
   // UpperBoundGRF is the measure max reg-pressure of this kernel before scheduling
   bool scheduleBlockForLatency(unsigned &MaxPressure, bool ReassignID,
                                unsigned UpperBoundGRF);
+  void SethiUllmanScheduling(bool DoClustering);
 
 private:
-  void SethiUllmanScheduling();
   void LatencyScheduling(unsigned GroupingThreshold);
   bool verifyScheduling();
 
@@ -624,11 +634,7 @@ bool preRA_Scheduler::run(unsigned &KernelPressure) {
   return Changed;
 }
 
-preRA_RegSharing::preRA_RegSharing(G4_Kernel &k) : kernel(k) {}
-
-preRA_RegSharing::~preRA_RegSharing() {}
-
-bool preRA_RegSharing::run(unsigned &KernelPressure) {
+bool preRA_Scheduler::runWithGRFSelection(unsigned &KernelPressure) {
 
   if (kernel.getInt32KernelAttr(Attributes::ATTR_Target) != VISA_3D) {
     // Do not run pre-RA scheduler for CM unless user forces it.
@@ -714,8 +720,8 @@ bool preRA_RegSharing::run(unsigned &KernelPressure) {
     unsigned BBRP = rp.getPressure(bb);
 
     unsigned UpperBoundGRF = 0;
-    if (GRFdecreased && KernelPressure < kernel.grfMode.getVRTMaxGRF())
-      UpperBoundGRF = kernel.grfMode.getVRTLargerGRF();
+    if (GRFdecreased && KernelPressure < kernel.grfMode.getMaxGRF())
+      UpperBoundGRF = kernel.grfMode.getLargerGRF();
     Changed |= S.scheduleBlockForLatency(BBRP, Changed, UpperBoundGRF);
   }
 
@@ -723,10 +729,15 @@ bool preRA_RegSharing::run(unsigned &KernelPressure) {
     rp.recompute();
     KernelPressure = rp.getMaxRP();
   }
-  // In RA extra registers might be needed to satisfy
-  // some restrictions, e.g. alignment, SIMD size, etc.
-  // So extra registers are provided.
-  unsigned ExtraRegs = (unsigned)(kernel.getNumRegTotal() * EXTRA_REGISTERS_FOR_RA / 100.0f);
+
+  unsigned ExtraRegs = 0;
+  if (kernel.grfMode.hasLargerGRFSameThreads()) {
+    // In RA extra registers might be needed to satisfy some restrictions,
+    // e.g. alignment, SIMD size, etc. So in order to avoid spill in GRF
+    // modes smaller than default, extra registers are added to reg pressure.
+    ExtraRegs =
+        (unsigned)(kernel.getNumRegTotal() * EXTRA_REGISTERS_FOR_RA / 100.0f);
+  }
   kernel.updateKernelByRegPressure(KernelPressure + ExtraRegs);
 
   return Changed;
@@ -800,13 +811,8 @@ class SethiUllmanQueue : public QueueBase {
   // max-reg-pressure for the sub-exp-tree starting from a node
   std::vector<int> MaxRegs;
   std::vector<int> DstSizes;
-
-  // The clustering nodes.
-  std::vector<preNode *> Clusterings;
-  std::set<preNode *> Visited;
-
-  // Scheduling in clustering mode.
-  bool IsInClusteringMode = false;
+  // the max time-stamp among node uses
+  std::vector<unsigned> LiveTS;
 
 public:
   SethiUllmanQueue(preDDD &ddd, RegisterPressure &rp, SchedConfig config)
@@ -816,28 +822,25 @@ public:
 
   // Add a new ready node.
   void push(preNode *N) override {
-    // Clustering nodes have been added.
-    if (N->isClustered && !N->isClusterLead) {
-      vASSERT(std::find(Clusterings.begin(), Clusterings.end(), N) !=
-              Clusterings.end());
-    } else {
-      Q.push_back(N);
-    }
+    Q.push_back(N);
   }
 
   // Schedule the top node.
   preNode *pickNode() override { return select(); }
 
-  bool empty() const { return Q.empty() && Clusterings.empty(); }
+  bool empty() const { return Q.empty(); }
+
+  friend void BB_Scheduler::SethiUllmanScheduling(bool);
 
 private:
   // Initialize Sethi-Ullman numbers.
   void init();
-
+  // Check if the Tuple restriction is obeyed.
+  bool willNotBreakTupleRestriction(preNode *N) const;
   // Select next ready node to schedule.
   preNode *select();
-
-  preNode *scheduleClusteringNode();
+  // In clustering mode
+  void formWorkingSet(preNode *seed, std::vector<preNode *> &W);
 
   // Compare two ready nodes and decide which one should be scheduled first.
   // Return true if N2 has a higher priority than N1, false otherwise.
@@ -924,6 +927,7 @@ void SethiUllmanQueue::init() {
   unsigned N = (unsigned)Nodes.size();
   MaxRegs.resize(N, 0);
   DstSizes.resize(N, 0);
+  LiveTS.resize(N, N);
   for (auto I = Nodes.rbegin(); I != Nodes.rend(); ++I) {
     calculateSethiUllmanNumber((*I));
   }
@@ -950,21 +954,6 @@ bool SethiUllmanQueue::compare(preNode *N1, preNode *N2) {
   if (N1->getInst()->isPseudoKill())
     return false;
 
-  // Prefer to unlock a pending clustering node.
-  if (IsInClusteringMode) {
-    // Only kick in when top clustering node is not ready.
-    vASSERT(!Clusterings.empty());
-    preNode *Top = Clusterings.back();
-    if (Top->NumSuccsLeft > 0) {
-      for (auto &SuccN : Top->succs()) {
-        if (SuccN.getNode() == N1)
-          return false;
-        if (SuccN.getNode() == N2)
-          return true;
-      }
-    }
-  }
-
   auto SU1 = MaxRegs[N1->getID()] - DstSizes[N1->getID()];
   auto SU2 = MaxRegs[N2->getID()] - DstSizes[N2->getID()];
 
@@ -979,136 +968,19 @@ bool SethiUllmanQueue::compare(preNode *N1, preNode *N2) {
   return N1->getID() > N2->getID();
 }
 
-preNode *SethiUllmanQueue::scheduleClusteringNode() {
-  // Clustering does not work well for SIMD32 before PVC
-  // because all instructions are sliced into SIMD16
-  if (isSlicedSIMD32(ddd.getKernel()))
-    return nullptr;
-
-  // Schedule clustering nodes first.
-  if (IsInClusteringMode && !Clusterings.empty()) {
-    // Pop off already scheduled node, if any.
-    while (!Clusterings.empty() && Clusterings.back()->isScheduled)
-      Clusterings.pop_back();
-
-    // All are scheduled, ending clustering mode.
-    if (Clusterings.empty()) {
-      IsInClusteringMode = false;
-      return nullptr;
-    }
-
-    // The next clustering node is not ready yet.
-    preNode *Top = Clusterings.back();
-    if (Top->NumSuccsLeft > 0)
-      return nullptr;
-
-    // The next clustering node is ready and not scheduled yet.
-    Clusterings.pop_back();
-    if (Clusterings.empty())
-      IsInClusteringMode = false;
-    return Top;
-  }
-
-  // The width limit of clustering.
-  const unsigned CLUSTER_SIZE_MIN = 3;
-  const unsigned CLUSTER_SIZE_MAX = 8;
-
-  // Match clustering nodes.
-  auto collectClustering = [&](preNode *Node, preNode *predNode) {
-    for (auto &E : predNode->succs()) {
-      preNode *N = E.getNode();
-      // Match nodes may not be ready.
-      if (!E.isDataDep() || N->isScheduled)
-        continue;
-      // Do not cluster sends, which may confuse send pairing.
-      if (N->getInst() == nullptr || N->getInst()->isSend())
-        continue;
-      Clusterings.push_back(N);
-    }
-
-    // Check if the first matching is successful.
-    if (unsigned(Clusterings.size()) == predNode->NumSuccsLeft &&
-        unsigned(Clusterings.size()) >= CLUSTER_SIZE_MIN &&
-        unsigned(Clusterings.size()) <= CLUSTER_SIZE_MAX)
-      return true;
-
-    // Check if the second matching is successful.
-    if (unsigned(Q.size()) >= CLUSTER_SIZE_MIN) {
-      Clusterings.clear();
-      for (auto &E : predNode->succs()) {
-        preNode *N = E.getNode();
-        // Only match ready nodes.
-        if (!E.isDataDep() || N->isScheduled || N->NumSuccsLeft)
-          continue;
-        // Do not cluster sends, which may confuse send pairing.
-        if (N->getInst() == nullptr || N->getInst()->isSend())
-          continue;
-        Clusterings.push_back(N);
-      }
-      if (unsigned(Clusterings.size()) == predNode->NumSuccsLeft &&
-          unsigned(Clusterings.size()) >= CLUSTER_SIZE_MIN &&
-          unsigned(Clusterings.size()) <= CLUSTER_SIZE_MAX) {
-        return true;
-      }
-    }
-
-    Clusterings.clear();
-    return false;
-  };
-
-  if (config.DoClustering && Clusterings.empty()) {
-    for (auto Node : Q) {
-      for (auto I = Node->pred_begin(), E = Node->pred_end(); I != E; ++I) {
-        if (I->isDataDep()) {
-          preNode *predN = I->getNode();
-          if (!Visited.insert(predN).second)
-            continue;
-          if (collectClustering(Node, predN))
-            break;
-        }
-      }
-
-      if (!Clusterings.empty()) {
-        for (auto N : Clusterings)
-          N->isClustered = true;
-
-        Q.erase(std::remove_if(Q.begin(), Q.end(),
-                               [](preNode *N) { return N->isClustered; }),
-                Q.end());
-
-        std::sort(
-            Clusterings.begin(), Clusterings.end(),
-            [](preNode *A, preNode *B) { return A->getID() > B->getID(); });
-
-        // We put the leading node back to the regular queue to
-        // participate SU number comparison.
-        preNode *Top = Clusterings.back();
-        Top->isClusterLead = true;
-        if (Top->NumSuccsLeft == 0) {
-          Clusterings.pop_back();
-          Q.push_back(Top);
-          return nullptr;
-        }
-        break;
-      }
-    }
-  }
-
-  return nullptr;
-}
+bool SethiUllmanQueue::willNotBreakTupleRestriction(preNode *N) const {
+  return (!N->getInst() || !N->getInst()->isSend() || !TheCurrTupleLead ||
+          (N->getTupleLead() == TheCurrTupleLead));
+};
 
 preNode *SethiUllmanQueue::select() {
-  if (auto Top = scheduleClusteringNode())
-    return Top;
-
   vASSERT(!Q.empty());
   auto TopIter = Q.end();
   for (auto I = Q.begin(), E = Q.end(); I != E; ++I) {
     preNode *N = *I;
     // If there's a node to be paired, skip send not in pair.
-    if (N->getInst() && N->getInst()->isSend())
-      if (TheCurrTupleLead && N->getTupleLead() != TheCurrTupleLead)
-        continue;
+    if (!willNotBreakTupleRestriction(N))
+      continue;
     if (TopIter == Q.end() || compare(*TopIter, *I))
       TopIter = I;
   }
@@ -1129,14 +1001,121 @@ preNode *SethiUllmanQueue::select() {
   std::swap(*TopIter, Q.back());
   Q.pop_back();
 
-  // This selected node is clustered. From now on, schedule all
-  // other clustered nodes.
-  if (Top->isClustered) {
-    IsInClusteringMode = true;
-    return Top;
+  return Top;
+}
+
+void SethiUllmanQueue::formWorkingSet(preNode *seed,
+                                      std::vector<preNode *> &W) {
+  if (!seed->getInst() || seed->getInst()->isSend()) {
+    W.push_back(seed);
+    return;
   }
 
-  return Top;
+  std::vector<preNode *> Cluster;
+  Cluster.push_back(seed);
+  preNode *ClusterWait = nullptr;
+  unsigned MaxHeight = seed->Height;
+  // looking for cluster by checking source-operand sharing
+  for (auto I = seed->pred_begin(), E = seed->pred_end(); I != E; ++I) {
+    preNode *Pred = I->getNode();
+    // not looking for cluster for instructions sharing tiny-size def
+    if (Pred->getInst() == nullptr || DstSizes[Pred->getID()] < 4)
+      continue;
+    if (I->isFlowDep()) {
+      unsigned UseCnt = 0;
+      for (auto J = Pred->succ_begin(), JE = Pred->succ_end(); J != JE; ++J) {
+        if (J->isFlowDep()) {
+          UseCnt++;
+        }
+      }
+      //  not looking for cluster on operand with too many sharing
+      if (UseCnt > 8)
+        continue;
+      // adding the other uses of Pred to the cluster
+      for (auto J = Pred->succ_begin(), JE = Pred->succ_end(); J != JE; ++J) {
+        preNode *Succ = J->getNode();
+        if (!J->isFlowDep())
+          continue;
+        if (Succ->isScheduled)
+          continue;
+        // this use is not in cluster
+        if (std::find(Cluster.begin(), Cluster.end(), Succ) == Cluster.end()) {
+          Cluster.push_back(Succ);
+          // Succ is not in ready list
+          if (Succ->NumSuccsLeft > 0) {
+            if (ClusterWait == nullptr)
+              ClusterWait = Succ;
+            else if (Succ->Height > ClusterWait->Height)
+              ClusterWait = Succ;
+            MaxHeight = std::max(MaxHeight, ClusterWait->Height);
+          }
+        }
+      }
+    }
+  }
+  // when the entire cluster is ready or the entire cluster is too small
+  // too large, just schedule all ready nodes in the cluster
+  if (!ClusterWait || Cluster.size() <= 2 || Cluster.size() > 5) {
+    W.push_back(seed);
+    unsigned idx = 0;
+    while (idx < Q.size()) {
+      preNode *Tmp = Q[idx];
+      if (std::find(Cluster.begin(), Cluster.end(), Tmp) != Cluster.end()) {
+        // For send instruction which is not part of TheCurrTupleLead, the send
+        // instruction cannot be inserted into W. Which will be scheduled before
+        // the other parts of TheCurrTupleLead.
+        // Such as in following 4 send instructions, first two and last two send
+        // instructions must be schedule together, cannot interleave between
+        // them.
+        //
+        // sample_l.RGB (M1, 16)  0x0:uw S31 %bss V0626.0 %null.0 V0628.0
+        // CCTuple_1.0 CCTuple_1.64
+        // sample_l.RGB(M5, 16) 0x0 : uw S31 %bss V0627.0 %null.0 V0629.0
+        // CCTuple_2.0 CCTuple_2.64
+        //
+        // sample_l.RGB(M1, 16) 0x0 : uw S31 %bss V0640.0 %null.0 V0642.0
+        // CCTuple_3.0 CCTuple_3.64
+        // sample_l.RGB(M5, 16) 0x0 : uw S31 %bss V0641.0 %null.0 V0643.0
+        // CCTuple_4.0 CCTuple_4.64
+        if (willNotBreakTupleRestriction(Tmp)) {
+          W.push_back(Tmp);
+          Q[idx] = Q.back();
+          Q.pop_back();
+        } else {
+          idx++;
+        }
+      } else
+        idx++;
+    }
+    return;
+  }
+  // cluster is not ready, find a ready node that can enable the cluster
+  auto Top = ClusterWait;
+  bool Searching = (MaxHeight - seed->Height <= 20);
+  while (Searching) {
+    Searching = false;
+    for (auto I = Top->succ_begin(), E = Top->succ_end(); I != E; ++I) {
+      auto Node = I->getNode();
+      if (!Node->isScheduled) {
+        if (Node->NumSuccsLeft > 0) {
+          Top = Node; // continue search
+          Searching = true;
+          break;
+        } else if (willNotBreakTupleRestriction(Node)) {
+          if (Node != seed) {
+            Q.erase(std::remove(Q.begin(), Q.end(), Node), Q.end());
+            Q.push_back(seed);
+          }
+          W.push_back(Node);
+          return;
+        }
+      }
+    }
+  }
+  if (W.empty()) {
+    W.push_back(seed);
+    return;
+  }
 }
 
 // The basic idea is...
@@ -1144,9 +1123,15 @@ preNode *SethiUllmanQueue::select() {
 bool BB_Scheduler::scheduleBlockForPressure(unsigned &MaxPressure,
                                             unsigned Threshold) {
   auto tryRPReduction = [=]() {
-    if (!config.UseSethiUllman)
+    if (!config.UseMinReg)
       return false;
-    return MaxPressure >= Threshold;
+    if (MaxPressure < Threshold)
+      return false;
+    // MaxRP at the block entry or exit, cannot change that
+    if (MaxPressure == rp.getPressure(ddd.getBB()->front()) ||
+        MaxPressure == rp.getPressure(ddd.getBB()->back()))
+      return false;
+    return true;
   };
 
   bool Changed = false;
@@ -1155,55 +1140,101 @@ bool BB_Scheduler::scheduleBlockForPressure(unsigned &MaxPressure,
     if (kernel.getOptions()->getOption(vISA_DumpDagTxt)) {
       ddd.dumpDagTxt(rp);
     }
-    SethiUllmanScheduling();
-    if (commitIfBeneficial(MaxPressure)) {
-      SCHED_DUMP(rp.dump(ddd.getBB(), "After scheduling for presssure, "));
-      Changed = true;
-    } else if (!config.DoClustering &&
-               !isSlicedSIMD32(ddd.getKernel())) { // try clustering
-      ddd.reset(false);
-      auto SaveClustering = config.DoClustering;
-      config.DoClustering = 1;
-      SethiUllmanScheduling();
-      config.DoClustering = SaveClustering;
+    if (!config.SkipClustering) {
+      // try clustering first
+      SethiUllmanScheduling(true);
       if (commitIfBeneficial(MaxPressure)) {
         SCHED_DUMP(rp.dump(ddd.getBB(), "After scheduling for presssure, "));
+        kernel.fg.builder->getJitInfo()->statsVerbose.minRegClusterCount++;
+        Changed = true;
+      } else {
+        ddd.reset(false);
+      }
+    }
+    if (!Changed) {
+      // try not-clustering
+      SethiUllmanScheduling(false);
+      if (commitIfBeneficial(MaxPressure)) {
+        SCHED_DUMP(rp.dump(ddd.getBB(), "After scheduling for presssure, "));
+        kernel.fg.builder->getJitInfo()->statsVerbose.minRegSUCount++;
         Changed = true;
       }
     }
   }
+  if (!Changed)
+    kernel.fg.builder->getJitInfo()->statsVerbose.minRegRestCount++;
   return Changed;
 }
 
-void BB_Scheduler::SethiUllmanScheduling() {
+void BB_Scheduler::SethiUllmanScheduling(bool DoClustering) {
   schedule.clear();
   SethiUllmanQueue Q(ddd, rp, config);
   Q.push(ddd.getExitNode());
 
   while (!Q.empty()) {
     preNode *N = Q.pickNode();
-    vASSERT(!N->isScheduled && N->NumSuccsLeft == 0);
-    if (N->getInst() != nullptr) {
-      // std::cerr << "emit: "; N->getInst()->dump();
-      if (N->getInst()->isSend() && N->getTupleLead()) {
-        // If it's the pair of the current node, reset the node to be
-        // paired. If it's send with pair, ensure its pair is scheduled
-        // before other sends by setting the current node to be paired.
-        if (!Q.getCurrTupleLead())
-          Q.setCurrTupleLead(N);
-        if (Q.getCurrTupleLead())
-          Q.updateCurrTupleLead(N);
+    std::vector<preNode *> W;
+    if (DoClustering)
+      Q.formWorkingSet(N, W);
+    else
+      W.push_back(N);
+    while (!W.empty()) {
+      N = W.back();
+      W.pop_back();
+      vASSERT(!N->isScheduled && N->NumSuccsLeft == 0);
+      if (N->getInst() != nullptr) {
+        // std::cerr << "emit: "; N->getInst()->dump();
+        if (N->getInst()->isSend() && N->getTupleLead()) {
+          // If it's the pair of the current node, reset the node to be
+          // paired. If it's send with pair, ensure its pair is scheduled
+          // before other sends by setting the current node to be paired.
+          if (!Q.getCurrTupleLead())
+            Q.setCurrTupleLead(N);
+          if (Q.getCurrTupleLead())
+            Q.updateCurrTupleLead(N);
+        }
+        schedule.push_back(N->getInst());
+        N->isScheduled = true;
       }
-      schedule.push_back(N->getInst());
-      N->isScheduled = true;
-    }
-
-    for (auto I = N->pred_begin(), E = N->pred_end(); I != E; ++I) {
-      preNode *Node = I->getNode();
-      vASSERT(!Node->isScheduled && Node->NumSuccsLeft);
-      --Node->NumSuccsLeft;
-      if (Node->NumSuccsLeft == 0)
-        Q.push(Node);
+      // update LiveTS, which is used both in priority-comparision
+      // and register-releasing scheduling
+      for (auto I = N->pred_begin(), E = N->pred_end(); I != E; ++I) {
+        preNode *Node = I->getNode();
+        vASSERT(!Node->isScheduled && Node->NumSuccsLeft);
+        if (I->isFlowDep()) {
+          Q.LiveTS[Node->getID()] =
+              std::min(Q.LiveTS[Node->getID()], (unsigned)schedule.size());
+        }
+      }
+      for (auto I = N->pred_begin(), E = N->pred_end(); I != E; ++I) {
+        preNode *Node = I->getNode();
+        --Node->NumSuccsLeft;
+        if (Node->NumSuccsLeft == 0) {
+          if (Node->getInst() == nullptr) {
+            W.push_back(Node);
+          } else if (Node->getInst()->isSend() && Node->getTupleLead()) {
+            Q.push(Node);
+          } else {
+            // if newly available node does not increase pressure,
+            // schedule it immediately
+            int SzDelta = (Q.LiveTS[Node->getID()] <= schedule.size())
+                              ? (int)Q.DstSizes[Node->getID()]
+                              : 0;
+            for (auto J = Node->pred_begin(), JE = Node->pred_end(); J != JE;
+                 ++J) {
+              if (J->isFlowDep()) {
+                auto NodeJ = J->getNode();
+                if (Q.LiveTS[NodeJ->getID()] > schedule.size())
+                  SzDelta = SzDelta - (int)Q.DstSizes[NodeJ->getID()];
+              }
+            }
+            if (SzDelta >= 0)
+              W.push_back(Node);
+            else
+              Q.push(Node);
+          }
+        }
+      }
     }
   }
 
@@ -2695,23 +2726,29 @@ void preDDD::reset(bool ReassignNodeID) {
     N->NumSuccsLeft = unsigned(N->Succs.size());
     N->isScheduled = false;
     N->setReadyCycle(0);
-    N->isClustered = false;
-    N->isClusterLead = false;
   }
 
   EntryNode.NumPredsLeft = 0;
   EntryNode.NumSuccsLeft = unsigned(EntryNode.Succs.size());
   EntryNode.isScheduled = false;
   EntryNode.setReadyCycle(0);
-  EntryNode.isClustered = false;
-  EntryNode.isClusterLead = false;
 
   ExitNode.NumPredsLeft = unsigned(ExitNode.Preds.size());
   ExitNode.NumSuccsLeft = 0;
   ExitNode.isScheduled = false;
   ExitNode.setReadyCycle(0);
-  ExitNode.isClustered = false;
-  ExitNode.isClusterLead = false;
+  // compute height
+  // sort its successor in height-descending order
+  for (auto N : SNodes) {
+    std::sort(N->Succs.begin(), N->Succs.end(), [](preEdge &A, preEdge &B) {
+      auto *AN = A.getNode();
+      auto *BN = B.getNode();
+      return (AN->Height > BN->Height) ||
+             (AN->Height == BN->Height && AN->getID() > BN->getID());
+    });
+    if (N->succs().size())
+      N->Height = N->succs().front().getNode()->Height + 1;
+  }
 }
 
 void preDDD::dumpDagTxt(RegisterPressure &rp) {
@@ -2778,10 +2815,8 @@ void preDDD::dumpDagTxt(RegisterPressure &rp) {
     }
     // Edge
     for (auto &E : N->Preds) {
-      DepType depType = E.getType();
       auto DefInst = E.getNode()->getInst();
-      if (DefInst && !DefInst->isPseudoKill() &&
-          (depType == RAW || depType == WAW))
+      if (DefInst && !DefInst->isPseudoKill() && E.isFlowDep())
         ofile << ", " << E.getNode()->ID;
     }
     ofile << "\n";

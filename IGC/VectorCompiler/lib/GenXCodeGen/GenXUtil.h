@@ -32,7 +32,6 @@ SPDX-License-Identifier: MIT
 #include <algorithm>
 #include <cstdint>
 #include <iterator>
-#include <unordered_map>
 #include <vector>
 
 namespace llvm {
@@ -67,6 +66,7 @@ inline int log2(T Val)
 
 // Common functionality for media ld/st lowering and CISA builder
 template <typename T> inline T roundedVal(T Val, T RoundUp) {
+  IGC_ASSERT_EXIT(Val >= 1);
   T RoundedVal = static_cast<T>(1) << genx::log2(Val);
   if (RoundedVal < Val)
     RoundedVal *= 2;
@@ -128,6 +128,22 @@ Instruction *convertShlShr(Instruction *Inst);
 bool splitStructPhis(Function *F);
 bool splitStructPhi(PHINode *Phi);
 
+// Is an instruction or contant expression bitcast.
+inline bool isABitCast(Value *V) {
+  return isa<BitCastInst>(V) ||
+         (isa<ConstantExpr>(V) &&
+          cast<ConstantExpr>(V)->getOpcode() == CastInst::BitCast);
+}
+
+inline Value *peelBitCastsInSingleUseChain(User *U) {
+  while (isABitCast(U) && U->hasOneUse())
+    U = *U->user_begin();
+  return U;
+}
+
+// Get user values peeling off intermittent bitcasts chains.
+llvm::SmallPtrSet<Value *, 4> peelBitCastsGetUserValues(Value *V);
+
 // Get original value before bit-casting chain.
 Value *getBitCastedValue(Value *V);
 
@@ -144,11 +160,20 @@ class Bale;
 
 bool isGlobalStore(Instruction *I);
 bool isGlobalStore(StoreInst *ST);
-bool isGlobalVolatileStore(Instruction *I, Value *GV_ = nullptr);
-
 bool isGlobalLoad(Instruction *I);
 bool isGlobalLoad(LoadInst* LI);
-bool isGlobalVolatileLoad(Instruction *I, Value *GV_ = nullptr);
+
+Value *getAVLoadSrcOrNull(Instruction *I, Value *CmpSrc = nullptr);
+Value *getAGVLoadSrcOrNull(Instruction *I, Value *CmpSrc = nullptr);
+bool isAVLoad(Instruction *I);
+bool isAVLoad(Instruction *I, Value *CmpSrc);
+bool isAGVLoad(Instruction *I, Value *CmpGvSrc = nullptr);
+
+Value *getAVStoreDstOrNull(Instruction *I, Value *CmpDst = nullptr);
+Value *getAGVStoreDstOrNull(Instruction *I, Value *CmpDst = nullptr);
+bool isAVStore(Instruction *I);
+bool isAVStore(Instruction *I, Value *CmpDst);
+bool isAGVStore(Instruction *I, Value *CmpGvDst = nullptr);
 
 // Check that V is correct as value for global store to StorePtr.
 // This implies:
@@ -741,17 +766,11 @@ public:
 std::size_t getStructElementPaddedSize(unsigned ElemIdx, unsigned NumOperands,
                                        const StructLayout &Layout);
 
-// Determine if there is a store to global variable Addr in between of L1 and
-// L2. L1 and L2 can be either vloads or regular stores.
-// TODO: replace with getInterveningGVStoreOrNull.
-bool hasMemoryDeps(Instruction *L1, Instruction *L2, Value *Addr,
-                   const DominatorTree *DT);
-
 // Return true if V is rdregion from a load result.
-bool isRdRFromGlobalLoad(Value *V);
+bool isRdRWithOldValueVLoadSrc(Value *V);
 
 // Return true if wrregion has result of load as old value.
-bool isWrRToGlobalLoad(Value *V);
+bool isWrRWithOldValueVLoadSrc(Value *V);
 
 //----------------------------------------------------------
 // Check that a Store potentially clobbers Load's Use.
@@ -760,40 +779,39 @@ bool isWrRToGlobalLoad(Value *V);
 // S clobbers L if there's a path from S to U not through
 // L: { S -> U } != { S -> L -> U }
 //----------------------------------------------------------
-// This helper is similar to but not the same as hasMemoryDeps.
-// It also properly works with loops (e.g. in case SI follows UI in a loop
-// body).
 // NB: This function may return a call to a user function as a potential
 //     intervening store. If CallSites is supplied, we'll limit our lookup to
 //     the call instructions mentioned in this list.
 // NB: There may be multiple intervening stores, for now we don't have
 //     a use case where we want the whole list, hence this variant
 //     only returns the first found.
-Instruction *getInterveningGVStoreOrNull(
-    Instruction *LI, Instruction *UIOrPos,
-    llvm::SetVector<Instruction *> *CallSites = nullptr);
+Instruction *getAVLoadKillOrNull(
+    Instruction *LI, Instruction *PosI, bool PosIsReachableFromLI = false,
+    const DominatorTree *DT = nullptr,
+    const SmallPtrSet<BasicBlock *, 2> *ExcludeBlocksOnCfgTraversal = nullptr,
+    const llvm::SmallVector<Instruction *, 8> *KillCallSites = nullptr);
 
 bool checkGVClobberingByInterveningStore(
     Instruction *LI, llvm::GenXBaling *Baling, llvm::GenXLiveness *Liveness,
     const llvm::StringRef PassName,
     llvm::SetVector<Instruction *> *SIs = nullptr);
 
-void collectRelatedCallSitesPerFunction(
-    Instruction *SI, class FunctionGroup *FG,
-    std::unordered_map<Function *, llvm::SetVector<Instruction *>>
-        &InstAndRelatedCallSitesPerFunction);
+llvm::SmallPtrSet<Instruction *, 1> getSrcVLoads(Instruction *I);
+Instruction *getSrcVLoadOrNull(Instruction *I);
+bool hasVLoadSource(Instruction *I);
 
-llvm::SetVector<Instruction *> getAncestorGVLoads(Instruction *I,
-                                                  bool OneLevel = false);
-Instruction *getAncestorGVLoadOrNull(Instruction *I, bool OneLevel = false);
-bool hasGVLoadSource(Instruction *I);
+bool isSafeToReplaceInstCheckAVLoadKill(Instruction *OldI,
+                                        Instruction *ReplacementI);
+bool isSafeToMoveBaleCheckAVLoadKill(const Bale &B, Instruction *To);
+bool isSafeToMoveInstCheckAVLoadKill(Instruction *I, Instruction *To);
+bool isSafeToMoveInstCheckAVLoadKill(Instruction *I, Instruction *To,
+                                     GenXBaling *Baling_);
+bool isSafeToUseAtPosCheckAVLoadKill(Instruction *I, Instruction *To);
 
-bool isSafeToMoveBaleCheckGVLoadClobber(const Bale &B, Instruction *To);
-bool isSafeToMoveInstCheckGVLoadClobber(
-    Instruction *I, Instruction *To,
-    bool OnlyImmediateGVLoadPredecessors = true);
-bool isSafeToMoveInstCheckGVLoadClobber(Instruction *I, Instruction *To,
-                                        GenXBaling *Baling_);
+bool loadingSameValue(Instruction *L1, Instruction *L2,
+                      const DominatorTree *DT);
+bool isBitwiseIdentical(Value *V1, Value *V2,
+                        const DominatorTree *DT = nullptr);
 
 } // namespace genx
 } // namespace llvm

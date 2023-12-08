@@ -76,6 +76,13 @@ static MsgOp ConvertLSCOpToMsgOp(LSC_OP op) {
     return MsgOp::ATOMIC_XOR;
   case LSC_OP::LSC_ATOMIC_OR:
     return MsgOp::ATOMIC_OR;
+  //
+  case LSC_OP::LSC_APNDCTR_ATOMIC_ADD:
+    return MsgOp::ATOMIC_ACADD;
+  case LSC_OP::LSC_APNDCTR_ATOMIC_SUB:
+    return MsgOp::ATOMIC_ACSUB;
+  case LSC_OP::LSC_APNDCTR_ATOMIC_STORE:
+    return MsgOp::ATOMIC_ACSTORE;
   case LSC_OP::LSC_FENCE:
     return MsgOp::FENCE;
   case LSC_OP::LSC_READ_STATE_INFO:
@@ -121,7 +128,7 @@ static DataOrder ConvertLSCDataOrder(LSC_DATA_ORDER dord, bool vnni = false) {
 
 G4_ExecSize IR_Builder::lscMinExecSize(LSC_SFID lscSfid) const {
   const TARGET_PLATFORM P = getPlatform();
-  uint32_t minExecSize = ((P == Xe_DG2 || P == Xe_MTL) ? 8 : 16);
+  uint32_t minExecSize = ((P == Xe_DG2 || P == Xe_MTL || P == Xe_ARL) ? 8 : 16);
   if (!hasLSCEnableHalfSIMD())
   {
     minExecSize *= 2;
@@ -170,14 +177,12 @@ static Caching ConvertLSCCacheOpt(LSC_CACHE_OPT co) {
     return Caching::ST;
   case LSC_CACHING_READINVALIDATE:
     return Caching::RI;
+  case LSC_CACHING_CONSTCACHED:
+    return Caching::CC;
   default:
     vISA_ASSERT_UNREACHABLE("invalid caching");
   }
   return Caching::INVALID;
-}
-static std::pair<Caching, Caching> ConvertLSCCacheOpts(LSC_CACHE_OPT col1,
-                                                       LSC_CACHE_OPT col3) {
-  return std::make_pair(ConvertLSCCacheOpt(col1), ConvertLSCCacheOpt(col3));
 }
 
 static G4_Operand *lscTryPromoteSurfaceImmToExDesc(G4_Operand *surface,
@@ -225,15 +230,9 @@ static int alignUp(int a, int n) { return n + a - 1 - ((n + a - 1) % a); }
 static int lscBlock2dComputeDataRegs(LSC_OP op,
                                      LSC_DATA_SHAPE_BLOCK2D dataShape2d,
                                      int BYTES_PER_REG, int dataSizeBits) {
-  auto roundUpToPowerOf2 = [](int n) {
-    while (n & (n - 1))
-      n++;
-    return n;
-  };
-
   bool transpose = dataShape2d.order == LSC_DATA_ORDER_TRANSPOSE;
   int grfRowPitchElems =
-      roundUpToPowerOf2(!transpose ? dataShape2d.width : dataShape2d.height);
+      RoundUpToPowerOf2(!transpose ? dataShape2d.width : dataShape2d.height);
   int blockRows = !transpose ? dataShape2d.height : dataShape2d.width;
   int elemsPerGrf = 8 * BYTES_PER_REG / dataSizeBits;
   // alignUp needed for padding between blocks; each block pads out to
@@ -372,6 +371,7 @@ int IR_Builder::translateLscUntypedInst(
   // send descriptor
   uint32_t desc = 0;
   uint32_t exDesc = 0;
+  uint32_t exDescImmOff = 0;
 
   // try and promote the surface identifier (e.g. BTI or SS obj) to ex desc
   surface = lscTryPromoteSurfaceImmToExDesc(surface, addrInfo.type, exDesc);
@@ -444,6 +444,8 @@ int IR_Builder::translateLscUntypedInst(
   src0Addr = lscLoadEffectiveAddress(op, lscSfid, pred, addrExecSize,
                                      addrExecCtrl, addrInfo, dataSizeBits / 8,
                                      surface, src0Addr, exDesc
+                                     ,
+                                     exDescImmOff
   );
 
   uint32_t dataRegs = 1;
@@ -646,6 +648,7 @@ int IR_Builder::translateLscUntypedInst(
       createLscDesc(sfid, desc, exDesc, src1Len,
                     getSendAccessType(loadAccess, storeAccess),
                     surface, LdStAttrs::NONE);
+  msgDesc->setExDescImmOff(exDescImmOff);
 
   auto sendInst =
     createLscSendInst(pred, dstRead, src0Addr, src1Data, execSize, msgDesc,
@@ -661,8 +664,9 @@ int IR_Builder::translateLscUntypedBlock2DInst(
     LSC_CACHE_OPTS cacheOpts, LSC_DATA_SHAPE_BLOCK2D dataShape2D,
     G4_DstRegRegion *dstRead, // dst can be NULL reg (e.g store)
     G4_Operand *src0Addrs[LSC_BLOCK2D_ADDR_PARAMS], // always the addresses
-    G4_SrcRegRegion *src1Data                       // store data
-){
+    G4_SrcRegRegion *src1Data, // store data
+    int xImmOff, int yImmOff)
+{
   TIME_SCOPE(VISA_BUILDER_IR_CONSTRUCTION);
 
   int status = VISA_SUCCESS;
@@ -700,8 +704,22 @@ int IR_Builder::translateLscUntypedBlock2DInst(
   const G4_ExecSize execSize = toExecSize(visaExecSize);
   const G4_InstOpts instOpt = Get_Gen4_Emask(emask, execSize);
 
+
+  int emuImmOffX = 0, emuImmOffY = 0;
+  auto immOffNeedsEmu = [&](int off) {
+    return true;
+  };
+  if (immOffNeedsEmu(xImmOff)) {
+    emuImmOffX = xImmOff;
+    xImmOff = 0;
+  }
+  if (immOffNeedsEmu(yImmOff)) {
+    emuImmOffY = yImmOff;
+    yImmOff = 0;
+  }
   G4_SrcRegRegion *src0Addr =
-      lscBuildBlock2DPayload(dataShape2D, pred, src0Addrs);
+      lscBuildBlock2DPayload(dataShape2D, pred, src0Addrs,
+                             emuImmOffX, emuImmOffY);
 
   SFID sfid = SFID::NULL_SFID;
   switch (lscSfid) {
@@ -719,7 +737,6 @@ int IR_Builder::translateLscUntypedBlock2DInst(
   }
   // send descriptor
   uint32_t desc = 0;
-  uint32_t exDesc = 0;
 
   desc |= opInfo.encoding;
   if (dataShape2D.vnni)
@@ -755,6 +772,11 @@ int IR_Builder::translateLscUntypedBlock2DInst(
 
   desc |= dstLen << 20;   // Desc[24:20]  dst len
   desc |= addrRegs << 25; // Desc[28:25]  src0 len
+
+
+  uint32_t exDesc = 0;
+  exDesc |= ((uint32_t)xImmOff & 0x3FF) << 12;
+  exDesc |= ((uint32_t)yImmOff & 0x3FF) << 22;
 
   G4_SendDescRaw *msgDesc =
       createLscDesc(sfid, desc, exDesc, src1Len,
@@ -1270,7 +1292,8 @@ IR_Builder::lscBuildStridedPayload(G4_Predicate *pred,
 G4_SrcRegRegion *
 IR_Builder::lscBuildBlock2DPayload(LSC_DATA_SHAPE_BLOCK2D dataShape2D,
                                    G4_Predicate *pred,
-                                   G4_Operand *src0Addrs[6]) {
+                                   G4_Operand *src0Addrs[6],
+                                   int immOffX, int immOffY) {
   // Similar to lscBuildStridedPayload, but this formats the payload
   // as follows.
   //
@@ -1309,14 +1332,32 @@ IR_Builder::lscBuildBlock2DPayload(LSC_DATA_SHAPE_BLOCK2D dataShape2D,
     createInst(pred, G4_mov, nullptr, g4::NOSAT, g4::SIMD1, payloadDstAddr_0_Q,
                src, nullptr, Get_Gen4_Emask(vISA_EMASK_M1_NM, g4::SIMD1), true);
   };
-  auto movUD = [&](int dstSubReg, G4_Operand *src) {
+  auto movUD = [&](int dstSubReg, G4_Operand *src, const char *comm) {
     G4_DstRegRegion *payloadDst =
         createDst(addrTmpDeclUd->getRegVar(), 0, dstSubReg, 1, Type_UD);
-    createInst(pred, G4_mov, nullptr, g4::NOSAT, g4::SIMD1, payloadDst, src,
-               nullptr, Get_Gen4_Emask(vISA_EMASK_M1_NM, g4::SIMD1), true);
+    auto *i = createInst(pred, G4_mov, nullptr, g4::NOSAT, g4::SIMD1, payloadDst,
+                         src, nullptr,
+                         Get_Gen4_Emask(vISA_EMASK_M1_NM, g4::SIMD1), true);
+    if (comm)
+      i->addComment(comm);
   };
-  auto movImmUD = [&](int dstSubReg, uint32_t imm) {
-    movUD(dstSubReg, createImmWithLowerType(imm, Type_UD));
+  auto addD = [&](int dstSubReg, G4_Operand *src, int addend,
+                  const char *comm) {
+    if (addend == 0) {
+      movUD(dstSubReg, src, comm);
+      return;
+    }
+    G4_DstRegRegion *payloadDst =
+        createDst(addrTmpDeclUd->getRegVar(), 0, dstSubReg, 1, Type_D);
+    auto *i = createInst(pred, G4_add, nullptr, g4::NOSAT, g4::SIMD1,
+                         payloadDst, src,
+                         createImmWithLowerType(addend, Type_D),
+                         Get_Gen4_Emask(vISA_EMASK_M1_NM, g4::SIMD1), true);
+    if (comm)
+      i->addComment(comm);
+  };
+  auto movImmUD = [&](int dstSubReg, uint32_t imm, const char *comm) {
+    movUD(dstSubReg, createImmWithLowerType(imm, Type_UD), comm);
   };
 
   ///////////////////////////////////
@@ -1332,16 +1373,18 @@ IR_Builder::lscBuildBlock2DPayload(LSC_DATA_SHAPE_BLOCK2D dataShape2D,
   //
   // bottom 64b
   movUQ(0, src0Addrs[0]); // surface address
-                          // these start at REG.2:d
-  movUD(2, src0Addrs[1]); // surface width - 1
-  movUD(3, src0Addrs[2]); // surface height - 1
-  movUD(4, src0Addrs[3]); // surface pitch - 1
-  movUD(5, src0Addrs[4]); // block x
-  movUD(6, src0Addrs[5]); // block y
+  movUD(2, src0Addrs[1], "blk2d.widthM1"); // surface width - 1
+  movUD(3, src0Addrs[2], "blk2d.heightM1"); // surface height - 1
+  movUD(4, src0Addrs[3], "blk2d.pitchM1"); // surface pitch - 1
+  addD(5, src0Addrs[4], immOffX, "blk2d.X"); // block x
+  addD(6, src0Addrs[5], immOffY, "blk2d.Y"); // block y
   uint32_t blockSize = (dataShape2D.width - 1) |
                        ((dataShape2D.height - 1) << 8) |
                        ((dataShape2D.blocks - 1) << 16);
-  movImmUD(7, blockSize);
+  std::stringstream ss;
+  ss << "bkl2d.shape = " << dataShape2D.blocks << "x" << dataShape2D.width <<
+      "x" << dataShape2D.height;
+  movImmUD(7, blockSize, ss.str().c_str());
   //
   return createSrc(addrTmpDeclUd->getRegVar(), 0, 0, getRegionScalar(),
                    Type_UD);
@@ -1350,7 +1393,8 @@ IR_Builder::lscBuildBlock2DPayload(LSC_DATA_SHAPE_BLOCK2D dataShape2D,
 G4_SrcRegRegion *IR_Builder::lscLoadEffectiveAddress(
     LSC_OP lscOp, LSC_SFID lscSfid, G4_Predicate *pred, G4_ExecSize execSize,
     VISA_EMask_Ctrl execCtrl, LSC_ADDR addrInfo, int bytesPerDataElem,
-    const G4_Operand *surface, G4_SrcRegRegion *addr, uint32_t &exDesc
+    const G4_Operand *surface, G4_SrcRegRegion *addr, uint32_t &exDesc,
+    uint32_t &exDescImmOff
 ) {
   vISA_ASSERT_INPUT(addrInfo.immScale == 1, "address scaling not supported yet");
   // The address may need scaling and offset adjustment
@@ -1359,11 +1403,125 @@ G4_SrcRegRegion *IR_Builder::lscLoadEffectiveAddress(
   // e.g. lsc_load.ugm.d32.a64 ... [4*ADDR - 0x100]
   //
 
+  if (lscTryPromoteImmOffToExDesc(lscOp, lscSfid, addrInfo, bytesPerDataElem,
+                                  surface, exDesc, exDescImmOff)) {
+    // we were able to encode the immediate offset
+    // zero so lscMulAdd doesn't try and emulate
+    addrInfo.immOffset = 0;
+  }
   // emulate scale and add if necessary
   return lscMulAdd(pred, execSize, execCtrl, addr, (int16_t)addrInfo.immScale,
                    addrInfo.immOffset);
 }
 
+bool IR_Builder::lscTryPromoteImmOffToExDesc(
+    LSC_OP lscOp, LSC_SFID lscSfid, LSC_ADDR addrInfo, int bytesPerDataElem,
+    const G4_Operand *surface, uint32_t &exDesc, uint32_t &exDescImmOff) {
+  // Xe2 supports a signed immediate offset
+  //   - must be DW aligned but value is in signed bytes
+  //   - not TGM (only UGM, SLM, URB, ...)
+  //   - enabled for BTI [23:12] and flat [31:12]
+  //     things aren't well defined given BTI if ExDesc.IsReg
+  //   - ExDesc must be an immediate field, not an a0.# register
+  //      The spec says: "Must programmed with an immediate value in EU SEND
+  //      instruction."
+  //       (and I confirmed this was the meaning)
+  // Xe2 extends this support for BSS/SS, but only
+  //      if ExDesc is a register (we also get most of the ExDescImm bits)
+
+  // fast path
+  if (addrInfo.immOffset == 0)
+    return true;
+
+  bool supportedPlatform = getPlatform() >= Xe2;
+  if (!supportedPlatform)
+    return false;
+
+  if (lscSfid == LSC_TGM)
+    return false; // TGM not supported
+
+  uint32_t enabledAddrTypes =
+      m_options->getuInt32Option(vISA_lscEnableImmOffsFor);
+  bool isEnabledAddrType =
+      (enabledAddrTypes & (1 << getLscImmOffOpt(addrInfo.type))) != 0;
+  if (!isEnabledAddrType) {
+    return false;
+  }
+
+  auto fitsIn = [&](int what, int bits) {
+    return what >= -(1 << (bits - 1)) && what <= (1 << (bits - 1)) - 1;
+  };
+
+  // offsets must be Dword aligned
+  // + careful handling of block2d where the offset is in elements not bytes
+  bool isBlock2d = lscOp == LSC_LOAD_BLOCK2D || lscOp == LSC_STORE_BLOCK2D;
+  if (isBlock2d) {
+    vISA_ASSERT_INPUT(lscSfid != LSC_TGM, "block2d mustn't be TGM for this");
+    vISA_ASSERT_INPUT(addrInfo.type == LSC_ADDR_TYPE_FLAT, "block2d must be flat");
+    vISA_ASSERT_INPUT(false, "block2d not supported yet");
+    //        if (bytesPerDataElem * addrInfo.immOffsetX % 4 != 0 ||
+    //            !fitsIn(addrInfo.immOffsetX, 10))
+    //        {
+    //            return false;
+    //        }
+    //        if (bytesPerDataElem * addrInfo.immOffsetY % 4 != 0 ||
+    //            !fitsIn(addrInfo.immOffsetY, 10))
+    //        {
+    //            return false;
+    //        }
+  } else {
+    if (addrInfo.immOffset % 4 != 0) {
+      return false;
+    }
+    if (addrInfo.type == LSC_ADDR_TYPE_FLAT &&
+        !fitsIn(addrInfo.immOffset, 20)) {
+      return false;
+    }
+  }
+
+  bool isFlatAndCanPromote =
+      addrInfo.type == LSC_ADDR_TYPE_FLAT &&
+      surface == nullptr; // FLAT should always be ExDesc.IsImm, but we check
+
+  bool isBtiAndCanPromote = // BTI requires ExDesc.IsImm
+      addrInfo.type == LSC_ADDR_TYPE_BTI &&
+      surface == nullptr && // only if ExDesc is imm
+      fitsIn(addrInfo.immOffset, 12);
+  //
+  bool isBssSsAndCanPromote = (addrInfo.type == LSC_ADDR_TYPE_BSS ||
+                               addrInfo.type == LSC_ADDR_TYPE_SS) &&
+                              surface != nullptr && // only if ExDesc.IsReg
+                              fitsIn(addrInfo.immOffset, 17);
+  //
+  if (isFlatAndCanPromote) {
+    // FLAT gets ExDesc[31:12] (signed 20b) or (signed 10b:signed 10b) for
+    // block2d
+    if (isBlock2d) {
+      vISA_ASSERT_INPUT(false, "block2d not supported yet");
+      // exDesc |= ((uint32_t)(addrInfo.immOffsetX & 0x3FF) << 12);
+      // exDesc |= ((uint32_t)(addrInfo.immOffsetY & 0x3FF) << (10 + 12));
+    } else {
+      exDesc |= ((uint32_t)addrInfo.immOffset << 12);
+    }
+    return true;
+  } else if (isBtiAndCanPromote) {
+    // BTI gets ExDesc[23:12] (signed 12b)
+    exDesc |= 0x00FFF000 & ((uint32_t)addrInfo.immOffset << 12);
+    return true;
+  } else if (isBssSsAndCanPromote) {
+    // BSS/SS
+       //   the value is stored in
+       //   Imm[16:4][3:0] => ExDescImm[31:19][15:12]
+       //     (bits ExDescImm[18:16] are MBZ)
+    uint32_t encddUnshifted = (((uint32_t)addrInfo.immOffset & ~0xF) << 3) |
+                              ((uint32_t)addrInfo.immOffset & 0xF);
+    exDescImmOff = (uint32_t)(encddUnshifted << 12);
+    return true;
+  } else {
+    // unsupported immediate offset case
+    return false;
+  }
+}
 
 G4_SrcRegRegion *IR_Builder::lscCheckRegion(G4_Predicate *pred,
                                             G4_ExecSize execSize,

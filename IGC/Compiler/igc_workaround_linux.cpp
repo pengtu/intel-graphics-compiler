@@ -152,6 +152,8 @@ namespace IGC
 
             break;
         case IGFX_METEORLAKE:
+        case IGFX_ARROWLAKE:
+        case IGFX_LUNARLAKE:
         /* This is just a place holder the WA application has moved below and changed
         its no longer based on platform */
             break;
@@ -178,6 +180,10 @@ namespace IGC
                 else if (GFX_GET_GMD_RELEASE_VERSION_RENDER(platform->getPlatformInfo()) == GFX_GMD_ARCH_12_RELEASE_XE_LP_LG)
                 {
                     InitGt_12_71HwWaTable(&waTable, pSkuFeatureTable, &stWaInitParam);
+                }
+                else if (GFX_GET_GMD_RELEASE_VERSION_RENDER(platform->getPlatformInfo()) == GFX_GMD_ARCH_12_RELEASE_XE_LPG_PLUS_1274)
+                {
+                    InitGt_12_74HwWaTable(&waTable, pSkuFeatureTable, &stWaInitParam);
                 }
                 InitGt_12_70SwWaTable(&waTable, pSkuFeatureTable, &stWaInitParam);
             }

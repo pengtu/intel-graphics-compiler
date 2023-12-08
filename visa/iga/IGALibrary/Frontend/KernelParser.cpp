@@ -1173,6 +1173,8 @@ public:
     case OpSpec::SEND_BINARY:
       if (platform() <= Platform::XE) {
         ParseSendInstructionLegacy();
+      } else if (platform() == Platform::XE2) {
+        ParseSendInstructionXe2();
       } else if (platform() >= Platform::XE_HP) {
         ParseSendInstructionXeHP();
       } else {
@@ -1295,6 +1297,16 @@ public:
     ParseSendSrc1OpWithOptLen(src1Len);
     ParseSendDescsWithOptSrc1Len(src1Len);
   }
+
+  // same as prior sends, but has ExDescImm (c.f. ParseSendDescsXe2)
+  void ParseSendInstructionXe2() {
+    ParseSendDstOp();
+    ParseSendSrcOp(0, false);
+    int src1Len = -1;
+    ParseSendSrc1OpWithOptLen(src1Len);
+    ParseSendDescsXe2(src1Len);
+  }
+
 
   // Predication = ('(' WrEnPred ')')?
   //   where WrEnPred = WrEn
@@ -2203,9 +2215,6 @@ public:
       // r13.acc2:f
       subregNum = 0;
       mme = ParseMathMacroReg();
-      // region is implicitly <1;1,0>
-      rgn = Region::SRC110;
-      // below we can override it if we really really want to
     } else {
       // regular src with subregister
       // r13.4....
@@ -3044,7 +3053,7 @@ public:
           WarningT("Send with immediate ExDesc should not have "
                    "Src1.Length given on src1 (e.g. r10:4) "
                    "on this platform");
-          exDesc.imm |= ((uint32_t)src1Length << 6) & 0x1F;
+          exDesc.imm |= (((uint32_t)src1Length & 0x1F) << 6);
         }
       }
       if (platform() >= Platform::XE_HPG) {
@@ -3063,16 +3072,11 @@ public:
                      "on src1 reg  (e.g. r10:4)");
           // if Src1.Length was also set on the register, then ensure
           // that it at least matches the descriptor value
-          if (src1Length >= 0) {
-            // throw a fit if they mismatch
-            if (exDescSrc1Len != src1Length)
-              FailAtT(exDescLoc, "mismatch of Src1.Length suffix and "
-                                 "ExDesc[10:6]");
-            // else we
-          } else {
-            // take it from the descriptor
-            src1Length = exDescSrc1Len;
-          }
+          IGA_ASSERT(src1Length >= 0, "Unexpected value");
+          // throw a fit if they mismatch
+          if (exDescSrc1Len != src1Length)
+            FailAtT(exDescLoc, "mismatch of Src1.Length suffix and "
+                               "ExDesc[10:6]");
         } // else: Src1Length >= 0 && exDescSrc1Len == 0 (prefer reg op)
 
         if (exDesc.imm & 0x7FF) {
@@ -3136,6 +3140,46 @@ public:
     return sd;
   }
 
+  // Xe2 version of descriptors:
+  // (IntExpr COLON)?(INTEXPR|AddrRegRef) (INTEXPR|AddrRegRef)
+  // Examples:
+  //    0x1234      0x56780002
+  //    a0.2        a0.0
+  //    0x100:a0.2  0x56780001
+  void ParseSendDescsXe2(int src1Len) {
+    const Loc exDescLoc = NextLoc();
+    ImmVal v;
+    uint32_t exImmOffDesc = 0;
+    SendDesc exDesc, desc;
+
+    bool z = TryParseIntConstExprPrimary(
+        v, "extended descriptor or immediate offset");
+    if (z) {
+      if (Consume(COLON)) {
+        exDesc = ParseDesc("extended descriptor");
+        exImmOffDesc = (uint32_t)v.s64;
+      } else {
+        exDesc.type = SendDesc::Kind::IMM;
+        exDesc.imm = (uint32_t)v.s64;
+      }
+    } else {
+      exDesc = ParseDesc("extended descriptor");
+    }
+
+    // src1Length set implies ExBSO is set when ExBSO is applicable
+    // ExBSO is applicable when exDesc is reg and non-UGM
+    if (src1Len >= 0 && exDesc.type != SendDesc::Kind::IMM &&
+        m_builder.getSubfunction().send != SFID::UGM) {
+      m_implicitExBSO = true;
+      m_builder.InstOptAdd(InstOpt::EXBSO);
+    }
+
+    const Loc descLoc = NextLoc();
+    desc = ParseDesc("Descriptor");
+
+    m_builder.InstSendDescs(exDescLoc, exImmOffDesc, exDesc, descLoc, desc);
+    m_builder.InstSendSrc1Length(src1Len);
+  }
 
 
   //
@@ -3250,7 +3294,7 @@ public:
     m_builder.InstOptsAdd(instOpts);
 
     if (m_implicitExBSO && !instOpts.contains(InstOpt::EXBSO)
-    ) {
+        ) {
       WarningAtT(m_mnemonicLoc, "send src1 length implicitly added "
                                 "(include {ExBSO})");
     }
@@ -3400,8 +3444,7 @@ public:
         }
         newOpt = InstOpt::EXBSO;
       } else if (ConsumeIdentEq("CPS")) {
-        if (platform() < Platform::XE_HP
-        ) {
+        if (platform() < Platform::XE_HP || platform() >= Platform::XE2) {
           FailAtT(loc, "CPS not supported on this platform");
         } else if (!m_opSpec->isAnySendFormat()) {
           FailAtT(loc, "CPS is not allowed for non-send instructions");
@@ -3847,6 +3890,8 @@ void KernelParser::ParseLdStOpControls(Loc mneLoc,
       co = CacheOpt::WRITEBACK;
     } else if (cc == "wt") {
       co = CacheOpt::WRITETHROUGH;
+    } else if (cc == "cc") {
+      co = CacheOpt::CONSTCACHED;
     } else {
       return false;
     }
@@ -4074,7 +4119,60 @@ bool KernelParser::ParseLdStInst() {
     m_sendSrcLenLocs[0] = addr.payload.regLenLoc;
     //
     vma.addrOffset = 0x0;
-       //
+    auto addrOffLoc = NextLoc();
+    if (LookingAt(ADD) || LookingAt(SUB)) {
+      auto immOffLoc = NextLoc();
+      auto rangeCheck = [&](int bits, const char *which) {
+        if (v.s64 > (1 << (bits - 1)) - 1 || v.s64 < -(1 << (bits - 1))) {
+          FailAtT(immOffLoc, "immediate offset exceeds ", bits, "b for ",
+                  which);
+        }
+      };
+
+      exDescLoc = addrOffLoc;
+      if (vma.op == SendOp::LOAD_BLOCK2D || vma.op == SendOp::STORE_BLOCK2D) {
+        // special handling for block 2d
+        bool isNeg = LookingAt(SUB);
+        Skip(1);
+        ConsumeOrFail(LPAREN, "expected (");
+        if (!TryParseIntConstExpr(v, "block2d x-offset")) {
+          FailT("syntax error in block2d x-offset");
+        }
+        if (isNeg) {
+          v.s64 = -v.s64;
+        }
+        rangeCheck(10, "block2d x-offset");
+        vma.addrOffsetX = (int)v.s64;
+        //
+        ConsumeOrFail(COMMA, "expected ,");
+        if (!TryParseIntConstExpr(v, "block2d y-offset")) {
+          FailT("syntax error in block2d y-offset");
+        }
+        if (isNeg) {
+          v.s64 = -v.s64;
+        }
+        rangeCheck(10, "block2d y-offset");
+        vma.addrOffsetY = (int)v.s64;
+        ConsumeOrFail(RPAREN, "expected )");
+      } else if (TryParseIntConstExprAddChain(v, "address immediate offset")) {
+        if (vma.addrType == AddrType::FLAT) {
+          rangeCheck(20, "flat addresses");
+        } else if (vma.addrType == AddrType::BSS ||
+                   vma.addrType == AddrType::SS) {
+          if (vma.sfid == SFID::UGM) {
+            rangeCheck(17, "ugm bss/ss addresses");
+          } else {
+            rangeCheck(16, "non-ugm bss/ss addresses");
+          }
+        }
+        if (v.s64 % 4 != 0)
+          FailAtT(immOffLoc, "immediate offset must be 32b aligned");
+        vma.addrOffset = (int)v.s64;
+      } else {
+        FailAtT(immOffLoc, "expected immediate offset expression");
+      }
+    }
+    //
     Consume(RBRACK);
     //
     const auto rgn = defaultSendOperandRegion(addr.payload.regName, 0);
@@ -4208,7 +4306,7 @@ bool KernelParser::ParseLdStInst() {
       WarningAtT(src1Data.regLenLoc, "Src1.Length: should be ", expectSrc1Regs);
     } else if (src1Data.regLenWasImplicit &&
                src1Data.regName != RegName::ARF_NULL) {
-      bool hasSrc1LenSfx = true;
+      bool hasSrc1LenSfx = platform() <= Platform::XE2;
       if (hasSrc1LenSfx && vma.addrSurface.isReg()) {
         // with a0 exdesc must omit Src1.Length
         // if ExBSO is set
@@ -4222,10 +4320,10 @@ bool KernelParser::ParseLdStInst() {
   }
 
   SendDesc exDesc(0x0), desc(0x0);
+  uint32_t exImmOffDesc = 0;
 
   std::string err;
-  if (!encodeDescriptors(platform(), vma,
-                         exDesc, desc, err)) {
+  if (!encodeDescriptors(platform(), vma, exImmOffDesc, exDesc, desc, err)) {
     if (err.empty())
       err = "unknown error translating load/store op";
     FailS(mneLoc, err);
@@ -4235,14 +4333,13 @@ bool KernelParser::ParseLdStInst() {
   desc.imm |= ((uint32_t)dstData.regLen & 0x1F) << 20;
   if (platform() < Platform::XE_HP && exDesc.isImm()) {
     // ExDesc[10:6] on <= XE_HP
-    exDesc.imm |= (((uint32_t)src1Data.regLen << 6) & 0x1F);
+    exDesc.imm |= (((uint32_t)src1Data.regLen & 0x1F) << 6);
   }
 
   m_builder.InstSendSrc0Length(src0Addr.payload.regLen);
   m_builder.InstSendSrc1Length(src1Data.regLen);
 
-  m_builder.InstSendDescs(mneLoc,
-                          exDesc, mneLoc, desc);
+  m_builder.InstSendDescs(mneLoc, exImmOffDesc, exDesc, mneLoc, desc);
 
   return true;
 } // KernelParser::ParseLscOp
@@ -4267,7 +4364,7 @@ Kernel *iga::ParseGenKernel(const Model &m, const char *inp,
   auto &insts = h.getInsts();
   auto blockStarts = Block::inferBlocks(e, k->getMemManager(), insts);
   int id = 0;
-  for (auto bitr : blockStarts) {
+  for (const auto &bitr : blockStarts) {
     bitr.second->setID(id++);
     k->appendBlock(bitr.second);
   }

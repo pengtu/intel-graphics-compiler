@@ -17,6 +17,7 @@ set(IGC_BUILD__SRC__CISACodeGen_Common
     "${CMAKE_CURRENT_SOURCE_DIR}/RematAddressArithmetic.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/AnnotateUniformAllocas.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/BlockCoalescing.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/BlockMemOpAddrScalarizationPass.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/CapLoopIterationsPass.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/CastToGASAnalysis.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/CISABuilder.cpp"
@@ -35,6 +36,7 @@ set(IGC_BUILD__SRC__CISACodeGen_Common
     "${CMAKE_CURRENT_SOURCE_DIR}/Emu64OpsPass.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/EvaluateFreeze.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/EstimateFunctionSize.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/GenerateFrequencyData.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/FixAddrSpaceCast.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/FixupExtractValuePair.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/FoldKnownWorkGroupSizes.cpp"
@@ -53,6 +55,7 @@ set(IGC_BUILD__SRC__CISACodeGen_Common
     "${CMAKE_CURRENT_SOURCE_DIR}/LSCControlsAnalysisPass.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/MemOpt.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/MemOpt2.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/OpenCLOptions.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/OpenCLKernelCodeGen.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/POSH_RemoveNonPositionOutput.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/PartialEmuI64OpsPass.cpp"
@@ -92,6 +95,7 @@ set(IGC_BUILD__SRC__CISACodeGen_Common
     "${CMAKE_CURRENT_SOURCE_DIR}/helper.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/layout.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/messageEncoding.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/IGCLivenessAnalysis.cpp"
   )
 
 
@@ -109,6 +113,7 @@ set(IGC_BUILD__HDR__CISACodeGen_Common
     "${CMAKE_CURRENT_SOURCE_DIR}/AdvMemOpt.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/AnnotateUniformAllocas.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/BlockCoalescing.hpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/BlockMemOpAddrScalarizationPass.hpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/CapLoopIterationsPass.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/CastToGASAnalysis.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/CISABuilder.hpp"
@@ -129,6 +134,7 @@ set(IGC_BUILD__HDR__CISACodeGen_Common
     "${CMAKE_CURRENT_SOURCE_DIR}/Emu64OpsPass.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/EvaluateFreeze.hpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/EstimateFunctionSize.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/GenerateFrequencyData.hpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/FixAddrSpaceCast.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/FixupExtractValuePair.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/FoldKnownWorkGroupSizes.h"
@@ -146,6 +152,7 @@ set(IGC_BUILD__HDR__CISACodeGen_Common
     "${CMAKE_CURRENT_SOURCE_DIR}/LSCControlsAnalysisPass.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/MemOpt.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/MemOpt2.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/OpenCLOptions.hpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/OpenCLKernelCodeGen.hpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/POSH_RemoveNonPositionOutput.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/PartialEmuI64OpsPass.h"
@@ -185,6 +192,7 @@ set(IGC_BUILD__HDR__CISACodeGen_Common
     "${CMAKE_CURRENT_SOURCE_DIR}/layout.hpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/messageEncoding.hpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/opCode.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/IGCLivenessAnalysis.h"
   )
 
 

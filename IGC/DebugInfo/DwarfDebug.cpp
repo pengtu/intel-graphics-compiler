@@ -42,13 +42,13 @@ See LICENSE.TXT for details.
 #include "common/LLVMWarningsPop.hpp"
 // clang-format on
 
+#include "DwarfDebug.hpp"
 #include "DIE.hpp"
 #include "DwarfCompileUnit.hpp"
-#include "DwarfDebug.hpp"
 #include "StreamEmitter.hpp"
 #include "Utils.hpp"
-#include "VISAModule.hpp"
 #include "VISADebugInfo.hpp"
+#include "VISAModule.hpp"
 
 #include <list>
 #include <unordered_set>
@@ -153,6 +153,17 @@ bool DbgVariable::currentLocationIsSimpleIndirectValue() const {
   return true;
 }
 
+bool DbgVariable::currentLocationIsVector() const {
+  const auto *DbgInst = getDbgInst();
+  if (!isa<llvm::DbgValueInst>(DbgInst))
+    return false;
+
+  Value *IRLocation = IGCLLVM::getVariableLocation(DbgInst);
+  if (!IRLocation->getType()->isVectorTy())
+    return false;
+  return true;
+}
+
 void DbgVariable::emitExpression(CompileUnit *CU, IGC::DIEBlock *Block) const {
   IGC_ASSERT(CU);
   IGC_ASSERT(Block);
@@ -199,109 +210,23 @@ void DbgVariable::emitExpression(CompileUnit *CU, IGC::DIEBlock *Block) const {
     }
     I->appendToVector(Elements);
   }
-
-  // Indirect values result in emission DWARF location descriptors of
-  // <memory location> type - the evaluation should result in address,
-  // thus no need for OP_deref.
-  // Currently, our dwarf emitters support only "simple indirect" values.
-  if (currentLocationIsSimpleIndirectValue())
-    Elements.erase(Elements.begin()); // drop OP_deref
+  bool isStackValueNeeded = false;
+  if (currentLocationIsSimpleIndirectValue()) {
+    // drop OP_deref and don't emit DW_OP_stack_value.
+    Elements.erase(Elements.begin());
+  } else if (!currentLocationIsMemoryAddress() &&
+             !currentLocationIsImplicit() && !currentLocationIsVector()) {
+    isStackValueNeeded = true;
+  }
 
   for (auto elem : Elements) {
     auto BF = DIEInteger::BestForm(false, elem);
     CU->addUInt(Block, BF, elem);
   }
-}
 
-/// If this type is derived from a base type then return base type size
-/// even if it derived directly or indirectly from Derived Type
-uint64_t DbgVariable::getBasicTypeSize(const DICompositeType *Ty) const {
-  unsigned Tag = Ty->getTag();
-
-  if (Tag != dwarf::DW_TAG_member && Tag != dwarf::DW_TAG_typedef &&
-      Tag != dwarf::DW_TAG_const_type && Tag != dwarf::DW_TAG_volatile_type &&
-      Tag != dwarf::DW_TAG_restrict_type) {
-    return Ty->getSizeInBits();
+  if (isStackValueNeeded) {
+    CU->addUInt(Block, dwarf::DW_FORM_data1, dwarf::DW_OP_stack_value);
   }
-
-  DIType *BaseType = Ty->getBaseType();
-
-  // If this is a derived type, go ahead and get the base type, unless it's a
-  // reference then it's just the size of the field. Pointer types have no need
-  // of this since they're a different type of qualification on the type.
-  if (BaseType->getTag() == dwarf::DW_TAG_reference_type ||
-      BaseType->getTag() == dwarf::DW_TAG_rvalue_reference_type) {
-    return Ty->getSizeInBits();
-  }
-
-  if (isa<DIDerivedType>(BaseType)) {
-    return getBasicTypeSize(cast<DIDerivedType>(BaseType));
-  } else if (isa<DICompositeType>(BaseType)) {
-    return getBasicTypeSize(cast<DICompositeType>(BaseType));
-  } else if (isa<DIBasicType>(BaseType)) {
-    return BaseType->getSizeInBits();
-  } else {
-    // Be prepared for unexpected.
-    IGC_ASSERT_MESSAGE(0, "Missing support for this type");
-  }
-
-  return BaseType->getSizeInBits();
-}
-
-/// If this type is derived from a base type then return base type size
-/// even if it derived directly or indirectly from Composite Type
-uint64_t DbgVariable::getBasicTypeSize(const DIDerivedType *Ty) const {
-  unsigned Tag = Ty->getTag();
-
-  if (Tag != dwarf::DW_TAG_member && Tag != dwarf::DW_TAG_typedef &&
-      Tag != dwarf::DW_TAG_const_type && Tag != dwarf::DW_TAG_volatile_type &&
-      Tag != dwarf::DW_TAG_restrict_type) {
-    return Ty->getSizeInBits();
-  }
-
-  DIType *BaseType = Ty->getBaseType();
-
-  // If this is a derived type, go ahead and get the base type, unless it's a
-  // reference then it's just the size of the field. Pointer types have no need
-  // of this since they're a different type of qualification on the type.
-  if (BaseType->getTag() == dwarf::DW_TAG_reference_type ||
-      BaseType->getTag() == dwarf::DW_TAG_rvalue_reference_type) {
-    return Ty->getSizeInBits();
-  }
-
-  if (isa<DIDerivedType>(BaseType)) {
-    return getBasicTypeSize(cast<DIDerivedType>(BaseType));
-  } else if (isa<DICompositeType>(BaseType)) {
-    return getBasicTypeSize(cast<DICompositeType>(BaseType));
-  } else if (isa<DIBasicType>(BaseType)) {
-    return BaseType->getSizeInBits();
-  } else {
-    // Be prepared for unexpected.
-    IGC_ASSERT_MESSAGE(0, "Missing support for this type");
-  }
-
-  return BaseType->getSizeInBits();
-}
-
-/// Return base type size even if it derived directly or indirectly from
-/// Composite Type
-uint64_t DbgVariable::getBasicSize(const DwarfDebug *DD) const {
-  uint64_t varSizeInBits = getType()->getSizeInBits();
-
-  if (isa<DIDerivedType>(getType())) {
-    // If type is derived then size of a basic type is needed
-    const DIType *Ty = getType();
-    const DIDerivedType *DDTy = cast<DIDerivedType>(Ty);
-    varSizeInBits = getBasicTypeSize(DDTy);
-    IGC_ASSERT_MESSAGE(varSizeInBits > 0, "\nVariable's basic type size 0\n");
-    IGC_ASSERT_MESSAGE(
-        !(varSizeInBits == 0 && getType()->getSizeInBits() == 0),
-        "\nVariable's basic type size 0 and getType()->getSizeInBits() 0\n");
-  } else {
-    IGC_ASSERT_MESSAGE(varSizeInBits > 0, "Not derived type variable's size 0");
-  }
-
-  return varSizeInBits;
 }
 
 unsigned DbgVariable::getRegisterValueSizeInBits(const DwarfDebug *DD) const {
@@ -1546,7 +1471,7 @@ void DwarfDebug::collectVariableInfo(
     write(TempDotDebugLocEntries.back().loc, (unsigned char *)&startRange,
           pointerSize);
 
-    for (auto it : allCallerSave) {
+    for (const auto &it : allCallerSave) {
       TempDotDebugLocEntries.back().end = std::get<0>(it);
       write(TempDotDebugLocEntries.back().loc,
             (unsigned char *)&std::get<0>(it), pointerSize);
@@ -1705,20 +1630,12 @@ void DwarfDebug::collectVariableInfo(
         continue;
       }
 
+      // For the address variable described with llvm.dbg.declare and
+      // StorageOffset we want to emit inlined location in the DWARF emit
+      // phase.
       const auto *StorageMD = pInst->getMetadata("StorageOffset");
-      if (EmitSettings.UseOffsetInLocation && isa<DbgDeclareInst>(pInst)) {
-        if (StorageMD) {
-          // When using OffsetInLocation, we emit offset of variable from
-          // privateBase. This works only for -O0 when variables are stored in
-          // memory. When optimizations are enabled, ie when pInst is not
-          // dbgDeclare, we may choose to emit locations to debug_loc as
-          // variables may be mapped to registers.
-          LLVM_DEBUG(dbgs()
-                     << "  << location is expected to be emitted in DIE: "
-                     << "EmitSettings.UseOffsetInLocation && "
-                        "isa<DbgDeclareInst> && StorageMD\n");
-          continue;
-        }
+      if (isa<DbgDeclareInst>(pInst) && StorageMD) {
+        continue;
       }
 
       // assume that VISA preserves location thoughout its lifetime
@@ -1760,7 +1677,7 @@ void DwarfDebug::collectVariableInfo(
         continue;
       }
 
-      for (auto range : GenISARange) {
+      for (const auto &range : GenISARange) {
         DbgValuesWithGenIP[RegVar].push_back(
             std::make_tuple(range.first, range.second, RegVar, pInst));
       }
@@ -2883,29 +2800,19 @@ void DwarfDebug::emitDebugMacInfo() {
 }
 
 void DwarfDebug::encodeScratchAddrSpace(std::vector<uint8_t> &data) {
-  if (!EmitSettings.EnableGTLocationDebugging) {
-    Address addr;
-    addr.Set(Address::Space::eScratch, 0, 0);
-
-    write(data, (uint8_t)llvm::dwarf::DW_OP_const8u);
-    write(data, (uint64_t)addr.GetAddress());
-
-    write(data, (uint8_t)llvm::dwarf::DW_OP_or);
+  uint32_t scratchBaseAddrEncoded = 0;
+  if (m_pModule->usesSlot1ScratchSpill()) {
+    scratchBaseAddrEncoded =
+        GetEncodedRegNum<RegisterNumbering::ScratchBaseSlot1>(
+            dwarf::DW_OP_breg0);
   } else {
-    uint32_t scratchBaseAddrEncoded = 0;
-    if (m_pModule->usesSlot1ScratchSpill()) {
-      scratchBaseAddrEncoded =
-          GetEncodedRegNum<RegisterNumbering::ScratchBaseSlot1>(
-              dwarf::DW_OP_breg0);
-    } else {
-      scratchBaseAddrEncoded =
-          GetEncodedRegNum<RegisterNumbering::ScratchBase>(dwarf::DW_OP_breg0);
-    }
-
-    write(data, (uint8_t)scratchBaseAddrEncoded);
-    writeULEB128(data, 0);
-    write(data, (uint8_t)llvm::dwarf::DW_OP_plus);
+    scratchBaseAddrEncoded =
+        GetEncodedRegNum<RegisterNumbering::ScratchBase>(dwarf::DW_OP_breg0);
   }
+
+  write(data, (uint8_t)scratchBaseAddrEncoded);
+  writeULEB128(data, 0);
+  write(data, (uint8_t)llvm::dwarf::DW_OP_plus);
 }
 
 uint32_t DwarfDebug::writeSubroutineCIE() {
@@ -3047,23 +2954,12 @@ uint32_t DwarfDebug::writeStackcallCIE() {
   // The DW_CFA_def_cfa_expression instruction takes a single operand
   // encoded as a DW_FORM_exprloc.
   auto DWRegEncoded = GetEncodedRegNum<RegisterNumbering::GRFBase>(specialGRF);
-  if (!getEmitterSettings().EnableGTLocationDebugging) {
-    write(data1, (uint8_t)llvm::dwarf::DW_OP_regx);
-    writeULEB128(data1, DWRegEncoded);
-  } else {
-    write(data1, (uint8_t)llvm::dwarf::DW_OP_const4u);
-    write(data1, (uint32_t)(DWRegEncoded));
-  }
+  write(data1, (uint8_t)llvm::dwarf::DW_OP_const4u);
+  write(data1, (uint32_t)(DWRegEncoded));
   write(data1, (uint8_t)llvm::dwarf::DW_OP_const2u);
   write(data1, (uint16_t)(getBEFPSubReg() * 4 * 8));
-  if (!getEmitterSettings().EnableGTLocationDebugging) {
-    write(data1, (uint8_t)llvm::dwarf::DW_OP_const1u);
-    write(data1, (uint8_t)32);
-    write(data1, (uint8_t)DW_OP_INTEL_push_bit_piece_stack);
-  } else {
-    write(data1, (uint8_t)DW_OP_INTEL_regval_bits);
-    write(data1, (uint8_t)32);
-  }
+  write(data1, (uint8_t)DW_OP_INTEL_regval_bits);
+  write(data1, (uint8_t)32);
 
   if (EmitSettings.ScratchOffsetInOW) {
     // when scratch offset is in OW, be_fp has to be multiplied by 16
@@ -3271,23 +3167,12 @@ void DwarfDebug::writeFDEStackCall(VISAModule *m) {
 
     auto DWRegEncoded =
         GetEncodedRegNum<RegisterNumbering::GRFBase>(specialGRF);
-    if (!getEmitterSettings().EnableGTLocationDebugging) {
-      write(data1, (uint8_t)llvm::dwarf::DW_OP_regx);
-      writeULEB128(data1, DWRegEncoded);
-    } else {
-      write(data1, (uint8_t)llvm::dwarf::DW_OP_const4u);
-      write(data1, (uint32_t)(DWRegEncoded));
-    }
+    write(data1, (uint8_t)llvm::dwarf::DW_OP_const4u);
+    write(data1, (uint32_t)(DWRegEncoded));
     write(data1, (uint8_t)llvm::dwarf::DW_OP_const2u);
     write(data1, (uint16_t)(getBEFPSubReg() * 4 * 8));
-    if (!getEmitterSettings().EnableGTLocationDebugging) {
-      write(data1, (uint8_t)llvm::dwarf::DW_OP_const1u);
-      write(data1, (uint8_t)32);
-      write(data1, (uint8_t)DW_OP_INTEL_push_bit_piece_stack);
-    } else {
-      write(data1, (uint8_t)DW_OP_INTEL_regval_bits);
-      write(data1, (uint8_t)32);
-    }
+    write(data1, (uint8_t)DW_OP_INTEL_regval_bits);
+    write(data1, (uint8_t)32);
 
     if (EmitSettings.ScratchOffsetInOW) {
       // when scratch offset is in OW, be_fp has to be multiplied by 16
@@ -3543,6 +3428,38 @@ llvm::MCSymbol *DwarfDebug::GetLabelBeforeIp(unsigned int ip) {
   auto NewLabel = Asm->CreateTempSymbol();
   LabelsBeforeIp[ip] = NewLabel;
   return NewLabel;
+}
+
+// If this type is derived from a base type then return base type size.
+uint64_t DwarfDebug::getBaseTypeSize(const llvm::DIType *Ty) {
+  IGC_ASSERT(Ty);
+  const DIDerivedType *DDTy = dyn_cast<DIDerivedType>(Ty);
+  if (!DDTy)
+    return Ty->getSizeInBits();
+
+  unsigned Tag = DDTy->getTag();
+
+  if (Tag != dwarf::DW_TAG_member && Tag != dwarf::DW_TAG_typedef &&
+      Tag != dwarf::DW_TAG_const_type && Tag != dwarf::DW_TAG_volatile_type &&
+      Tag != dwarf::DW_TAG_restrict_type && Tag != dwarf::DW_TAG_atomic_type &&
+      Tag != dwarf::DW_TAG_immutable_type)
+    return DDTy->getSizeInBits();
+
+  DIType *BaseType = DDTy->getBaseType();
+
+  if (!BaseType) {
+    IGC_ASSERT_MESSAGE(false, "Empty base type!");
+    return 0;
+  }
+
+  // If this is a derived type, go ahead and get the base type, unless it's a
+  // reference then it's just the size of the field. Pointer types have no need
+  // of this since they're a different type of qualification on the type.
+  if (BaseType->getTag() == dwarf::DW_TAG_reference_type ||
+      BaseType->getTag() == dwarf::DW_TAG_rvalue_reference_type)
+    return Ty->getSizeInBits();
+
+  return getBaseTypeSize(BaseType);
 }
 
 void DbgVariable::print(raw_ostream &O, bool NestedAbstract) const {

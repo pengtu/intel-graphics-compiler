@@ -415,7 +415,8 @@ static void emitDecodeOutput(const Opts &opts, std::ostream &os,
     const auto &mi = dr.info;
     bool showDataPayload =
         mi.execWidth > 0 && !mi.isSample() && !mi.isOther() &&
-        mi.op != iga::SendOp::READ_STATE && mi.op != iga::SendOp::LOAD_STATUS &&
+        mi.op != iga::SendOp::READ_STATE &&
+        mi.op != iga::SendOp::LOAD_STATUS &&
         mi.op != iga::SendOp::RENDER_READ &&
         mi.op != iga::SendOp::RENDER_WRITE && mi.op != iga::SendOp::FENCE &&
         mi.op != iga::SendOp::CCS_PC && mi.op != iga::SendOp::CCS_PU &&
@@ -505,6 +506,8 @@ bool decodeSendDescriptor(const Opts &opts) {
   // Formats are:
   //   <=GEN11:      ExecSize? ExDesc  Desc
   //   >=XE:    SFID ExecSize? ExDesc  Desc
+  //   >=XE2:   SFID ExecSize? ExDesc           Desc
+  //            SFID ExecSize? ExDescImm:A0Reg  Desc
   //
   // If ExecSize is not given, then we deduce it from the platform.
 
@@ -528,6 +531,13 @@ bool decodeSendDescriptor(const Opts &opts) {
     fatalExitWithMessage("-Xdsd: expects at least ExDesc Desc");
   }
   std::string exDescStr = opts.inputFiles[argOff];
+  uint32_t exImmOffDesc = 0;
+  auto colon = exDescStr.find(':');
+  if (colon != std::string::npos) {
+    std::string offStr = exDescStr.substr(0, colon);
+    exImmOffDesc = (uint32_t)parseInt("ExImmOffDesc", offStr);
+    exDescStr = exDescStr.substr(colon + 1);
+  }
 
   // ExDesc
   const iga::SendDesc exDesc = parseSendDescArg("ExDesc", exDescStr);
@@ -555,7 +565,8 @@ bool decodeSendDescriptor(const Opts &opts) {
     // anything better right now.
     execSize = p >= iga::Platform::XE_HPC ? iga::ExecSize::SIMD32
                                           : iga::ExecSize::SIMD16;
-    if (sfid == iga::SFID::TGM) {
+    if (sfid == iga::SFID::TGM || sfid == iga::SFID::BTD ||
+        sfid == iga::SFID::RTA) {
       // typed LSC messages default to half the SIMD size
       execSize = p >= iga::Platform::XE_HPC ? iga::ExecSize::SIMD16
                                             : iga::ExecSize::SIMD8;
@@ -564,6 +575,7 @@ bool decodeSendDescriptor(const Opts &opts) {
   //
   iga::DecodedDescFields decodedFields;
   const auto dr = iga::tryDecode(p, sfid, execSize,
+                                 exImmOffDesc,
                                  exDesc, desc, &decodedFields);
   emitDecodeOutput(opts, os, p, dr, decodedFields);
 

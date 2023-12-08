@@ -276,8 +276,8 @@ public:
 private:
   bool hasSameSourceOneDPAS(G4_INST *curInst, G4_INST *nextInst,
                             BitSet &liveDst, BitSet &liveSrc) const;
-  bool hsaSameTypesAllOperands(const G4_INST &curInst,
-                               const G4_INST &nextInst) const;
+  bool DPASHasSameTypesAllOperands(const G4_INST &curInst,
+                                   const G4_INST &nextInst) const;
 
 public:
   DDD(G4_BB *bb, const LatencyTable &lt, G4_Kernel *k, PointsToAnalysis &p);
@@ -346,6 +346,7 @@ public:
   preRA_Scheduler(G4_Kernel &k);
   ~preRA_Scheduler();
   bool run(unsigned &KernelPressure);
+  bool runWithGRFSelection(unsigned &KernelPressure);
 
 private:
   G4_Kernel &kernel;
@@ -363,15 +364,6 @@ private:
   Options *m_options;
 };
 
-class preRA_RegSharing {
-public:
-  preRA_RegSharing(G4_Kernel &k);
-  ~preRA_RegSharing();
-  bool run(unsigned &KernelPressure);
-
-private:
-  G4_Kernel &kernel;
-};
 // Restrictions of candidate for 2xDP:
 //    1, Only support SIMD16 DF mad with M0
 //    2, Inst must not have predicate/cond mod
@@ -391,6 +383,16 @@ static bool instCanUse2xDP(G4_INST *inst) {
   return false;
 }
 
+// Restrictions of candidate for 2xSP:
+//    1, Only support mad
+//    2, Instruction must be Type_DF or Type_F
+static bool instCanUse2xSP(G4_INST *inst) {
+  if (inst->opcode() == G4_mad && (inst->getDst()->getType() == Type_DF ||
+                                   inst->getDst()->getType() == Type_F)) {
+    return true;
+  }
+  return false;
+}
 
 class window2xSP {
 public:
@@ -410,6 +412,9 @@ public:
     srcGRF.clear();
     instList.clear();
   }
+
+  window2xSP(const window2xSP&) = delete;
+  window2xSP& operator=(const window2xSP&) = delete;
 
   ~window2xSP() {
     instGRFSize = 0;
@@ -589,6 +594,32 @@ public:
     return true;
   }
 
+  // Check if the instruction can be added into the 2xSP block
+  bool canAddToBlock2xSP(Node *node) const {
+    G4_INST *inst = node->getInstructions()->front();
+
+    if (!instCanUse2xSP(inst)) {
+      return false;
+    }
+
+    // All instructions in the same block have the same type
+    if (instType != Type_UNDEF && inst->getDst()->getType() != instType) {
+      return false;
+    }
+
+    // All instructions in the block have the same GRF size
+    if (!checkGRFSize(node)) {
+      return false;
+    }
+
+    // For non-first blocks, the inst's src0 should have the same registers as
+    // the dst of instructions in previous block
+    if (preBlock && !hasSameOperand(inst)) {
+      return false;
+    }
+
+    return true;
+  }
 
   // Check if block is good or not:
   //     GRF size should be <= ACC number
@@ -687,8 +718,9 @@ public:
     }
 
     auto dst = inst->getDst();
-    // 1, dst cannot be null and cannot cross GRF boundary
-    if (!dst || dst->asDstRegRegion()->isCrossGRFDst(inst->getBuilder())) {
+    // 1, dst cannot cross GRF boundary
+    if (!dst->isGreg() ||
+        dst->asDstRegRegion()->isCrossGRFDst(inst->getBuilder())) {
       return false;
     }
 
@@ -746,6 +778,15 @@ public:
     // 8, conditional modifiers are not used
     if (inst->getCondMod())
       return false;
+
+    // 9, Source GRF register are different and do not overlap with destination
+    //    GRF register.
+    if (src->isGreg()) {
+      int srcRegStart = src->getLinearizedStart() / grfSize;
+      int srcRegEnd = src->getLinearizedEnd() / grfSize;
+      if (srcRegStart <= dstReg && dstReg <= srcRegEnd)
+        return false;
+    }
 
     return true;
   }

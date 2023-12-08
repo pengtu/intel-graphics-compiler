@@ -266,7 +266,7 @@ void CheckInstrTypes::visitCallInst(CallInst& C)
         if (GenIntrinsicInst * CI = dyn_cast<GenIntrinsicInst>(&C))
         {
             GenISAIntrinsic::ID IID = CI->getIntrinsicID();
-            if (IID != GenISA_OUTPUT && IID != GenISA_discard)
+            if (IID != GetOutputPSIntrinsic(context->platform) && IID != GenISA_discard)
             {
                 g_InstrTypes.psHasSideEffect = true;
             }
@@ -298,6 +298,11 @@ void CheckInstrTypes::visitCallInst(CallInst& C)
         case GenISAIntrinsic::GenISA_floatatomicraw:
         case GenISAIntrinsic::GenISA_floatatomicrawA64:
         case GenISAIntrinsic::GenISA_floatatomicstructured:
+        case GenISAIntrinsic::GenISA_floatatomictyped:
+        case GenISAIntrinsic::GenISA_fcmpxchgatomictyped:
+        case GenISAIntrinsic::GenISA_LSCAtomicFP64:
+        case GenISAIntrinsic::GenISA_LSCAtomicFP32:
+        case GenISAIntrinsic::GenISA_LSCAtomicInts:
             g_InstrTypes.hasAtomics = true;
             g_InstrTypes.numAtomics++;
             break;

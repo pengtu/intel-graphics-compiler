@@ -43,9 +43,6 @@ namespace IGC
 {
     const unsigned int INVALID_CONSTANT_BUFFER_INVALID_ADDR = 0xFFFFFFFF;
 
-    static const char* NAMED_METADATA_COARSE_PHASE = "coarse_phase";
-    static const char* NAMED_METADATA_PIXEL_PHASE  = "pixel_phase";
-
     enum FunctionTypeMD
     {
         KernelFunction,
@@ -364,6 +361,7 @@ namespace IGC
     struct CompOptions
     {
         bool DenormsAreZero                             = false;
+        bool BFTFDenormsAreZero                         = false;
         bool CorrectlyRoundedDivSqrt                    = false;
         bool OptDisable                                 = false;
         bool MadEnable                                  = false;
@@ -382,6 +380,7 @@ namespace IGC
         bool UnsafeMathOptimizations                    = false;
         bool disableCustomUnsafeOpts                    = false;
         bool disableReducePow                           = false;
+        bool disableSqrtOpt                             = false;
         bool FiniteMathOnly                             = false;
         bool FastRelaxedMath                            = false;
         bool DashGSpecified                             = false;
@@ -397,7 +396,6 @@ namespace IGC
         bool HasPositivePointerOffset                   = false;
         bool HasBufferOffsetArg                         = false;
         bool BufferOffsetArgOptional                    = true;
-        bool HasSubDWAlignedPtrArg                      = false;
         bool replaceGlobalOffsetsByZero                 = false;
         unsigned forcePixelShaderSIMDMode               = 0;
         bool pixelShaderDoNotAbortOnSpill               = false;
@@ -443,6 +441,7 @@ namespace IGC
         bool DisableFDivToFMulInvOpt                    = false;
         bool initializePhiSampleSourceWA                = false;
         bool WaDisableSubspanUseNoMaskForCB             = false;
+        bool DisableLoosenSimd32Occu                    = false;
 
         unsigned FastestS1Options                       = 0;  // FCEXP_NO_EXPRIMENT. Can't access the enum here for some reason.
     };

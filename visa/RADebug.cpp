@@ -445,18 +445,44 @@ void VerifyAugmentation::verifyAlign(G4_Declare *dcl) {
   if (it == masks.end())
     return;
 
-  if (dcl->getByteSize() >=
-          kernel->numEltPerGRF<Type_UD>() * TypeSize(Type_UD) &&
-      dcl->getByteSize() <=
-          2 * kernel->numEltPerGRF<Type_UD>() * TypeSize(Type_UD) &&
-      kernel->getSimdSize() > kernel->numEltPerGRF<Type_UD>()) {
-    auto assignment = dcl->getRegVar()->getPhyReg();
-    if (assignment && assignment->isGreg()) {
-      auto phyRegNum = assignment->asGreg()->getRegNum();
-      auto augMask = std::get<1>((*it).second);
-      if (phyRegNum % 2 != 0 && augMask == AugmentationMasks::Default32Bit) {
-        printf("Dcl %s is Default32Bit but assignment is not Even aligned\n",
-               dcl->getName());
+  if (gra->use4GRFAlign) {
+    auto augMask = std::get<1>((*it).second);
+    if (augMask == AugmentationMasks::Default64Bit) {
+      auto assignment = dcl->getRegVar()->getPhyReg();
+      if (assignment && assignment->isGreg()) {
+        auto phyRegNum = assignment->asGreg()->getRegNum();
+        if (phyRegNum % 4 != 0) {
+          printf("Dcl %s is Default64Bit but assignment is not 4GRF aligned "
+                 "(gra.getAugAlign() = %d)\n",
+                 dcl->getName(), gra->getAugAlign(dcl));
+        }
+      }
+    } else if (augMask == AugmentationMasks::Default32Bit) {
+      auto assignment = dcl->getRegVar()->getPhyReg();
+      if (assignment && assignment->isGreg()) {
+        auto phyRegNum = assignment->asGreg()->getRegNum();
+        auto augMask = std::get<1>((*it).second);
+        if (phyRegNum % 2 != 0 && augMask == AugmentationMasks::Default32Bit) {
+          printf("Dcl %s is Default32Bit but assignment is not Even aligned "
+                 "(gra.getAugAlign() = %d)\n",
+                 dcl->getName(), gra->getAugAlign(dcl));
+        }
+      }
+    }
+  } else {
+    if (dcl->getByteSize() >=
+            kernel->numEltPerGRF<Type_UD>() * TypeSize(Type_UD) &&
+        dcl->getByteSize() <=
+            2 * kernel->numEltPerGRF<Type_UD>() * TypeSize(Type_UD) &&
+        kernel->getSimdSize() > kernel->numEltPerGRF<Type_UD>()) {
+      auto assignment = dcl->getRegVar()->getPhyReg();
+      if (assignment && assignment->isGreg()) {
+        auto phyRegNum = assignment->asGreg()->getRegNum();
+        auto augMask = std::get<1>((*it).second);
+        if (phyRegNum % 2 != 0 && augMask == AugmentationMasks::Default32Bit) {
+          printf("Dcl %s is Default32Bit but assignment is not Even aligned\n",
+                 dcl->getName());
+        }
       }
     }
   }
@@ -606,25 +632,25 @@ bool VerifyAugmentation::interfereBetween(G4_Declare *dcl1, G4_Declare *dcl2) {
 }
 
 void VerifyAugmentation::verify() {
-  std::cerr << "Start verification for kernel: "
+  std::cout << "Start verification for kernel: "
             << kernel->getOptions()->getOptionCstr(VISA_AsmFileName) << "\n";
 
   for (auto dcl : kernel->Declares) {
     if (dcl->getIsSplittedDcl()) {
       auto &tup = masks[dcl];
-      std::cerr << dcl->getName() << "(" << getStr(std::get<1>(tup))
+      std::cout << dcl->getName() << "(" << getStr(std::get<1>(tup))
                 << ") is split"
                 << "\n";
       for (const G4_Declare *subDcl : gra->getSubDclList(dcl)) {
         auto &tupSub = masks[subDcl];
-        std::cerr << "\t" << subDcl->getName() << " ("
+        std::cout << "\t" << subDcl->getName() << " ("
                   << getStr(std::get<1>(tupSub)) << ")"
                   << "\n";
       }
     }
   }
 
-  std::cerr << "\n"
+  std::cout << "\n"
             << "\n"
             << "\n";
 
@@ -663,12 +689,14 @@ void VerifyAugmentation::verify() {
         str = "NonDefault";
       else if (m == AugmentationMasks::DefaultPredicateMask)
         str = "DefaultPredicateMask";
-      str.append("\n");
 
       return str;
     };
 
-    std::cerr << dcl->getName() << " - " << getMaskStr(dclMask);
+    std::cout << dcl->getName() << " - " << getMaskStr(dclMask);
+    auto augAlign = gra->getAugAlign(dcl);
+    std::cout << " (align = " << augAlign << "GRF)";
+    std::cout << "\n";
 
     verifyAlign(dcl);
 
@@ -693,7 +721,7 @@ void VerifyAugmentation::verify() {
           continue;
 
         if (!interfere) {
-          std::cerr << dcl->getRegVar()->getName() << "(" << getStr(dclMask)
+          std::cout << dcl->getRegVar()->getName() << "(" << getStr(dclMask)
                     << ") and " << activeDcl->getRegVar()->getName() << "("
                     << getStr(aDclMask)
                     << ") are overlapping with incompatible emask but not "
@@ -703,7 +731,7 @@ void VerifyAugmentation::verify() {
 
         if (overlapDcl(activeDcl, dcl)) {
           if (!interfere) {
-            std::cerr << dcl->getRegVar()->getName() << "(" << getStr(dclMask)
+            std::cout << dcl->getRegVar()->getName() << "(" << getStr(dclMask)
                       << ") and " << activeDcl->getName() << "("
                       << getStr(aDclMask)
                       << ") use overlapping physical assignments but not "
@@ -717,7 +745,11 @@ void VerifyAugmentation::verify() {
     active.push_back(dcl);
   }
 
-  std::cerr << "End verification for kenel: "
+  std::cout << "\nProgram has "
+            << (intf->numVarsWithWeakEdges() == 0 ? "no" : "")
+            << " vars with weak edges\n";
+
+  std::cout << "End verification for kernel: "
             << kernel->getOptions()->getOptionCstr(VISA_AsmFileName) << "\n"
             << "\n"
             << "\n";
@@ -809,7 +841,7 @@ bool VerifyAugmentation::isClobbered(LiveRange *lr, std::string &msg) {
           if (oiDst && oiDst->isDstRegRegion() && oiDst->getTopDcl()) {
             unsigned oilb = 0, oirb = 0;
             auto oiLR = DclLRMap[oiDst->getTopDcl()];
-            if (oiLR && !oiLR->getPhyReg())
+            if (!oiLR->getPhyReg())
               continue;
 
             oilb = oiLR->getPhyReg()->asGreg()->getRegNum() *
@@ -851,7 +883,7 @@ bool VerifyAugmentation::isClobbered(LiveRange *lr, std::string &msg) {
 
     if (rd.size() > 0) {
       printf("Current use str = %s for inst:\t", useStr.data());
-      inst->emit(std::cerr);
+      inst->emit(std::cout);
       printf("\t$%d\n", inst->getVISAId());
     }
     // process all reaching defs
@@ -907,7 +939,7 @@ bool VerifyAugmentation::isClobbered(LiveRange *lr, std::string &msg) {
           printed = true;
         }
         printf("\t");
-        std::get<0>(reachingDef)->emit(std::cerr);
+        std::get<0>(reachingDef)->emit(std::cout);
         printf("\t$%d\n", std::get<0>(reachingDef)->getVISAId());
       }
     }
@@ -1242,7 +1274,7 @@ void DynPerfModel::dump() {
   OF << Buffer << "\n";
   OF.close();
 
-  std::cerr << Buffer << "\n";
+  std::cout << Buffer << "\n";
 }
 
 SpillAnalysis::~SpillAnalysis() {
@@ -1423,12 +1455,12 @@ SpillAnalysis::GetLiveBBs(G4_Declare *Dcl,
   auto *Defs = VarRefs.getDefs(Dcl);
   auto *Uses = VarRefs.getUses(Dcl);
 
-  for (auto Def : *Defs) {
+  for (const auto &Def : *Defs) {
     auto *BB = std::get<1>(Def);
     BBs.insert(BB);
   }
 
-  for (auto Use : *Uses) {
+  for (const auto &Use : *Uses) {
     auto *BB = std::get<1>(Use);
     BBs.insert(BB);
   }

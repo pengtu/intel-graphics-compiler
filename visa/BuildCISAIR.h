@@ -25,7 +25,6 @@ namespace vISA {
 class Mem_Manager;
 class PlatformInfo;
 } // namespace vISA
-class CisaBinary;
 class VISAKernelImpl;
 class VISAFunction;
 
@@ -53,8 +52,6 @@ public:
     m_header.major_version = majorVersion;
     m_header.minor_version = minorVersion;
     m_header.magic_number = COMMON_ISA_MAGIC_NUM;
-
-    m_cisaBinary = new (m_mem) CisaFramework::CisaBinary(this);
   }
 
   virtual ~CISA_IR_Builder();
@@ -112,7 +109,6 @@ public:
   // the current vISA kernel/function being processed
   VISAKernelImpl *m_kernel;
   VISAKernelImpl *m_prevKernel = nullptr;
-  CisaFramework::CisaBinary *m_cisaBinary;
   VISAKernelImpl *get_kernel() const { return m_kernel; }
 
   std::stringstream &criticalMsgStream() { return criticalMsg; }
@@ -433,11 +429,11 @@ public:
                                  bool pixelNullMask, bool cpsEnable,
                                  bool uniformSampler, ChannelMask channels,
                                  VISA_EMask_Ctrl emask, unsigned exec_size,
-                                 VISA_opnd *aoffimmi, const char *sampler_name,
-                                 const char *surface_name,
+                                 VISA_opnd *aoffimmi,
+                                 const char *sampler_name, unsigned int samplerIdx,
+                                 const char *surface_name, unsigned int surfaceIdx,
                                  VISA_opnd *dst, unsigned int numParameters,
                                  VISA_RawOpnd **params, int lineNum);
-
 
   bool CISA_create_sample_instruction(ISA_Opcode opcode, ChannelMask channel,
                                       int simd_mode, const char *sampler_name,
@@ -595,6 +591,8 @@ public:
   VISA_BUILDER_OPTION getBuilderOption() const { return mBuildOption; }
   vISABuilderMode getBuilderMode() const { return m_builderMode; }
 
+  LSC_CACHE_OPTS CISA_create_caching_opts(int lineNum);
+  LSC_CACHE_OPTS CISA_create_caching_opts(LSC_CACHE_OPT l1, LSC_CACHE_OPT l3, int lineNum);
   bool CISA_create_dpas_instruction(ISA_Opcode opcode, VISA_EMask_Ctrl emask,
                                     unsigned exec_size, VISA_opnd *dst_cisa,
                                     VISA_opnd *src0_cisa, VISA_opnd *src1_cisa,

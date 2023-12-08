@@ -419,7 +419,7 @@ void LinearScanRA::linearScanMarkReferencesInOpnd(G4_Operand *opnd, bool isEOT,
       LSLiveRange *lr = GetOrCreateLocalLiveRange(topdcl);
 
       lr->recordRef(curBB_, false);
-      if (isEOT) {
+      if (isEOT && kernel.fg.builder->hasEOTGRFBinding()) {
         lr->markEOT();
       }
       if (topdcl->getRegVar() && topdcl->getRegVar()->isPhyRegAssigned() &&
@@ -788,12 +788,6 @@ void LinearScanRA::calculateFuncLastID() {
 }
 
 int LinearScanRA::linearScanRA() {
-  if (kernel.fg.getIsStackCallFunc()) {
-    // Allocate space to store Frame Descriptor
-    nextSpillOffset += 32;
-    scratchOffset += 32;
-  }
-
   std::list<LSLiveRange *> spillLRs;
   int iterator = 0;
   uint32_t GRFSpillFillCount = 0;
@@ -914,31 +908,27 @@ int LinearScanRA::linearScanRA() {
     if (spillLRs.size()) {
       if (iterator == 0 && enableSpillSpaceCompression &&
           kernel.getInt32KernelAttr(Attributes::ATTR_Target) == VISA_3D &&
-          !(kernel.fg.getHasStackCalls() || kernel.fg.getIsStackCallFunc())) {
-        unsigned int spillSize = 0;
-        for (auto lr : spillLRs) {
-          spillSize += lr->getTopDcl()->getByteSize();
-        }
-        if ((spillSize * 1.5) < (SCRATCH_MSG_LIMIT - nextSpillOffset)) {
-          enableSpillSpaceCompression = false;
-        }
+          !hasStackCall) {
+        enableSpillSpaceCompression = gra.spillSpaceCompression(
+            gra.computeSpillSize(spillLRs), gra.nextSpillOffset);
       }
 
-      SpillManagerGRF spillGRF(gra, nextSpillOffset, &l, &spillLRs,
+      SpillManagerGRF spillGRF(gra, gra.nextSpillOffset, &l, &spillLRs,
                                enableSpillSpaceCompression,
                                useScratchMsgForSpill);
 
       spillGRF.spillLiveRanges(&kernel);
-      nextSpillOffset = spillGRF.getNextOffset();
-      ;
-      scratchOffset = std::max(scratchOffset, spillGRF.getNextScratchOffset());
+      gra.nextSpillOffset = spillGRF.getNextOffset();
+      gra.scratchOffset = std::max(gra.scratchOffset, spillGRF.getNextScratchOffset());
+
 #ifdef DEBUG_VERBOSE_ON
       COUT_ERROR << "===== printSpillLiveIntervals============"
                  << "\n";
       printSpillLiveIntervals(spillLRs);
 #endif
+
       if (builder.hasScratchSurface() && !hasStackCall &&
-          (nextSpillOffset + globalScratchOffset) > SCRATCH_MSG_LIMIT) {
+          (gra.nextSpillOffset + globalScratchOffset) > SCRATCH_MSG_LIMIT) {
         // create temp variable to store old a0.2 - this is marked as live-in
         // and live-out. because the variable is emitted only post RA to
         // preserve old value of a0.2.
@@ -950,6 +940,7 @@ int LinearScanRA::linearScanRA() {
         }
       } else if (gra.useLscForNonStackCallSpillFill ||
                  gra.useLscForScatterSpill) {
+        // Xe2+ LSC-based spill/fill needs the same as above
         G4_Declare *a0Dcl = kernel.fg.builder->getOldA0Dot2Temp();
         LSLiveRange *lr = gra.getSafeLSLR(a0Dcl);
         if (!lr) {
@@ -986,8 +977,8 @@ int LinearScanRA::linearScanRA() {
           kernel.getGTPinData()->setScratchNextFree(
               8 * 1024 - kernel.getGTPinData()->getNumBytesScratchUse());
         } else {
-          jitInfo->stats.spillMemUsed = nextSpillOffset;
-          kernel.getGTPinData()->setScratchNextFree(nextSpillOffset);
+          jitInfo->stats.spillMemUsed = gra.nextSpillOffset;
+          kernel.getGTPinData()->setScratchNextFree(gra.nextSpillOffset);
         }
         jitInfo->stats.numGRFSpillFillWeighted = GRFSpillFillCount;
       }
@@ -996,7 +987,7 @@ int LinearScanRA::linearScanRA() {
 
     RA_TRACE({
       std::cout << "\titeration: " << iterator << "\n";
-      std::cout << "\t\tnextSpillOffset: " << nextSpillOffset << "\n";
+      std::cout << "\t\tnextSpillOffset: " << gra.nextSpillOffset << "\n";
       std::cout << "\t\tGRFSpillFillCount: " << GRFSpillFillCount << "\n";
     });
 
@@ -1020,7 +1011,7 @@ int LinearScanRA::linearScanRA() {
 
   if (kernel.fg.getHasStackCalls() || kernel.fg.getIsStackCallFunc()) {
     getSaveRestoreRegister();
-    unsigned localSpillAreaOwordSize = ROUND(scratchOffset, 64) / 16;
+    unsigned localSpillAreaOwordSize = ROUND(gra.scratchOffset, 64) / 16;
     gra.addSaveRestoreCode(localSpillAreaOwordSize);
   }
   return VISA_SUCCESS;
@@ -1170,7 +1161,11 @@ void LinearScanRA::setDstReferences(
     if (lr->getFirstRef(startIdx) == NULL && startIdx == 0) {
       lr->setFirstRef(curInst, curInst->getLexicalId() * 2);
     }
-    lr->setLastRef(curInst, curInst->getLexicalId() * 2);
+
+    // For dst, we set the last ref = lexcial_ID * 2 + 1.
+    // So that the dst will not be released immediately if it's defined only.
+    // This is to handle some special workload. Such as for LIT test
+    lr->setLastRef(curInst, curInst->getLexicalId() * 2 + 1);
   } else if (dcl->getRegVar()
                  ->getPhyReg()
                  ->isGreg()) // Assigned already and is GRF
@@ -1189,7 +1184,9 @@ void LinearScanRA::setDstReferences(
     if (lr->getFirstRef(startIdx) == NULL && startIdx == 0) {
       lr->setFirstRef(curInst, curInst->getLexicalId() * 2);
     }
-    lr->setLastRef(curInst, curInst->getLexicalId() * 2);
+    // For dst, we set the last ref = lexcial_ID * 2 + 1.
+    // So that the dst will not be released immediately if it's defined only.
+    lr->setLastRef(curInst, curInst->getLexicalId() * 2 + 1);
   }
 
   if (lr->isEOT() && std::find(eotLiveIntervals.begin(), eotLiveIntervals.end(),
@@ -1286,7 +1283,10 @@ void LinearScanRA::generateInputIntervals(
   unsigned int idx = regNum * builder.numEltPerGRF<Type_UW>() +
                      (regOff * topdcl->getElemSize()) / G4_WSIZE +
                      topdcl->getWordSize() - 1;
-
+  //Variable size may be larger than occupied GRF
+  if (idx > (kernel.getNumRegTotal() * builder.numEltPerGRF<Type_UW>() - 1)) {
+    idx = kernel.getNumRegTotal() * builder.numEltPerGRF<Type_UW>() - 1;
+  }
   unsigned int numWords = topdcl->getWordSize();
   for (int i = numWords - 1; i >= 0; --i, --idx) {
     if ((inputRegLastRef[idx] == UINT_MAX || inputRegLastRef[idx] < instID) &&

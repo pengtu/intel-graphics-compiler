@@ -309,6 +309,7 @@ namespace {
     static void getAnalysisUsage(AnalysisUsage &AU) {
       AU.addRequired<GenXLiveness>();
       AU.addRequired<GenXGroupBaling>();
+      AU.addRequired<GenXGroupLiveElementsWrapper>();
       AU.addRequired<GenXNumbering>();
       AU.addRequired<DominatorTreeGroupWrapperPassWrapper>();
       AU.addRequired<LoopInfoGroupWrapperPass>();
@@ -419,6 +420,7 @@ using GenXCoalescingWrapper = FunctionGroupWrapperPass<GenXCoalescing>;
 INITIALIZE_PASS_BEGIN(GenXCoalescingWrapper, "GenXCoalescingWrapper",
                       "GenXCoalescingWrapper", false, false)
 INITIALIZE_PASS_DEPENDENCY(GenXGroupBalingWrapper)
+INITIALIZE_PASS_DEPENDENCY(GenXGroupLiveElementsWrapper)
 INITIALIZE_PASS_DEPENDENCY(GenXLivenessWrapper)
 INITIALIZE_PASS_DEPENDENCY(GenXNumberingWrapper)
 INITIALIZE_PASS_DEPENDENCY(DominatorTreeGroupWrapperPassWrapper);
@@ -443,6 +445,7 @@ bool GenXCoalescing::runOnFunctionGroup(FunctionGroup &FG)
             .getGenXSubtarget();
   Baling = &getAnalysis<GenXGroupBaling>();
   Liveness = &getAnalysis<GenXLiveness>();
+  Liveness->setLiveElements(&getAnalysis<GenXGroupLiveElements>());
   Numbering = &getAnalysis<GenXNumbering>();
   DTWrapper = &getAnalysis<DominatorTreeGroupWrapperPass>();
   LIWrapper = &getAnalysis<LoopInfoGroupWrapperPass>();
@@ -1087,7 +1090,7 @@ void GenXCoalescing::processPhiNodes(FunctionGroup *FG)
   // Perform copy of uncoalesced phi node incomings.
   // New phis can be created during this, store them.
   std::vector<PHINode *> NewPhis;
-  for (auto Elem : PhiCopies) {
+  for (auto &Elem : PhiCopies) {
     processPhiCopy(Elem.Phi, Elem.IncomingIdx, NewPhis);
   }
   // Phi copies are resolved. Clean the list.
@@ -1107,7 +1110,7 @@ void GenXCoalescing::processPhiNodes(FunctionGroup *FG)
     NewPhis.clear();
 
     // Perform copy of uncoalesced phi node incomings.
-    for (auto Elem : PhiCopies) {
+    for (auto &Elem : PhiCopies) {
       processPhiCopy(Elem.Phi, Elem.IncomingIdx, NewPhis);
     }
     // Phi copies are resolved. Clean the list.
@@ -1899,9 +1902,9 @@ void GenXCoalescing::applyCopiesOptimized() {
   // it is still simple linear traverse through all copies.
 
   // Traverse all LRs
-  for (auto LRDataIt : SortedCD.CopiesPerLR) {
+  for (auto &LRDataIt : SortedCD.CopiesPerLR) {
     // Traverse all copy values
-    for (auto CDIt : LRDataIt.second.CopiesPerValue) {
+    for (auto &CDIt : LRDataIt.second.CopiesPerValue) {
       // Finally we got into current copy candidates.
       // Traverse all copy data.
       applyCopiesForValue(CDIt.second);

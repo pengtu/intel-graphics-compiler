@@ -42,8 +42,6 @@ SPDX-License-Identifier: MIT
 
 using namespace CisaFramework;
 using namespace vISA;
-#define SIZE_VALUE m_kernel_data_size
-#define SIZE_VALUE_INST m_instruction_size
 
 #define IS_GEN_PATH (mBuildOption == VISA_BUILDER_GEN)
 #define IS_BOTH_PATH (mBuildOption == VISA_BUILDER_BOTH)
@@ -1296,12 +1294,9 @@ int VISAKernelImpl::CreateVISALabelVar(VISA_LabelOpnd *&opnd, const char *name,
     opnd->opnd_type = CISA_OPND_OTHER;
     opnd->size = (uint16_t)Get_VISA_Type_Size(
         (VISA_Type)inst_desc->opnd_desc[0].data_type);
-    // opnd->tag = inst_desc->opnd_desc[0].opnd_type;
     lbl->attribute_capacity = 0;
     lbl->attribute_count = 0;
     lbl->attributes = NULL;
-
-    m_label_info_size += lbl->getSizeInBinary();
   }
 
   return VISA_SUCCESS;
@@ -1563,25 +1558,12 @@ int VISAKernelImpl::AddAttributeToVarGeneric(CISA_GEN_VAR *decl,
     }
     break;
   }
-  case ADDRESS_VAR: {
-    m_address_info_size += attr->getSizeInBinary();
+  case ADDRESS_VAR:
+  case PREDICATE_VAR:
+  case SAMPLER_VAR:
+  case SURFACE_VAR:
+  case LABEL_VAR:
     break;
-  }
-  case PREDICATE_VAR: {
-    m_predicate_info_size += attr->getSizeInBinary();
-    break;
-  }
-  case SAMPLER_VAR: {
-    m_sampler_info_size += attr->getSizeInBinary();
-    break;
-  }
-  case SURFACE_VAR: {
-    break;
-  }
-  case LABEL_VAR: {
-    m_label_info_size += attr->getSizeInBinary();
-    break;
-  }
   default:
     vISA_ASSERT_UNREACHABLE("invalid dcl type");
     return VISA_FAILURE;
@@ -1616,7 +1598,6 @@ void VISAKernelImpl::addVarInfoToList(CISA_GEN_VAR *t) {
 
 void VISAKernelImpl::addSampler(CISA_GEN_VAR *state) {
   m_sampler_info_list.push_back(state);
-  m_sampler_info_size += state->stateVar.getSizeInBinary();
 }
 
 void VISAKernelImpl::addSurface(CISA_GEN_VAR *state) {
@@ -1625,12 +1606,10 @@ void VISAKernelImpl::addSurface(CISA_GEN_VAR *state) {
 
 void VISAKernelImpl::addAddrToList(CISA_GEN_VAR *addr) {
   m_addr_info_list.push_back(addr);
-  m_address_info_size += addr->addrVar.getSizeInBinary();
 }
 
 void VISAKernelImpl::addPredToList(CISA_GEN_VAR *pred) {
   m_pred_info_list.push_back(pred);
-  m_predicate_info_size += pred->predVar.getSizeInBinary();
 }
 
 void VISAKernelImpl::addAttribute(const char *inputName,
@@ -1638,7 +1617,6 @@ void VISAKernelImpl::addAttribute(const char *inputName,
   attrTemp->nameIndex = addStringPool(std::string(inputName));
   m_attribute_info_list.push_back(attrTemp);
   m_attribute_count++;
-  m_attribute_info_size += attrTemp->getSizeInBinary();
 }
 
 Common_ISA_Input_Class
@@ -1706,7 +1684,6 @@ int VISAKernelImpl::CreateVISAInputVar(CISA_GEN_VAR *decl, uint16_t offset,
     } else {
       m_input_info_list.push_back(input);
       m_input_count++;
-      m_input_info_size += input->getSizeInBinary();
 
       if (IsAsmWriterMode()) {
         // Print input var
@@ -4801,6 +4778,7 @@ int VISAKernelImpl::AppendVISAMiscRawSends(
 
   int status = VISA_SUCCESS;
 
+
   if (IS_GEN_BOTH_PATH) {
     CreateGenRawSrcOperand(src0);
     CreateGenRawSrcOperand(src1);
@@ -5168,8 +5146,8 @@ int VISAKernelImpl::AppendVISA3dSamplerMsgGeneric(
     ISA_Opcode opcode, VISASampler3DSubOpCode subOpcode, bool pixelNullMask,
     bool cpsEnable, bool uniformSampler, VISA_PredOpnd *pred,
     VISA_EMask_Ctrl emask, VISA_Exec_Size executionSize, ChannelMask srcChannel,
-    VISA_VectorOpnd *aoffimmi, VISA_StateOpndHandle *sampler,
-    VISA_StateOpndHandle *surface,
+    VISA_VectorOpnd *aoffimmi, VISA_StateOpndHandle *sampler, unsigned int samplerIdx,
+    VISA_StateOpndHandle *surface, unsigned int surfaceIdx,
     VISA_RawOpnd *dst, unsigned int numMsgSpecificOpnds,
     VISA_RawOpnd **opndArray) {
   TIME_SCOPE(VISA_BUILDER_APPEND_INST);
@@ -5178,11 +5156,22 @@ int VISAKernelImpl::AppendVISA3dSamplerMsgGeneric(
 
   int status = VISA_SUCCESS;
   bool isLoad = (subOpcode == VISA_3D_LD_MCS || subOpcode == VISA_3D_LD ||
+                 subOpcode == VISA_3D_LD_L ||
                  subOpcode == VISA_3D_LD2DMS_W || subOpcode == VISA_3D_LD_LZ);
   bool isSample4 =
       (subOpcode == VISA_3D_GATHER4 || subOpcode == VISA_3D_GATHER4_C ||
        (m_builder->hasGather4PO() && subOpcode == VISA_3D_GATHER4_PO) ||
-       (m_builder->hasGather4PO() && subOpcode == VISA_3D_GATHER4_PO_C)
+       (m_builder->hasGather4PO() && subOpcode == VISA_3D_GATHER4_PO_C) ||
+       subOpcode == VISA_3D_GATHER4_PO_PACKED ||
+       subOpcode == VISA_3D_GATHER4_PO_PACKED_L ||
+       subOpcode == VISA_3D_GATHER4_PO_PACKED_B ||
+       subOpcode == VISA_3D_GATHER4_PO_PACKED_I ||
+       subOpcode == VISA_3D_GATHER4_PO_PACKED_C ||
+       subOpcode == VISA_3D_GATHER4_PO_PACKED_I_C ||
+       subOpcode == VISA_3D_GATHER4_PO_PACKED_L_C ||
+       subOpcode == VISA_3D_GATHER4_I || subOpcode == VISA_3D_GATHER4_B ||
+       subOpcode == VISA_3D_GATHER4_L || subOpcode == VISA_3D_GATHER4_I_C ||
+       subOpcode == VISA_3D_GATHER4_L_C
       );
 
   if (IS_GEN_BOTH_PATH) {
@@ -5212,7 +5201,6 @@ int VISAKernelImpl::AppendVISA3dSamplerMsgGeneric(
           subOpcode, pixelNullMask, g4Pred, executionSize, emask, srcChannel,
           aoffimmi->g4opnd, sampler->g4opnd, surface->g4opnd,
           dst->g4opnd->asDstRegRegion(), numMsgSpecificOpnds, g4params);
-
     } else {
       status = m_builder->translateVISASampler3DInst(
           subOpcode, pixelNullMask, cpsEnable, uniformSampler, g4Pred,
@@ -5254,13 +5242,17 @@ int VISAKernelImpl::AppendVISA3dSamplerMsgGeneric(
     // sampler
     if (opcode == ISA_3D_SAMPLE || opcode == ISA_3D_GATHER4) {
       ADD_OPND(num_operands, opnd, sampler);
+      // reserved
+      ADD_OPND(num_operands, opnd, CreateOtherOpnd(0, ISA_TYPE_UD));
     }
 
     // surface
     ADD_OPND(num_operands, opnd, surface);
-
+    // reserved
+    ADD_OPND(num_operands, opnd, CreateOtherOpnd(0, ISA_TYPE_UD));
     // dst
     ADD_OPND(num_operands, opnd, dst);
+
     ADD_OPND(num_operands, opnd,
              CreateOtherOpndHelper(num_pred_desc_operands, num_operands,
                                    inst_desc, numMsgSpecificOpnds));
@@ -5297,15 +5289,28 @@ int VISAKernelImpl::AppendVISA3dSampler(
     VISASampler3DSubOpCode subOpcode, bool pixelNullMask, bool cpsEnable,
     bool uniformSampler, VISA_PredOpnd *pred, VISA_EMask_Ctrl emask,
     VISA_Exec_Size executionSize, VISAChannelMask srcChannel,
-    VISA_VectorOpnd *aoffimmi, VISA_StateOpndHandle *sampler,
-    VISA_StateOpndHandle *surface,
+    VISA_VectorOpnd *aoffimmi, VISA_StateOpndHandle *sampler, VISA_StateOpndHandle *surface,
+    VISA_RawOpnd *dst, int numMsgSpecificOpnds, VISA_RawOpnd **opndArray) {
+  return AppendVISA3dSampler(
+      subOpcode, pixelNullMask, cpsEnable, uniformSampler, pred, emask,
+      executionSize, srcChannel, aoffimmi,
+      sampler, 0, surface, 0,
+      dst, numMsgSpecificOpnds, opndArray);
+}
+
+int VISAKernelImpl::AppendVISA3dSampler(
+    VISASampler3DSubOpCode subOpcode, bool pixelNullMask, bool cpsEnable,
+    bool uniformSampler, VISA_PredOpnd *pred, VISA_EMask_Ctrl emask,
+    VISA_Exec_Size executionSize, VISAChannelMask srcChannel,
+    VISA_VectorOpnd *aoffimmi, VISA_StateOpndHandle *sampler, unsigned int samplerIdx,
+    VISA_StateOpndHandle *surface, unsigned int surfaceIdx,
     VISA_RawOpnd *dst, int numMsgSpecificOpnds, VISA_RawOpnd **opndArray) {
   ISA_Opcode opcode =
       ISA_3D_SAMPLE; // generate Gen IR for opndArray and dst in below func
   return AppendVISA3dSamplerMsgGeneric(
       opcode, subOpcode, pixelNullMask, cpsEnable, uniformSampler, pred, emask,
-      executionSize, ChannelMask::createFromAPI(srcChannel), aoffimmi, sampler,
-      surface,
+      executionSize, ChannelMask::createFromAPI(srcChannel), aoffimmi,
+      sampler, samplerIdx, surface, surfaceIdx,
       dst, numMsgSpecificOpnds, opndArray);
 }
 
@@ -5321,7 +5326,7 @@ int VISAKernelImpl::AppendVISA3dLoad(
       opcode, subOpcode, pixelNullMask,
       /*cpsEnable*/ false,
       /*uniformSampler*/ true, pred, emask, executionSize,
-      ChannelMask::createFromAPI(srcChannel), aoffimmi, NULL, surface,
+      ChannelMask::createFromAPI(srcChannel), aoffimmi, nullptr, 0, surface, 0,
       dst, numMsgSpecificOpnds, opndArray);
 }
 
@@ -5337,11 +5342,10 @@ int VISAKernelImpl::AppendVISA3dGather4(
       opcode, subOpcode, pixelNullMask,
       /*cpsEnable*/ false,
       /*uniformSampler*/ true, pred, emask, executionSize,
-      ChannelMask::createFromSingleChannel(srcChannel), aoffimmi, sampler,
-      surface,
+      ChannelMask::createFromSingleChannel(srcChannel), aoffimmi, sampler, 0,
+      surface, 0,
       dst, numMsgSpecificOpnds, opndArray);
 }
-
 
 int VISAKernelImpl::AppendVISA3dInfo(VISASampler3DSubOpCode subOpcode,
                                      VISA_EMask_Ctrl emask,
@@ -7267,6 +7271,7 @@ int VISAKernelImpl::AppendVISADpasInstCommon(
     uint32_t src2Bits = GenPrecisionTable[(int)src2Precision].BitSize;
     if (src2Precision == GenPrecision::FP16 ||
         src2Precision == GenPrecision::BF16 ||
+        src2Precision == GenPrecision::TF32 ||
         src2Bits == 8 || (src1Bits <= 4 && src2Bits == 4)) {
       G4_SubReg_Align srAlign = getIRBuilder()->getGRFAlign();
       if (Count != 8)
@@ -7816,7 +7821,7 @@ VISA_BUILDER_API int VISAKernelImpl::AppendVISALscUntypedBlock2DInst(
     status |= m_builder->translateLscUntypedBlock2DInst(
         op, lscSfid, pred ? pred->g4opnd->asPredicate() : nullptr, execSize,
         emask, cacheOpts, dataShape2D, dstData->g4opnd->asDstRegRegion(),
-        src0AddrSrcRgns, src1Data->g4opnd->asSrcRegRegion());
+        src0AddrSrcRgns, src1Data->g4opnd->asSrcRegRegion(), xImmOffset, yImmOffset);
   }
 
   if (IS_VISA_BOTH_PATH) {
@@ -8028,6 +8033,10 @@ VISA_BUILDER_API int VISAKernelImpl::AppendVISALscFence(LSC_SFID lscSfid,
       scope > LSC_SCOPE_LOCAL && fenceOp == LSC_FENCE_OP_NONE)
     fenceOp = LSC_FENCE_OP_INVALIDATE;
 
+  if (m_builder->needLSCFenceDiscardWA())
+    vISA_ASSERT_INPUT(fenceOp != LSC_FENCE_OP_DISCARD,
+                      "Fence Op Discard is prohibited on this platform.");
+
   if (IS_GEN_BOTH_PATH) {
     SFID sfid = LSC_SFID_To_SFID(lscSfid);
     m_builder->translateLscFence(nullptr, sfid, fenceOp, scope, status);
@@ -8133,8 +8142,6 @@ uint32_t VISAKernelImpl::addStringPool(std::string str) {
   if (str.empty()) {
     return 0;
   }
-  m_string_pool_size +=
-      (int)str.size() + 1; // to account for a null terminating character
   m_string_pool.emplace_back(std::move(str));
   return (uint32_t)(m_string_pool.size() - 1);
 }
@@ -8143,9 +8150,6 @@ void VISAKernelImpl::addInstructionToEnd(CisaInst *inst) {
   m_instruction_list.push_back(inst);
   CISA_INST *cisaInst = inst->getCISAInst();
   cisaInst->id = getvIsaInstCount();
-  m_instruction_size += inst->getSize();
-  DEBUG_PRINT_SIZE_INSTRUCTION("size after instruction added: ",
-                               inst->m_inst_desc->opcode, SIZE_VALUE_INST);
 
   if (IsAsmWriterMode()) {
     // Print instructions
@@ -8178,238 +8182,6 @@ void VISAKernelImpl::finalizeAttributes() {
     uint8_t val = (uint8_t)target;
     AddKernelAttribute("Target", 1, &val);
   }
-}
-
-/**
- * This function is called right before the kernel instructions are outputed in
- * to a buffer. It assumes that all the VISA instructions have already been
- * generated.
- */
-void VISAKernelImpl::finalizeKernel() {
-  finalizeAttributes();
-  m_cisa_kernel.string_count = (uint32_t)m_string_pool.size();
-  m_cisa_kernel.strings =
-      (const char **)m_mem.alloc(m_cisa_kernel.string_count * sizeof(char *));
-  auto it_string = m_string_pool.begin(), et_string = m_string_pool.end();
-  int size_check = 0;
-
-  for (int i = 0; it_string != et_string; i++, ++it_string) {
-    char *string = (char *)m_mem.alloc(it_string->size() + 1);
-    memcpy_s(string, it_string->size() + 1, it_string->c_str(),
-             it_string->size() + 1);
-    m_cisa_kernel.strings[i] = string;
-    size_check += (int)it_string->size() + 1;
-  }
-
-  m_kernel_data_size = sizeof(m_cisa_kernel.string_count);
-  m_kernel_data_size += m_string_pool_size;
-
-  DEBUG_PRINT_SIZE("\nsize after string_count: ", SIZE_VALUE);
-
-  // already set
-  m_kernel_data_size += sizeof(m_cisa_kernel.name_index);
-
-  DEBUG_PRINT_SIZE("size after name_index: ", SIZE_VALUE);
-
-  /****VARIABLES*******/
-  unsigned int adjVarInfoCount = m_var_info_count - m_num_pred_vars;
-  m_cisa_kernel.variable_count = adjVarInfoCount;
-  m_cisa_kernel.variables =
-      (var_info_t *)m_mem.alloc(sizeof(var_info_t) * adjVarInfoCount);
-
-  uint32_t varInfoSize = 0;
-  for (unsigned int i = 0; i < adjVarInfoCount; i++) {
-    var_info_t *temp = &m_var_info_list.at(i + m_num_pred_vars)->genVar;
-    m_cisa_kernel.variables[i] = *temp;
-    varInfoSize += temp->getSizeInBinary();
-  }
-  m_kernel_data_size += sizeof(m_cisa_kernel.variable_count);
-  m_kernel_data_size += varInfoSize;
-
-  DEBUG_PRINT_SIZE("size after variables: ", SIZE_VALUE);
-
-  /****ADDRESSES**********/
-
-  m_cisa_kernel.address_count = (uint16_t)m_addr_info_count;
-
-  m_cisa_kernel.addresses =
-      (addr_info_t *)m_mem.alloc(sizeof(addr_info_t) * m_addr_info_count);
-
-  std::vector<CISA_GEN_VAR *>::iterator it_addr_info = m_addr_info_list.begin();
-  for (unsigned int i = 0; i < m_addr_info_count; i++, it_addr_info++) {
-    vISA_ASSERT_INPUT(
-        it_addr_info != m_addr_info_list.end(),
-        "Count of addresses does not correspond with number of items.");
-    m_cisa_kernel.addresses[i] = (*it_addr_info)->addrVar;
-  }
-
-  m_kernel_data_size += sizeof(m_cisa_kernel.address_count);
-  m_kernel_data_size += m_address_info_size;
-
-  DEBUG_PRINT_SIZE("size after addresses: ", SIZE_VALUE);
-
-  /****PREDICATES*********/
-  m_cisa_kernel.predicate_count = (uint16_t)m_pred_info_count;
-  m_cisa_kernel.predicates =
-      (pred_info_t *)m_mem.alloc(sizeof(pred_info_t) * m_pred_info_count);
-
-  std::vector<CISA_GEN_VAR *>::iterator it_pred_info = m_pred_info_list.begin();
-  for (unsigned int i = 0; i < m_pred_info_count; i++, it_pred_info++) {
-    vISA_ASSERT_INPUT(
-        it_pred_info != m_pred_info_list.end(),
-        "Count of predicates does not correspond with number of items.");
-    pred_info_t *temp = &(*it_pred_info)->predVar;
-    m_cisa_kernel.predicates[i] = *temp;
-  }
-  m_kernel_data_size += sizeof(m_cisa_kernel.predicate_count);
-  m_kernel_data_size += m_predicate_info_size;
-
-  DEBUG_PRINT_SIZE("size after predicates: ", SIZE_VALUE);
-
-  /****LABELS**********/
-  m_cisa_kernel.label_count = (uint16_t)m_label_count;
-  m_cisa_kernel.labels =
-      (label_info_t *)m_mem.alloc(sizeof(label_info_t) * m_label_count);
-
-  std::vector<label_info_t *>::const_iterator it_label_info =
-      m_label_info_list.cbegin();
-  std::vector<label_info_t *>::const_iterator it_label_info_end =
-      m_label_info_list.cend();
-  for (unsigned int i = 0; i < m_label_count; i++, it_label_info++) {
-    vISA_ASSERT_INPUT(it_label_info != it_label_info_end,
-                 "Count of labels does not correspond with number of items.");
-    label_info_t *temp = *it_label_info;
-    m_cisa_kernel.labels[i] = *temp;
-  }
-  m_kernel_data_size += sizeof(m_cisa_kernel.label_count);
-  m_kernel_data_size += m_label_info_size;
-
-  DEBUG_PRINT_SIZE("size after labels: ", SIZE_VALUE);
-
-  /*****SAMPLERS*********/
-  m_cisa_kernel.sampler_count = (uint8_t)m_sampler_count;
-  m_cisa_kernel.samplers =
-      (state_info_t *)m_mem.alloc(sizeof(state_info_t) * m_sampler_count);
-
-  std::vector<CISA_GEN_VAR *>::iterator it_sampler_info =
-      m_sampler_info_list.begin();
-  for (unsigned int i = 0; i < m_sampler_count; i++, it_sampler_info++) {
-    vISA_ASSERT_INPUT(it_sampler_info != m_sampler_info_list.end(),
-                 "Count of sampler declarations does not correspond with "
-                 "number of items.");
-    state_info_t *temp = &(*it_sampler_info)->stateVar;
-    m_cisa_kernel.samplers[i] = *temp;
-  }
-
-  m_kernel_data_size += sizeof(m_cisa_kernel.sampler_count);
-  m_kernel_data_size += m_sampler_info_size;
-
-  DEBUG_PRINT_SIZE("size after samplers: ", SIZE_VALUE);
-
-  /*****SURFACES******/
-  unsigned int adjSurfaceCount =
-      m_surface_count - Get_CISA_PreDefined_Surf_Count();
-  m_cisa_kernel.surface_count = (uint8_t)adjSurfaceCount;
-  m_cisa_kernel.surfaces =
-      (state_info_t *)m_mem.alloc(sizeof(state_info_t) * adjSurfaceCount);
-
-  uint32_t surfaceInfoSize = 0;
-  for (unsigned int i = 0, j = Get_CISA_PreDefined_Surf_Count();
-       i < adjSurfaceCount; i++, j++) {
-    state_info_t *temp = &m_surface_info_list.at(j)->stateVar;
-    m_cisa_kernel.surfaces[i] = *temp;
-    surfaceInfoSize += temp->getSizeInBinary();
-  }
-
-  m_kernel_data_size += sizeof(m_cisa_kernel.surface_count);
-  m_kernel_data_size += surfaceInfoSize;
-
-  DEBUG_PRINT_SIZE("size after surfaces: ", SIZE_VALUE);
-
-  /*****VMES********/
-  // VME variables are removed
-  m_cisa_kernel.vme_count = 0;
-  m_kernel_data_size += sizeof(m_cisa_kernel.vme_count);
-
-  DEBUG_PRINT_SIZE("size after VMEs: ", SIZE_VALUE);
-
-  /*****INPUTS******/
-
-  if (getIsKernel()) {
-    m_input_offset = m_kernel_data_size;
-    m_cisa_kernel.input_count = (uint8_t)m_input_count;
-    m_cisa_kernel.inputs =
-        (input_info_t *)m_mem.alloc(sizeof(input_info_t) * m_input_count);
-
-    std::vector<input_info_t *>::iterator it_input_info =
-        m_input_info_list.begin();
-    for (unsigned int i = 0; i < m_input_count; i++, it_input_info++) {
-      vISA_ASSERT_INPUT(it_input_info != m_input_info_list.end(),
-                   "Count of inputs does not correspond with number of items.");
-      input_info_t *temp = *it_input_info;
-      m_cisa_kernel.inputs[i] = *temp;
-    }
-    m_kernel_data_size += sizeof(m_cisa_kernel.input_count);
-    m_kernel_data_size += m_input_info_size;
-
-    DEBUG_PRINT_SIZE("size after inputs: ", SIZE_VALUE);
-  }
-
-  /*******INSTRUCTIONS SIZE*****/
-  m_kernel_data_size += sizeof(m_cisa_kernel.size);
-  m_cisa_kernel.size = m_instruction_size;
-
-  DEBUG_PRINT_SIZE("size after size: ", SIZE_VALUE);
-
-  /******OFFSET OF FIRST INSTRUCTION FROM KERNEL START*********/
-  m_kernel_data_size += sizeof(m_cisa_kernel.entry);
-
-  DEBUG_PRINT_SIZE("size after entry: ", SIZE_VALUE);
-
-  if (!getIsKernel()) {
-    m_kernel_data_size += sizeof(m_cisa_kernel.input_size);
-    DEBUG_PRINT_SIZE("size after input size: ", SIZE_VALUE);
-
-    m_kernel_data_size += sizeof(m_cisa_kernel.return_type);
-    DEBUG_PRINT_SIZE("size after return type: ", SIZE_VALUE);
-  }
-
-  /*******ATTRIBUTES**************/
-  m_cisa_kernel.attribute_count = (uint16_t)m_attribute_count;
-  m_cisa_kernel.attributes = (attribute_info_t *)m_mem.alloc(
-      sizeof(attribute_info_t) * m_attribute_count);
-
-  std::list<attribute_info_t *>::iterator it_attribute_info =
-      m_attribute_info_list.begin();
-  for (unsigned int i = 0; i < m_attribute_count; i++, it_attribute_info++) {
-    vISA_ASSERT_INPUT(
-        it_attribute_info != m_attribute_info_list.end(),
-        "Count of attributes does not correspond with number of items.");
-    attribute_info_t *temp = *it_attribute_info;
-    m_cisa_kernel.attributes[i] = *temp;
-  }
-  m_kernel_data_size += sizeof(m_cisa_kernel.attribute_count);
-  m_kernel_data_size += m_attribute_info_size;
-
-  DEBUG_PRINT_SIZE("size after attributes: ", SIZE_VALUE);
-
-  /******Setting Entry*********/
-  m_cisa_kernel.entry = m_kernel_data_size;
-
-  m_cisa_binary_size = m_instruction_size + m_kernel_data_size;
-  m_cisa_binary_buffer = (char *)m_mem.alloc(m_cisa_binary_size);
-}
-
-unsigned long VISAKernelImpl::writeInToCisaBinaryBuffer(const void *value,
-                                                        int size) {
-  vISA_ASSERT_INPUT(m_bytes_written_cisa_buffer + size <= m_cisa_binary_size,
-               "Size of VISA instructions binary buffer is exceeded.");
-
-  memcpy_s(&m_cisa_binary_buffer[m_bytes_written_cisa_buffer], size, value,
-           size);
-  m_bytes_written_cisa_buffer += size;
-
-  return m_bytes_written_cisa_buffer;
 }
 
 VISA_LabelOpnd *
@@ -8580,7 +8352,7 @@ int VISAKernelImpl::GetGenRelocEntryBuffer(void *&buffer,
     return VISA_FAILURE;
 
   GenRelocEntry *buffer_p = (GenRelocEntry *)buffer;
-  for (auto reloc : reloc_table) {
+  for (const auto &reloc : reloc_table) {
     auto inst = reloc.getInst();
     buffer_p->r_type = reloc.getType();
     buffer_p->r_offset = static_cast<uint32_t>(inst->getGenOffset()) +
@@ -8595,7 +8367,7 @@ int VISAKernelImpl::GetGenRelocEntryBuffer(void *&buffer,
         "Relocation symbol name longer than MAX_SYMBOL_NAME_LENGTH");
 
     // clean the buffer first
-    memset(buffer_p->r_symbol, '0', MAX_SYMBOL_NAME_LENGTH);
+    memset(buffer_p->r_symbol, 0, MAX_SYMBOL_NAME_LENGTH);
     strcpy_s(buffer_p->r_symbol, MAX_SYMBOL_NAME_LENGTH,
              reloc.getSymbolName().c_str());
     ++buffer_p;
@@ -9018,7 +8790,7 @@ static const VISAKernelImpl *getFmtKernelForISADump(
     const VISAKernelImpl *kernel,
     const CISA_IR_Builder &cisaBuilder) {
   // Assuming there's no too many payload kernels. Use the logic in
-  // CisaBinary::isaDump to select the kernel for format provider.
+  // isaDump to select the kernel for format provider.
   if (!kernel->getIsPayload())
     return kernel;
 
@@ -9042,6 +8814,14 @@ std::string VISAKernelImpl::getVISAAsm() const {
   const VISAKernelImpl *fmtKernel = getFmtKernelForISADump(
           this, *m_CISABuilder);
   return m_CISABuilder->isaDump(this, fmtKernel);
+}
+
+int VISAKernelImpl::encodeBlockFrequency(uint64_t digits, int16_t scale, bool beginEncoding) {
+  if (beginEncoding)
+    m_builder->getFreqInfoManager().setCurrentStaticFreq(digits, scale);
+  else
+    m_builder->getFreqInfoManager().transferFreqToG4Inst();
+  return VISA_SUCCESS;
 }
 
 void VISAKernelImpl::computeAndEmitDebugInfo(KernelListTy &functions) {

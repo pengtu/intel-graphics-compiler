@@ -27,6 +27,7 @@ public:
   uint16_t getLatency(const G4_INST *Inst) const override;
   uint16_t getOccupancy(const G4_INST *Inst) const override;
   uint16_t getDPASLatency(uint8_t repeatCount) const override;
+  uint16_t getSendSrcReadLatency(const G4_INST *Inst) const override;
 };
 
 template <PlatformGen Gen>
@@ -48,6 +49,8 @@ public:
   // The details of heuristics used to calculate the latency. The
   // implementation can be specialized if needed.
   uint16_t getDPASLatency(uint8_t repeatCount) const override;
+  uint16_t getSendSrcReadLatency(const G4_INST *Inst) const override;
+
 private:
   uint16_t getMsgLatency(const G4_INST *Inst) const;
   uint16_t getMathLatency(const G4_INST *inst) const;
@@ -153,6 +156,10 @@ uint16_t LatencyTableLegacy::getDPASLatency(uint8_t repeatCount) const {
   return LegacyLatencies::UNKNOWN_LATENCY;
 }
 
+uint16_t LatencyTableLegacy::getSendSrcReadLatency(const G4_INST *inst) const {
+  return LegacyLatencies::UNCOMPR_LATENCY;
+}
+
 // General template implementations for XE+.
 template<PlatformGen Gen>
 uint16_t LatencyTableXe<Gen>::getLatency(const G4_INST *Inst) const {
@@ -174,6 +181,22 @@ uint16_t LatencyTableXe<Gen>::getLatency(const G4_INST *Inst) const {
 
   // By default, use the FPU pipeline latency.
   return value_of(LI::FPU);
+}
+
+// ARB cycle + GRF read lengths
+template <PlatformGen Gen>
+uint16_t LatencyTableXe<Gen>::getSendSrcReadLatency(const G4_INST *Inst) const {
+  vASSERT(Inst->isSend());
+  G4_SendDesc *msgDesc = Inst->getMsgDesc();
+  unsigned src0RegSize = 0;
+  src0RegSize = msgDesc->getSrc0LenRegs();
+
+  unsigned src1RegSize = 0;
+  if (Inst->isSplitSend()) {
+    src1RegSize = msgDesc->getSrc1LenRegs();
+  }
+
+  return value_of(LI::SEND_ARB) + src0RegSize + src1RegSize;
 }
 
 template<PlatformGen Gen>
@@ -230,6 +253,8 @@ uint16_t LatencyTableXe<Gen>::getBranchLatency(const G4_INST *Inst) const {
 template<PlatformGen Gen>
 uint16_t LatencyTableXe<Gen>::getIntrinsicLatency(const G4_INST *Inst) const {
   vASSERT(Inst->isIntrinsic());
+  if (Inst->isPseudoAddrMovIntrinsic())
+    return value_of(LI::ADDR_MOV);
   return value_of(LI::FPU);
 }
 
@@ -288,10 +313,36 @@ LatencyTableXe<PlatformGen::XE>::getDPASLatency(uint8_t repeatCount) const {
     default:
       return 32;
     }
+  case Xe_ARL:
+    switch (repeatCount) {
+    case 1:
+      return 21;
+    case 2:
+      return 22;
+    case 8: {
+      if (m_builder.has4DeepSystolic()) {
+        return 32;
+      }
+      return 46;
+    }
+    default:
+      return 22; // Conservative cycle
+    }
   case Xe_PVC:
     return value_of(LI::DPAS) + repeatCount - 1;
   case Xe_PVCXT:
     return value_of(LI::DPAS) + repeatCount;
+  case Xe2:
+    switch (repeatCount) {
+    case 1:
+      return 22;
+    case 2:
+      return 23;
+    case 8:
+      return 33;
+    default:
+      return 33;
+    }
   default: // Not supported platform
     // TODO: Add vISA_ASSERT_UNREACHABLE.
     return 46;
@@ -306,9 +357,10 @@ LatencyTableXe<PlatformGen::XE>::getMathLatency(const G4_INST *Inst) const {
   return value_of(LI::MATH) + value_of(LI::DELTA_MATH) * Scale;
 }
 
-template<>
-uint16_t LatencyTableXe<PlatformGen::XE>::getDPASLatency(
-    const G4_InstDpas *dpas) const {
+template <>
+uint16_t
+LatencyTableXe<PlatformGen::XE>::getDPASLatency(const G4_InstDpas *dpas) const {
+
   return getDPASLatency(dpas->getRepeatCount());
 }
 

@@ -153,24 +153,6 @@ static VISA_Exec_Size getExecSizeFromValue(unsigned int Size) {
   return Res == -1 ? EXEC_SIZE_ILLEGAL : (VISA_Exec_Size)Res;
 }
 
-static VISA_Oword_Num getCisaOwordNumFromNumber(unsigned num) {
-  switch (num) {
-  case 1:
-    return OWORD_NUM_1;
-  case 2:
-    return OWORD_NUM_2;
-  case 4:
-    return OWORD_NUM_4;
-  case 8:
-    return OWORD_NUM_8;
-  case 16:
-    return OWORD_NUM_16;
-  default:
-    IGC_ASSERT_MESSAGE(0, "illegal Oword number.");
-    return OWORD_NUM_ILLEGAL;
-  }
-}
-
 VISAChannelMask convertChannelMaskToVisaType(unsigned Mask) {
   switch (Mask & 0xf) {
   case 1:
@@ -301,161 +283,6 @@ bool testPredicate(const CmpInst *const Cmp, const DstOpndDesc &DstDesc) {
 
 namespace llvm {
 
-static VISA_Type getVisaTypeFromBytesNumber(unsigned BytesNum, bool IsFloat,
-                                            genx::Signedness Sign) {
-  VISA_Type aliasType;
-  if (IsFloat) {
-    switch (BytesNum) {
-    case 2:
-      aliasType = ISA_TYPE_HF;
-      break;
-    case 4:
-      aliasType = ISA_TYPE_F;
-      break;
-    case 8:
-      aliasType = ISA_TYPE_DF;
-      break;
-    default:
-      report_fatal_error("unknown float type");
-      break;
-    }
-  } else {
-    switch (BytesNum) {
-    case 1:
-      aliasType = (Sign == SIGNED) ? ISA_TYPE_B : ISA_TYPE_UB;
-      break;
-    case 2:
-      aliasType = (Sign == SIGNED) ? ISA_TYPE_W : ISA_TYPE_UW;
-      break;
-    case 4:
-      aliasType = (Sign == SIGNED) ? ISA_TYPE_D : ISA_TYPE_UD;
-      break;
-    case 8:
-      aliasType = (Sign == SIGNED) ? ISA_TYPE_Q : ISA_TYPE_UQ;
-      break;
-    default:
-      report_fatal_error("unknown integer type");
-      break;
-    }
-  }
-  return aliasType;
-}
-
-static VISA_Type llvmToVisaType(Type *Type,
-                                genx::Signedness Sign = DONTCARESIGNED) {
-  auto T = Type;
-  IGC_ASSERT(!T->isAggregateType());
-  VISA_Type Result = ISA_TYPE_NUM;
-  if (auto *VT = dyn_cast<IGCLLVM::FixedVectorType>(T);
-      VT && VT->getElementType()->isIntegerTy(1)) {
-    IGC_ASSERT(VT->getNumElements() == 8 || VT->getNumElements() == 16 ||
-               VT->getNumElements() == 32);
-    Result = getVisaTypeFromBytesNumber(VT->getNumElements() / genx::ByteBits,
-                                        false, Sign);
-  } else {
-    if (T->isVectorTy())
-      T = cast<VectorType>(T)->getElementType();
-    if (T->isPointerTy()) {
-      // we might have used DL to get the type size but that'd
-      // overcomplicate this function's type unnecessarily
-      Result = getVisaTypeFromBytesNumber(visa::BytesPerSVMPtr, false,
-                                          DONTCARESIGNED);
-    } else {
-      IGC_ASSERT(T->isFloatingPointTy() || T->isIntegerTy());
-      Result = getVisaTypeFromBytesNumber(T->getScalarSizeInBits() / CHAR_BIT,
-                                          T->isFloatingPointTy(), Sign);
-    }
-  }
-  IGC_ASSERT(Result != ISA_TYPE_NUM);
-  return Result;
-}
-
-static VISA_Type llvmToVisaType(Value *V,
-                                genx::Signedness Sign = DONTCARESIGNED) {
-  return llvmToVisaType(V->getType(), Sign);
-}
-
-// Due to the lack of access to VISA_GenVar internal interfaces (concerning type, size, etc)
-// some local DS are required to store such info: CisaVariable and GenericCisaVariable.
-
-//===----------------------------------------------------------------------===//
-// CisaVariable
-// ------------------
-//
-// CisaVariable keeps VISA_GenVar of a specific VISA_Type and provides accessors
-// to its byte size and number of elements thus emulating some internal vISA machinery.
-//
-//===----------------------------------------------------------------------===//
-class CisaVariable {
-  VISA_Type Type;
-  unsigned ByteSize = 0;
-  VISA_GenVar *VisaVar = nullptr;
-
-public:
-  CisaVariable(VISA_Type T, unsigned BS, VISA_GenVar *V)
-      : Type(T), ByteSize(BS), VisaVar(V) {}
-
-  VISA_Type getType() const { return Type; }
-
-  VISA_GenVar *getGenVar() { return VisaVar; }
-
-  unsigned getByteSize() const { return ByteSize; }
-
-  unsigned getNumElements() const {
-    const int size = CISATypeTable[Type].typeSize;
-    IGC_ASSERT(size);
-    IGC_ASSERT(!(ByteSize % size));
-    return ByteSize / size;
-  }
-};
-
-//===----------------------------------------------------------------------===//
-// GenericCisaVariable
-// ------------------
-//
-// GenericCisaVariable describes vISA value that isn't intended to have matching llvm::Value
-// (e.g. stack regs %arg and %retv). It provides interface to get a VisaVar alias with a specific
-// vISA type.
-//
-//===----------------------------------------------------------------------===//
-class GenericCisaVariable {
-  const char *Name = "";
-  VISA_GenVar *VisaVar = nullptr;
-  unsigned ByteSize = 0;
-
-  IndexedMap<CisaVariable *> AliasDecls;
-  std::list<CisaVariable> Storage;
-
-  unsigned getNumElements(VISA_Type T) const {
-    const int size = CISATypeTable[T].typeSize;
-    IGC_ASSERT(size);
-    IGC_ASSERT(!(ByteSize % size));
-    return ByteSize / size;
-  }
-
-public:
-  GenericCisaVariable(const char *Nm, VISA_GenVar *V, unsigned BS)
-      : Name(Nm), VisaVar(V), ByteSize(BS) {
-    AliasDecls.grow(ISA_TYPE_NUM);
-  }
-
-  CisaVariable *getAlias(Value *V, VISAKernel *K) {
-    return getAlias(llvmToVisaType(V), K);
-  }
-
-  CisaVariable *getAlias(VISA_Type T, VISAKernel *K) {
-    if (!AliasDecls[T]) {
-      VISA_GenVar *VV = nullptr;
-      K->CreateVISAGenVar(VV, Name, getNumElements(T), T, ALIGN_GRF, VisaVar);
-      Storage.push_back(CisaVariable(T, ByteSize, VV));
-      AliasDecls[T] = &Storage.back();
-    }
-    return AliasDecls[T];
-  }
-
-  unsigned getByteSize() const { return ByteSize; }
-};
-
 //===----------------------------------------------------------------------===//
 /// GenXCisaBuilder
 /// ------------------
@@ -536,9 +363,7 @@ class GenXKernelBuilder {
   bool HasBarrier = false;
   bool HasCallable = false;
   bool HasStackcalls = false;
-  bool HasAlloca = false;
   bool HasSimdCF = false;
-  bool UseNewStackBuilder = false;
   // GRF width in unit of byte
   unsigned GrfByteSize = defaultGRFByteSize;
   // SIMD size for setting visa kernel attribute
@@ -556,12 +381,10 @@ class GenXKernelBuilder {
   Function *Func = nullptr;
   // function corresponding to VISAKernel currently being written
   Function *KernFunc = nullptr;
-  PreDefined_Surface StackSurf;
+  PreDefined_Surface StackSurf = PreDefined_Surface::PREDEFINED_SURFACE_INVALID;
 
   std::map<Function *, VISA_GenVar *> FPMap;
   SmallVector<InsertValueInst *, 10> RetvInserts;
-
-  std::map<VISAKernel *, std::map<StringRef, GenericCisaVariable>> CisaVars;
 
   // The default float control from kernel attribute. Each subroutine may
   // overrride this control mask, but it should revert back to the default float
@@ -603,7 +426,6 @@ public:
   VISABuilder *CisaBuilder = nullptr;
 
 private:
-  bool allowI64Ops() const;
   void collectKernelInfo();
   void buildVariables();
   void buildInstructions();
@@ -664,8 +486,6 @@ private:
                      const DstOpndDesc &DstDesc);
   void buildConvertAddr(CallInst *CI, genx::BaleInfo BI, unsigned Mod,
                         const DstOpndDesc &DstDesc);
-  void buildAlloca(CallInst *CI, unsigned IntrinID, unsigned Mod,
-                   const DstOpndDesc &DstDesc);
   void buildLoneReadVariableRegion(CallInst &CI);
   void buildLoneWriteVariableRegion(CallInst &CI);
   void buildWritePredefSurface(CallInst &CI);
@@ -676,8 +496,6 @@ private:
   void buildNoopCast(CastInst *CI, genx::BaleInfo BI, unsigned Mod,
                      const DstOpndDesc &DstDesc);
   void buildCmp(CmpInst *Cmp, genx::BaleInfo BI, const DstOpndDesc &DstDesc);
-  void buildExtractRetv(ExtractValueInst *Inst);
-  void buildInsertRetv(InsertValueInst *Inst);
 
   VISA_VectorOpnd *createState(Register *Reg, unsigned Offset, bool IsDst);
   VISA_Type getVISAImmTy(uint8_t ImmTy);
@@ -698,9 +516,6 @@ private:
                                      unsigned Mod, const DstOpndDesc &DstDesc,
                                      genx::Signedness *SignedRes = nullptr,
                                      unsigned *Offset = nullptr);
-  VISA_VectorOpnd *createDestination(CisaVariable *Dest,
-                                     genx::Signedness Signed,
-                                     unsigned *Offset = nullptr);
   VISA_VectorOpnd *createDestination(Value *Dest,
                                      genx::Signedness Signed,
                                      unsigned *Offset = nullptr);
@@ -710,9 +525,6 @@ private:
                                        unsigned Mod = 0,
                                        genx::Signedness *SignedRes = nullptr,
                                        unsigned MaxWidth = 16);
-  VISA_VectorOpnd *createSource(CisaVariable *V, genx::Signedness Signed,
-                                unsigned MaxWidth = 16,
-                                unsigned *Offset = nullptr);
   VISA_VectorOpnd *createSource(Value *V, genx::Signedness Signed, bool Baled,
                                 unsigned Mod = 0,
                                 genx::Signedness *SignedRes = nullptr,
@@ -780,28 +592,6 @@ private:
   std::string buildAsmName() const;
   void beginFunctionLight(Function *Func);
 
-  unsigned getFuncArgsSize(Function *F);
-  unsigned getValueSize(Type *T, unsigned Mod = 32) const;
-  unsigned getValueSize(CisaVariable *V) const {
-    return V->getByteSize();
-  }
-  unsigned getValueSize(Value *V, unsigned Mod = 32) const {
-    return getValueSize(V->getType(), Mod);
-  }
-  GenericCisaVariable *createCisaVariable(VISAKernel *Kernel, const char *Name,
-                                   VISA_GenVar *AliasVar, unsigned ByteSize);
-
-  template <typename T1, typename T2>
-  void emitVectorCopy(
-      T1 *Dst, T2 *Src, unsigned &RowOff, unsigned &ColOff, unsigned &SrcRowOff,
-      unsigned &SrcColOff, int TotalSize, bool DoCopy = true);
-
-  void pushStackArg(VISA_StateOpndHandle *Dst, Value *Src, int TotalSz,
-                    unsigned &RowOff, unsigned &ColOff, unsigned &SrcRowOff,
-                    unsigned &SrcColOff, bool DoCopy = true);
-  void popStackArg(Value *Dst, VISA_StateOpndHandle *Src, int TotalSz,
-                   unsigned &RowOff, unsigned &ColOff, unsigned &SrcRowOff,
-                   unsigned &SrcColOff, int &PrevStackOff);
   Signedness getCommonSignedness(ArrayRef<Value *> Vs) const;
 
   Register *getLastUsedAlias(Value *V) const;
@@ -944,6 +734,8 @@ public:
     collectKernelInfo();
   }
   ~GenXKernelBuilder() { clearLoops(); }
+  GenXKernelBuilder(const GenXKernelBuilder &) = delete;
+  GenXKernelBuilder &operator=(const GenXKernelBuilder &) = delete;
   void clearLoops() {
     for (auto i = Loops.begin(), e = Loops.end(); i != e; ++i) {
       delete i->second;
@@ -1152,8 +944,6 @@ void addKernelAttrsFromMetadata(VISAKernel &Kernel,
   unsigned SLMSizeInKb = divideCeil(KM.getSLMSize(), 1024);
   if (SLMSizeInKb > Subtarget->getMaxSlmSize())
     report_fatal_error("SLM size exceeds target limits");
-  if (!Subtarget->isOCLRuntime() && SLMSizeInKb > 255)
-    report_fatal_error("SLM size greater than 255KB is not supported by CMRT");
   Kernel.AddKernelAttribute("SLMSize", sizeof(SLMSizeInKb), &SLMSizeInKb);
 
   // Load thread payload from memory.
@@ -1165,19 +955,14 @@ void addKernelAttrsFromMetadata(VISAKernel &Kernel,
       if (Kind & 0x8)
         HasImplicit = true;
     }
-    if (Subtarget->isOCLRuntime()) {
-      // When CM kernel is run with OCL runtime, it is dispatched in a
-      // special "SIMD1" mode (aka "Programmable Media Kernels").
-      // This mode implies that we always have a "full" thread payload,
-      // even when CM kernel does *not* have implicit arguments.
-      // Payload format:
-      // | 0-15     | 16 - 31  | 32 - 47  | 46 - 256 |
-      // | localIDX | localIDY | localIDZ | unused   |
-      NumGRFs = 1;
-    } else {
-      // One GRF for per thread input size for CM
-      NumGRFs = std::max(HasImplicit ? 1U : 0U, NumGRFs);
-    }
+    // OCL runtime dispatches CM kernel in a
+    // special "SIMD1" mode (aka "Programmable Media Kernels").
+    // This mode implies that we always have a "full" thread payload,
+    // even when CM kernel does *not* have implicit arguments.
+    // Payload format:
+    // | 0-15     | 16 - 31  | 32 - 47  | 46 - 256 |
+    // | localIDX | localIDY | localIDZ | unused   |
+    NumGRFs = 1;
 
     uint16_t Bytes = NumGRFs * Subtarget->getGRFByteSize();
     Kernel.AddKernelAttribute("PerThreadInputSize", sizeof(Bytes), &Bytes);
@@ -1345,8 +1130,6 @@ bool GenXKernelBuilder::run() {
            CRBits::HalfPrecisionDenorm;
 
 
-  UseNewStackBuilder =
-      BackendConfig->useNewStackBuilder() && Subtarget->isOCLRuntime();
   StackCallExecSize =
       getExecSizeFromValue(BackendConfig->getInteropSubgroupSize());
 
@@ -1382,24 +1165,6 @@ bool GenXKernelBuilder::run() {
   }
 
   NumVisaInsts += Kernel->getvIsaInstCount();
-
-  return false;
-}
-
-static bool PatchImpArgOffset(Function *F, const GenXSubtarget *ST,
-                              const vc::KernelMetadata &KM) {
-  IGC_ASSERT(ST);
-  if (ST->isOCLRuntime())
-    return false;
-  if (!ST->hasThreadPayloadInMemory())
-    return false;
-
-  unsigned Idx = 0;
-  for (auto i = F->arg_begin(), e = F->arg_end(); i != e; ++i, ++Idx) {
-    uint8_t Kind = (KM.getArgKind(Idx));
-    if (Kind & 0xf8)
-      return true;
-  }
 
   return false;
 }
@@ -1446,7 +1211,6 @@ void GenXKernelBuilder::buildInputs(Function *F, bool NeedRetIP) {
   }
   // Each argument.
   unsigned Idx = 0;
-  bool PatchImpArgOff = PatchImpArgOffset(F, Subtarget, TheKernelMetadata);
   for (auto i = F->arg_begin(), e = F->arg_end(); i != e; ++i, ++Idx) {
     if (TheKernelMetadata.shouldSkipArg(Idx))
       continue;
@@ -1455,16 +1219,7 @@ void GenXKernelBuilder::buildInputs(Function *F, bool NeedRetIP) {
     IGC_ASSERT(Reg);
     uint8_t Kind = TheKernelMetadata.getArgKind(Idx);
     uint16_t Offset = 0;
-    if (!PatchImpArgOff) {
-      Offset = TheKernelMetadata.getArgOffset(Idx);
-    }
-    else {
-      if ((Kind >> 3) == 3) {
-        Offset = GrfByteSize;
-      } else {
-        Offset = (TheKernelMetadata.getArgOffset(Idx) + GrfByteSize);
-      }
-    }
+    Offset = TheKernelMetadata.getArgOffset(Idx);
     // Argument size in bytes.
     const unsigned NumBytes = getInputSizeInBytes(
         DL, TheKernelMetadata.getArgCategory(Idx), Arg->getType());
@@ -1627,10 +1382,11 @@ void GenXKernelBuilder::buildInstructions() {
                 auto Phi = dyn_cast<PHINode>(&*si);
                 if (!Phi)
                   break;
+                auto PredIdx = Phi->getBasicBlockIndex(BB);
+                IGC_ASSERT_EXIT(PredIdx >= 0);
                 if (Phi->getType()->getPrimitiveSizeInBits() >=
                         (GrfByteSize * 8) * 4 &&
-                    isa<UndefValue>(
-                        Phi->getIncomingValue(Phi->getBasicBlockIndex(BB))))
+                    isa<UndefValue>(Phi->getIncomingValue(PredIdx)))
                   addLifetimeStartInst(Phi);
               }
             }
@@ -1850,17 +1606,6 @@ VISA_VectorOpnd *GenXKernelBuilder::createState(Register *Reg, unsigned Offset,
   }
 
   return Op;
-}
-
-VISA_VectorOpnd *GenXKernelBuilder::createDestination(CisaVariable *Dest,
-                                                      genx::Signedness Signed,
-                                                      unsigned *Offset) {
-  Region R(IGCLLVM::FixedVectorType::get(
-      IntegerType::get(Ctx, CISATypeTable[Dest->getType()].typeSize * CHAR_BIT),
-      Dest->getNumElements()));
-  if (Offset)
-    R.Offset = *Offset;
-  return createRegionOperand(&R, Dest->getGenVar(), Signed, 0, true);
 }
 
 VISA_VectorOpnd *GenXKernelBuilder::createDestination(Value *Dest,
@@ -2249,18 +1994,6 @@ void GenXKernelBuilder::buildConvert(CallInst *CI, BaleInfo BI, unsigned Mod,
       createImmediateOperand(Constant::getNullValue(CI->getType()), UNSIGNED);
 
   appendVISAAddrAddInst(vISA_EMASK_M1_NM, ISAExecSize, Dst, Src0, Src1);
-}
-
-VISA_VectorOpnd *GenXKernelBuilder::createSource(CisaVariable *V,
-                                                 Signedness Signed,
-                                                 unsigned MaxWidth,
-                                                 unsigned *Offset) {
-  Region R(IGCLLVM::FixedVectorType::get(
-      IntegerType::get(Ctx, CISATypeTable[V->getType()].typeSize * CHAR_BIT),
-      V->getNumElements()));
-  if (Offset)
-    R.Offset = *Offset;
-  return createRegionOperand(&R, V->getGenVar(), Signed, 0, false, MaxWidth);
 }
 
 VISA_VectorOpnd *GenXKernelBuilder::createSource(Value *V, Signedness Signed,
@@ -2886,23 +2619,6 @@ static unsigned getResultedTypeSize(Type *Ty, const DataLayout& DL) {
   return TySz;
 }
 
-// Check if we're trying to form return value of a structure type
-// TODO:  should check full insert/extract chain (for failed coalescing cases),
-//        e.g. after failed coalescing we may end up having a bunch of
-//        extractvalue, insertvalue and bitcasts inst where only the last one
-//        should be actually lowered
-static bool checkInsertToRetv(InsertValueInst *Inst) {
-  if (auto IVI = dyn_cast<InsertValueInst>(Inst->use_begin()->getUser()))
-    return checkInsertToRetv(IVI);
-
-  if (auto RI = dyn_cast<ReturnInst>(Inst->use_begin()->getUser())) {
-    const auto *F = RI->getFunction();
-    return vc::requiresStackCall(F);
-  }
-
-  return false;
-}
-
 /***********************************************************************
  * buildMainInst : build a main instruction
  *
@@ -2939,19 +2655,8 @@ bool GenXKernelBuilder::buildMainInst(Instruction *Inst, BaleInfo BI,
       buildBoolBinaryOperator(BO);
     }
   } else if (auto EVI = dyn_cast<ExtractValueInst>(Inst)) {
-    if (auto *CI = dyn_cast<CallInst>(Inst->getOperand(0)))
-      // translate extraction of structured type from retv
-      if (!UseNewStackBuilder && !CI->isInlineAsm() &&
-          (vc::requiresStackCall(CI->getCalledFunction()) ||
-           CI->isIndirectCall()))
-        buildExtractRetv(EVI);
     // no code generated
   } else if (auto IVI = dyn_cast<InsertValueInst>(Inst)) {
-    if (!UseNewStackBuilder && checkInsertToRetv(IVI) &&
-        // TODO: safely remove this tmp workaround for failed coalescing cases
-        // and insert-extract-insert chains
-        !isa<BitCastInst>(Inst->getOperand(1)))
-      RetvInserts.push_back(IVI);
     // no code generated
   } else if (CastInst *CI = dyn_cast<CastInst>(Inst)) {
     if (genx::isNoopCast(CI))
@@ -3015,10 +2720,6 @@ bool GenXKernelBuilder::buildMainInst(Instruction *Inst, BaleInfo BI,
         break;
       case GenXIntrinsic::genx_convert_addr:
         buildConvertAddr(CI, BI, Mod, DstDesc);
-        break;
-      case GenXIntrinsic::genx_alloca:
-        if (!UseNewStackBuilder)
-          buildAlloca(CI, IntrinID, Mod, DstDesc);
         break;
       case GenXIntrinsic::genx_gaddr:
         buildSymbolInst(CI, Mod, DstDesc);
@@ -3161,8 +2862,9 @@ void GenXKernelBuilder::buildGoto(CallInst *Goto, BranchInst *Branch) {
     IGC_ASSERT(PredReg->Category == vc::RegCategory::Predicate);
   }
 
-  uint8_t execSize = genx::log2(
+  auto execSize = genx::log2(
       cast<IGCLLVM::FixedVectorType>(Pred->getType())->getNumElements());
+  IGC_ASSERT_EXIT(execSize > 0);
 
   // Visa decoder part
   VISA_EMask_Ctrl emask = VISA_EMask_Ctrl((execSize >> 0x4) & 0xF);
@@ -3363,14 +3065,6 @@ void GenXKernelBuilder::AddGenVar(Register &Reg) {
   }
 }
 
-bool GenXKernelBuilder::allowI64Ops() const {
-  IGC_ASSERT(Subtarget);
-  if (!Subtarget->hasLongLong())
-    return false;
-  if (Subtarget->partialI64Emulation())
-    return false;
-  return true;
-}
 /**************************************************************************************************
  * Scan ir to collect information about whether kernel has callable function or
  * barrier.
@@ -3389,8 +3083,6 @@ void GenXKernelBuilder::collectKernelInfo() {
             if (IID == GenXIntrinsic::genx_barrier ||
                 IID == GenXIntrinsic::genx_sbarrier)
               HasBarrier = true;
-            else if (IID == GenXIntrinsic::genx_alloca)
-              HasAlloca = true;
           } else {
             Function *Callee = CI->getCalledFunction();
             if (Callee && Callee->hasFnAttribute("CMCallable"))
@@ -3481,10 +3173,6 @@ void GenXKernelBuilder::buildVariables() {
   VISA_GenVar *ArgDecl = nullptr, *RetDecl = nullptr;
   Kernel->GetPredefinedVar(ArgDecl, PREDEFINED_ARG);
   Kernel->GetPredefinedVar(RetDecl, PREDEFINED_RET);
-  createCisaVariable(Kernel, "argv", ArgDecl,
-                     visa::ArgRegSizeInGRFs * GrfByteSize);
-  createCisaVariable(Kernel, "retv", RetDecl,
-                     visa::RetRegSizeInGRFs * GrfByteSize);
 }
 
 /***********************************************************************
@@ -3638,9 +3326,9 @@ void GenXKernelBuilder::buildIntrinsic(CallInst *CI, unsigned IntrinID,
     // media width and the return type or final arg
     ConstantInt *Const =
         dyn_cast<ConstantInt>(CI->getArgOperand(AI.getArgIdx()));
-    IGC_ASSERT_MESSAGE(Const, "Incorrect args to intrinsic call");
+    IGC_ASSERT_EXIT_MESSAGE(Const, "Incorrect args to intrinsic call");
     unsigned Width = Const->getZExtValue();
-    IGC_ASSERT_MESSAGE(Width > 0 && Width <= 64, "Invalid media width");
+    IGC_ASSERT_EXIT_MESSAGE(Width > 0 && Width <= 64, "Invalid media width");
     unsigned RoundedWidth = roundedVal(Width, 4u);
     Type *DataType = CI->getType();
     if (DataType->isVoidTy())
@@ -4092,7 +3780,7 @@ void GenXKernelBuilder::buildIntrinsic(CallInst *CI, unsigned IntrinID,
                ElementSize == LSC_DATA_SIZE_32b ||
                ElementSize == LSC_DATA_SIZE_64b);
 
-    constexpr unsigned AddressOperandNum = 7;
+    constexpr unsigned AddressOperandNum = 6;
     auto *AddrV = CI->getArgOperand(AddressOperandNum);
     auto *AddrTy = AddrV->getType();
     if (auto *AddrVTy = dyn_cast<IGCLLVM::FixedVectorType>(AddrTy))
@@ -4103,11 +3791,28 @@ void GenXKernelBuilder::buildIntrinsic(CallInst *CI, unsigned IntrinID,
                AddrBits == 32);
   };
 
+  auto GetLscCacheControls = [&](II::ArgInfo AI) {
+    const auto CacheOptsIndex = AI.getArgIdx();
+    IGC_ASSERT(CacheOptsIndex ==
+               vc::InternalIntrinsic::getMemoryCacheControlOperandIndex(CI));
+    auto *CacheOpts = cast<Constant>(CI->getArgOperand(CacheOptsIndex));
+
+    LSC_CACHE_OPTS Res(LSC_CACHING_DEFAULT, LSC_CACHING_DEFAULT);
+
+    auto *L1Opt = cast<ConstantInt>(CacheOpts->getAggregateElement(0u));
+    Res.l1 = static_cast<LSC_CACHE_OPT>(L1Opt->getZExtValue());
+
+    auto *L3Opt = cast<ConstantInt>(CacheOpts->getAggregateElement(1u));
+    Res.l3 = static_cast<LSC_CACHE_OPT>(L3Opt->getZExtValue());
+
+    return Res;
+  };
+
   auto CreateLscAtomic =
       [&](VISA_PredOpnd *Pred, VISA_Exec_Size ExecSize,
           VISA_EMask_Ctrl ExecMask, LSC_OP Opcode, LSC_SFID LscSfid,
           LSC_ADDR_TYPE AddressType, LSC_ADDR_SIZE AddressSize,
-          LSC_DATA_SIZE ElementSize, LSC_CACHE_OPT L1Opt, LSC_CACHE_OPT L3Opt,
+          LSC_DATA_SIZE ElementSize, LSC_CACHE_OPTS CacheOpts,
           VISA_RawOpnd *Dest, VISA_VectorOpnd *Base, VISA_RawOpnd *Addr,
           int Scale, int Offset, VISA_RawOpnd *Src1, VISA_RawOpnd *Src2) {
         LLVM_DEBUG(dbgs() << "CreateLscAtomic\n");
@@ -4115,7 +3820,6 @@ void GenXKernelBuilder::buildIntrinsic(CallInst *CI, unsigned IntrinID,
         IGC_ASSERT(ElementSize != LSC_DATA_SIZE_8c32b);
         IGC_ASSERT(Opcode >= LSC_ATOMIC_IINC && Opcode <= LSC_ATOMIC_XOR);
 
-        LSC_CACHE_OPTS CacheOpts = {L1Opt, L3Opt};
         LSC_ADDR AddressDesc = {AddressType, Scale, Offset, AddressSize};
         LSC_DATA_SHAPE DataDesc = {ElementSize, LSC_DATA_ORDER_NONTRANSPOSE,
                                    LSC_DATA_ELEMS_1};
@@ -4130,15 +3834,13 @@ void GenXKernelBuilder::buildIntrinsic(CallInst *CI, unsigned IntrinID,
                            VISA_EMask_Ctrl ExecMask, LSC_OP Opcode,
                            LSC_SFID LscSfid, LSC_ADDR_TYPE AddressType,
                            LSC_ADDR_SIZE AddressSize, LSC_DATA_SIZE ElementSize,
-                           int VectorAttr, LSC_CACHE_OPT L1Opt,
-                           LSC_CACHE_OPT L3Opt, VISA_RawOpnd *Dest,
-                           VISA_VectorOpnd *Base, VISA_RawOpnd *Addr, int Scale,
-                           int Offset) {
+                           int VectorAttr, LSC_CACHE_OPTS CacheOpts,
+                           VISA_RawOpnd *Dest, VISA_VectorOpnd *Base,
+                           VISA_RawOpnd *Addr, int Scale, int Offset) {
     LLVM_DEBUG(dbgs() << "CreateLscLoad\n");
     IGC_ASSERT(Opcode == LSC_LOAD || Opcode == LSC_LOAD_QUAD);
     CheckLscOp(LscSfid, AddressType, AddressSize, ElementSize);
 
-    LSC_CACHE_OPTS CacheOpts = {L1Opt, L3Opt};
     LSC_ADDR AddressDesc = {AddressType, Scale, Offset, AddressSize};
     LSC_DATA_SHAPE DataDesc = {ElementSize, LSC_DATA_ORDER_NONTRANSPOSE};
 
@@ -4164,14 +3866,13 @@ void GenXKernelBuilder::buildIntrinsic(CallInst *CI, unsigned IntrinID,
       [&](VISA_PredOpnd *Pred, VISA_Exec_Size ExecSize,
           VISA_EMask_Ctrl ExecMask, LSC_OP Opcode, LSC_SFID LscSfid,
           LSC_ADDR_TYPE AddressType, LSC_ADDR_SIZE AddressSize,
-          LSC_DATA_SIZE ElementSize, int VectorAttr, LSC_CACHE_OPT L1Opt,
-          LSC_CACHE_OPT L3Opt, VISA_VectorOpnd *Base, VISA_RawOpnd *Addr,
-          int Scale, int Offset, VISA_RawOpnd *Data) {
+          LSC_DATA_SIZE ElementSize, int VectorAttr, LSC_CACHE_OPTS CacheOpts,
+          VISA_VectorOpnd *Base, VISA_RawOpnd *Addr, int Scale, int Offset,
+          VISA_RawOpnd *Data) {
         LLVM_DEBUG(dbgs() << "CreateLscStore\n");
         IGC_ASSERT(Opcode == LSC_STORE || Opcode == LSC_STORE_QUAD);
         CheckLscOp(LscSfid, AddressType, AddressSize, ElementSize);
 
-        LSC_CACHE_OPTS CacheOpts = {L1Opt, L3Opt};
         LSC_ADDR AddressDesc = {AddressType, Scale, Offset, AddressSize};
         LSC_DATA_SHAPE DataDesc = {ElementSize, LSC_DATA_ORDER_NONTRANSPOSE};
 
@@ -5042,6 +4743,7 @@ void GenXKernelBuilder::buildConvertAddr(CallInst *CI, genx::BaleInfo BI,
                    CI);
     }
   } else {
+    IGC_ASSERT_EXIT(GrfByteSize > 0);
     uint8_t rowOffset = Offset >> genx::log2(GrfByteSize);
     uint8_t colOffset = (Offset & (GrfByteSize - 1)) >> Log2_32(ElementBytes);
     auto TypeSize = BaseReg->Ty->getScalarType()->getPrimitiveSizeInBits() >> 3;
@@ -5058,77 +4760,6 @@ void GenXKernelBuilder::buildConvertAddr(CallInst *CI, genx::BaleInfo BI,
   }
   VISA_VectorOpnd *Src2 = createSourceOperand(CI, UNSIGNED, 0, BI);
   appendVISAAddrAddInst(MaskCtrl, ExecSize, Dst, Src1, Src2);
-}
-
-/***********************************************************************
- * buildAlloca : build code for allocating in thread-private memory
- *
- * Enter:   CI = the CallInst
- *
- */
-void GenXKernelBuilder::buildAlloca(CallInst *CI, unsigned IntrinID,
-                                    unsigned Mod, const DstOpndDesc &DstDesc) {
-  LLVM_DEBUG(dbgs() << "Building alloca " << *CI << "\n");
-  VISA_GenVar *Sp = nullptr;
-  CISA_CALL(Kernel->GetPredefinedVar(Sp, PreDefined_Vars::PREDEFINED_FE_SP));
-  if (!allowI64Ops())
-    CISA_CALL(
-        Kernel->CreateVISAGenVar(Sp, "Sp", 1, ISA_TYPE_UD, ALIGN_DWORD, Sp));
-
-  Value *AllocaOff = CI->getOperand(0);
-  Type *AllocaOffTy = AllocaOff->getType();
-
-  if (CurrentPadding) {
-    // padd the current alloca the comply with gather/scatter alignment rules
-    // unsigned LastOff =
-    // getResultedTypeSize(LastAlloca->getOperand(0)->getType(), DL);
-    auto *AllocaEltTy = AllocaOffTy->getScalarType();
-    if (AllocaOffTy->isArrayTy())
-      AllocaEltTy = AllocaOffTy->getArrayElementType();
-    unsigned Padding = DL.getTypeSizeInBits(AllocaEltTy) / genx::ByteBits;
-    Padding = (Padding - CurrentPadding) % Padding;
-    if (Padding) {
-      VISA_VectorOpnd *SpSrc = nullptr;
-      CISA_CALL(Kernel->CreateVISASrcOperand(SpSrc, Sp, MODIFIER_NONE, 0, 1, 0,
-                                             0, 0));
-      VISA_VectorOpnd *PaddImm = nullptr;
-      CISA_CALL(Kernel->CreateVISAImmediate(PaddImm, &Padding, ISA_TYPE_D));
-      VISA_VectorOpnd *DstSp = nullptr;
-      CISA_CALL(Kernel->CreateVISADstOperand(
-          DstSp, static_cast<VISA_GenVar *>(Sp), 1, 0, 0));
-
-      appendVISAArithmeticInst(ISA_ADD, nullptr, false, vISA_EMASK_M1,
-                               EXEC_SIZE_1, DstSp, SpSrc, PaddImm);
-      CurrentPadding += Padding;
-    }
-  }
-
-  VISA_VectorOpnd *SpSrc = nullptr;
-  CISA_CALL(
-      Kernel->CreateVISASrcOperand(SpSrc, Sp, MODIFIER_NONE, 0, 1, 0, 0, 0));
-
-  unsigned OffVal = getResultedTypeSize(AllocaOffTy, DL);
-  CurrentPadding = (CurrentPadding + OffVal) %
-                   (DL.getLargestLegalIntTypeSizeInBits() / genx::ByteBits);
-
-  VISA_VectorOpnd *Imm = nullptr;
-  CISA_CALL(Kernel->CreateVISAImmediate(Imm, &OffVal, ISA_TYPE_D));
-
-  if (IntrinID == llvm::GenXIntrinsic::genx_alloca) {
-    VISA_VectorOpnd *Src = nullptr;
-    CISA_CALL(Kernel->CreateVISASrcOperand(Src, static_cast<VISA_GenVar *>(Sp),
-                                           MODIFIER_NONE, 0, 1, 0, 0, 0));
-    VISA_VectorOpnd *Dst = createDestination(CI, DONTCARESIGNED, Mod, DstDesc);
-    appendVISADataMovementInst(ISA_MOV, nullptr, false, vISA_EMASK_M1,
-                               EXEC_SIZE_1, Dst, Src);
-  }
-
-  VISA_VectorOpnd *DstSp = nullptr;
-  CISA_CALL(Kernel->CreateVISADstOperand(DstSp, static_cast<VISA_GenVar *>(Sp),
-                                         1, 0, 0));
-
-  appendVISAArithmeticInst(ISA_ADD, nullptr, false, vISA_EMASK_M1, EXEC_SIZE_1,
-                           DstSp, SpSrc, Imm);
 }
 
 /***********************************************************************
@@ -5217,15 +4848,15 @@ GenXKernelBuilder::createGeneralOperand(Region *R, VISA_GenVar *Decl,
   // Write the vISA general operand, canonicalizing the
   // region parameters where applicable.
   IGC_ASSERT_MESSAGE(Decl, "no register allocated for this value");
+  IGC_ASSERT_EXIT(GrfByteSize > 0);
+  auto Off = R->Offset >> genx::log2(GrfByteSize);
+  auto NumOff = (R->Offset & (GrfByteSize - 1)) / R->ElementBytes;
   if (!IsDest) {
-    ResultOperand = createCisaSrcOperand(
-        Decl, static_cast<VISA_Modifier>(Mod), R->VStride, R->Width, R->Stride,
-        R->Offset >> genx::log2(GrfByteSize),
-        (R->Offset & (GrfByteSize - 1)) / R->ElementBytes);
+    ResultOperand =
+        createCisaSrcOperand(Decl, static_cast<VISA_Modifier>(Mod), R->VStride,
+                             R->Width, R->Stride, Off, NumOff);
   } else {
-    ResultOperand = createCisaDstOperand(
-        Decl, R->getDstStride(), R->Offset >> genx::log2(GrfByteSize),
-        (R->Offset & (GrfByteSize - 1)) / R->ElementBytes);
+    ResultOperand = createCisaDstOperand(Decl, R->getDstStride(), Off, NumOff);
   }
   return ResultOperand;
 }
@@ -5864,226 +5495,6 @@ StringRef GenXKernelBuilder::getStringByIndex(unsigned Val) {
   IGC_ASSERT_UNREACHABLE(); // Can't find string by index.
 }
 
-/***********************************************************************
- * Get size of the argument of type 'type' in bytes considering layout of
- * subtypes of aggregate type in units of size 'mod'
- * mod is typically 32 (GRF) or 16 (oword)
- */
-unsigned GenXKernelBuilder::getValueSize(Type *T, unsigned Mod) const {
-  unsigned Result = 0;
-  if (T->isAggregateType()) {
-    for (unsigned i = 0; i < T->getStructNumElements(); i++) {
-      Result += getValueSize(T->getContainedType(i)) / Mod +
-                (getValueSize(T->getContainedType(i)) % Mod ? 1 : 0);
-    }
-    Result *= Mod;
-  } else
-    Result = DL.getTypeSizeInBits(T) / 8;
-  return Result;
-}
-
-unsigned GenXKernelBuilder::getFuncArgsSize(llvm::Function *F) {
-  unsigned Result = 0;
-  for (auto &Arg : F->args())
-    Result += getValueSize(&Arg);
-  return Result;
-}
-
-GenericCisaVariable *
-GenXKernelBuilder::createCisaVariable(VISAKernel *Kernel, const char *Name,
-                                      VISA_GenVar *AliasVar,
-                                      unsigned ByteSize) {
-  auto it = CisaVars[Kernel].find(Name);
-  if (it != CisaVars[Kernel].end())
-    it->second = GenericCisaVariable(Name, AliasVar, ByteSize);
-  else
-    CisaVars[Kernel].insert(
-        std::make_pair(Name, GenericCisaVariable(Name, AliasVar, ByteSize)));
-  return &(CisaVars[Kernel].at(Name));
-}
-
-static unsigned deduceByteSize(Value *V, const DataLayout &DL) {
-  return DL.getTypeSizeInBits(V->getType()->getScalarType()) / 8;
-}
-
-static unsigned deduceByteSize(CisaVariable *V, const DataLayout &DL) {
-  IGC_ASSERT(V->getType() < ISA_TYPE_NUM);
-  return CISATypeTable[V->getType()].typeSize;
-}
-
-/**************************************************************************************************
- * emitVectorCopy : emit vISA that performs copying form Dst to Src
- *
- * Emit sufficient amount of MOVs from Dst to Src picking size in a greedy
- * manner
- *
- * T1 and T2 should be llvm::Value and CisaVariable or vice-versa,
- * CisaVariable=>CisaVariable or Value=>Value copying is not supported here
- *
- */
-template <typename T1, typename T2>
-void GenXKernelBuilder::emitVectorCopy(T1 *Dst, T2 *Src, unsigned &RowOff,
-                                       unsigned &ColOff, unsigned &SrcRowOff,
-                                       unsigned &SrcColOff, int TotalSize,
-                                       bool DoCopy) {
-  IGC_ASSERT(Subtarget);
-  auto partCopy = [&, GRFWidth = Subtarget->getGRFByteSize()](int Sz) {
-    int ByteSz = Sz * deduceByteSize(Dst, DL);
-    IGC_ASSERT(ByteSz);
-
-    unsigned Start = SrcRowOff;
-    unsigned End = (SrcRowOff * GRFWidth + SrcColOff + ByteSz) / GRFWidth;
-
-    // mov is prohibited to span across >2 GRF
-    if (End - Start >= 2) {
-      IGC_ASSERT(Sz > 1);
-      return;
-    }
-
-    while (TotalSize >= ByteSz) {
-      VISA_VectorOpnd *ArgSrc = nullptr, *ArgDst = nullptr;
-      unsigned Offset = SrcRowOff * GrfByteSize + SrcColOff;
-      ArgSrc = createSource(Src, UNSIGNED, Sz, &Offset);
-      SrcRowOff += (SrcColOff + ByteSz) / GrfByteSize;
-      SrcColOff = (SrcColOff + ByteSz) % GrfByteSize;
-
-      Offset = RowOff * GrfByteSize + ColOff;
-      ArgDst = createDestination(Dst, UNSIGNED, &Offset);
-      RowOff += (ColOff + ByteSz) / GrfByteSize;
-      ColOff = (ColOff + ByteSz) % GrfByteSize;
-
-      if (DoCopy)
-        appendVISADataMovementInst(ISA_MOV, nullptr, false,
-                                   (NoMask ? vISA_EMASK_M1_NM : vISA_EMASK_M1),
-                                   getExecSizeFromValue(Sz), ArgDst, ArgSrc);
-      TotalSize -= ByteSz;
-    }
-  };
-  partCopy(16);
-  partCopy(8);
-  partCopy(4);
-  partCopy(2);
-  partCopy(1);
-}
-
-void GenXKernelBuilder::pushStackArg(VISA_StateOpndHandle *Dst, Value *Src,
-                                     int TotalSz, unsigned &RowOff,
-                                     unsigned &ColOff, unsigned &SrcRowOff,
-                                     unsigned &SrcColOff, bool DoCopy) {
-  VISA_GenVar *StackOff = nullptr, *Sp = nullptr;
-
-  auto StackTmp = createCisaVariable(Kernel, "stackTmp", nullptr, TotalSz);
-
-  auto TmpType = llvmToVisaType(Src->getType());
-  auto TmpVar = StackTmp->getAlias(TmpType, Kernel);
-
-  CISA_CALL(Kernel->CreateVISAGenVar(StackOff, "stackOff", 1, ISA_TYPE_UQ,
-                                     ALIGN_OWORD));
-  unsigned RawOff = 0;
-  auto partCopy = [&](int Sz) {
-    // TODO: mb we have some constant for oword size
-    int ByteSz = Sz * visa::BytesPerOword;
-    int CopySz = std::min(ByteSz, TotalSz);
-
-    while (TotalSz - ByteSz >= 0 || (TotalSz > 0 && Sz == 1)) {
-      CISA_CALL(Kernel->GetPredefinedVar(Sp, PREDEFINED_FE_SP));
-      VISA_VectorOpnd *SpOpSrc1 = nullptr;
-      VISA_VectorOpnd *SpOpSrc2 = nullptr;
-      VISA_VectorOpnd *SpOpDst = nullptr;
-      CISA_CALL(Kernel->CreateVISADstOperand(SpOpDst, Sp, 1, 0, 0));
-      CISA_CALL(Kernel->CreateVISASrcOperand(SpOpSrc1, Sp, MODIFIER_NONE, 0, 1,
-                                             0, 0, 0));
-      CISA_CALL(Kernel->CreateVISASrcOperand(SpOpSrc2, Sp, MODIFIER_NONE, 0, 1,
-                                             0, 0, 0));
-
-      VISA_VectorOpnd *TmpOffDst = nullptr, *TmpOffSrc = nullptr;
-      CISA_CALL(Kernel->CreateVISADstOperand(TmpOffDst, StackOff, 1, 0, 0));
-      CISA_CALL(Kernel->CreateVISASrcOperand(TmpOffSrc, StackOff, MODIFIER_NONE,
-                                             0, 1, 0, 0, 0));
-
-      emitVectorCopy(TmpVar, Src, RowOff, ColOff, SrcRowOff, SrcColOff, CopySz,
-                     DoCopy);
-      VISA_VectorOpnd *Imm = nullptr;
-      unsigned OffVal = Sz;
-      CISA_CALL(Kernel->CreateVISAImmediate(Imm, &OffVal, ISA_TYPE_UD));
-      VISA_RawOpnd *RawSrc = nullptr;
-      CISA_CALL(
-          Kernel->CreateVISARawOperand(RawSrc, TmpVar->getGenVar(), RawOff));
-      RawOff += Sz * visa::BytesPerOword;
-
-      if (DoCopy) {
-        appendVISADataMovementInst(ISA_MOV, nullptr, false, vISA_EMASK_M1,
-                                   EXEC_SIZE_1, TmpOffDst, SpOpSrc1);
-        CISA_CALL(Kernel->AppendVISASurfAccessOwordLoadStoreInst(
-            ISA_OWORD_ST, vISA_EMASK_M1, Dst, getCisaOwordNumFromNumber(Sz),
-            TmpOffSrc, RawSrc));
-      }
-      appendVISAArithmeticInst(ISA_ADD, nullptr, false, vISA_EMASK_M1,
-                               EXEC_SIZE_1, SpOpDst, SpOpSrc2, Imm);
-      TotalSz -= ByteSz;
-    }
-  };
-
-  partCopy(8);
-  partCopy(4);
-  partCopy(2);
-  partCopy(1);
-}
-
-void GenXKernelBuilder::popStackArg(llvm::Value *Dst, VISA_StateOpndHandle *Src,
-                                    int TotalSz, unsigned &RowOff,
-                                    unsigned &ColOff, unsigned &SrcRowOff,
-                                    unsigned &SrcColOff, int &PrevStackOff) {
-  VISA_GenVar *StackOff = nullptr, *Sp = nullptr;
-
-  auto StackTmp = createCisaVariable(Kernel, "stackTmp", nullptr, TotalSz);
-
-  auto TmpType = llvmToVisaType(Dst->getType());
-  auto TmpVar = StackTmp->getAlias(TmpType, Kernel);
-
-  CISA_CALL(Kernel->CreateVISAGenVar(StackOff, "stackOff", 1, ISA_TYPE_UQ,
-                                     ALIGN_OWORD));
-  auto partCopy = [&](int Sz) {
-    // TODO: mb we have some constant for oword size
-    int ByteSz = Sz * visa::BytesPerOword;
-    while (TotalSz - ByteSz >= 0 || (TotalSz > 0 && Sz == 1)) {
-      CISA_CALL(Kernel->GetPredefinedVar(Sp, PREDEFINED_FE_SP));
-      VISA_VectorOpnd *SpOpSrc = nullptr;
-      CISA_CALL(Kernel->CreateVISASrcOperand(SpOpSrc, Sp, MODIFIER_NONE, 0, 1,
-                                             0, 0, 0));
-
-      VISA_VectorOpnd *TmpOffDst = nullptr;
-      VISA_VectorOpnd *TmpOffSrc = nullptr;
-      CISA_CALL(Kernel->CreateVISADstOperand(TmpOffDst, StackOff, 1, 0, 0));
-      CISA_CALL(Kernel->CreateVISASrcOperand(TmpOffSrc, StackOff, MODIFIER_NONE,
-                                             0, 1, 0, 0, 0));
-
-      VISA_VectorOpnd *Imm = nullptr;
-      int OffVal = PrevStackOff;
-      CISA_CALL(Kernel->CreateVISAImmediate(Imm, &OffVal, ISA_TYPE_UD));
-      PrevStackOff += Sz;
-      VISA_RawOpnd *RawSrc = nullptr;
-      CISA_CALL(Kernel->CreateVISARawOperand(RawSrc, TmpVar->getGenVar(), 0));
-
-      appendVISAArithmeticInst(ISA_ADD, nullptr, false, vISA_EMASK_M1,
-                               EXEC_SIZE_1, TmpOffDst, SpOpSrc, Imm);
-      CISA_CALL(Kernel->AppendVISASurfAccessOwordLoadStoreInst(
-          ISA_OWORD_LD, vISA_EMASK_M1, Src, getCisaOwordNumFromNumber(Sz),
-          TmpOffSrc, RawSrc));
-      int CopySz = std::min(ByteSz, TotalSz);
-      SrcRowOff = SrcColOff = 0;
-      emitVectorCopy(Dst, TmpVar, RowOff, ColOff, SrcRowOff, SrcColOff, CopySz);
-      TotalSz -= ByteSz;
-    }
-    SrcRowOff = SrcColOff = 0;
-  };
-
-  partCopy(8);
-  partCopy(4);
-  partCopy(2);
-  partCopy(1);
-}
-
 void GenXKernelBuilder::beginFunctionLight(Function *Func) {
   if (vc::isKernel(Func))
     return;
@@ -6112,77 +5523,6 @@ void GenXKernelBuilder::beginFunctionLight(Function *Func) {
   StackCallee->SetFunctionReturnSize(RetSize);
   StackCallee->AddKernelAttribute("ArgSize", 1, &ArgSize);
   StackCallee->AddKernelAttribute("RetValSize", 1, &RetSize);
-}
-
-void GenXKernelBuilder::buildExtractRetv(ExtractValueInst *Inst) {
-  auto T = Inst->getOperand(0)->getType();
-  auto *RetVar = &CisaVars[Kernel].at("retv");
-
-  bool UseStack = getValueSize(T) > RetVar->getByteSize();
-
-  auto Index = Inst->getIndices().front();
-  if (T->getContainedType(Index)->isVectorTy() &&
-      cast<VectorType>(T->getContainedType(Index))
-          ->getElementType()
-          ->isIntegerTy(1))
-    // elements of <N x i1> type should be ignored
-    return;
-
-  unsigned RowOff = 0, ColOff = 0;
-  unsigned SrcRowOff = 0, SrcColOff = 0;
-  for (unsigned i = 0; i < Index; i++) {
-    int Mod = UseStack ? visa::BytesPerOword : GrfByteSize;
-    SrcRowOff += (getValueSize(T->getContainedType(i)) + Mod - 1) / Mod;
-  }
-
-  if (UseStack) {
-    int Prev = SrcRowOff;
-    VISA_StateOpndHandle *StackSurfOp = nullptr;
-    VISA_SurfaceVar *StackSurfVar = nullptr;
-    CISA_CALL(Kernel->GetPredefinedSurface(StackSurfVar, StackSurf));
-    CISA_CALL(Kernel->CreateVISAStateOperandHandle(StackSurfOp, StackSurfVar));
-    popStackArg(Inst, StackSurfOp, getValueSize(T->getContainedType(Index)),
-                RowOff, ColOff, SrcRowOff, SrcColOff, Prev);
-  } else
-    emitVectorCopy(Inst, RetVar->getAlias(Inst, Kernel), RowOff, ColOff,
-                   SrcRowOff, SrcColOff, getValueSize(Inst));
-}
-
-void GenXKernelBuilder::buildInsertRetv(InsertValueInst *Inst) {
-  auto T = Inst->getOperand(0)->getType();
-  auto *RetVar = &CisaVars[Kernel].at("retv");
-
-  bool UseStack = getValueSize(T) > RetVar->getByteSize();
-
-  auto Index = Inst->getIndices().front();
-  if (T->getContainedType(Index)->isVectorTy() &&
-      cast<VectorType>(T->getContainedType(Index))
-          ->getElementType()
-          ->isIntegerTy(1)) {
-    // elements of <N x i1> type should be ignored
-    return;
-  }
-
-  unsigned RowOff = 0, ColOff = 0;
-  unsigned SrcRowOff = 0, SrcColOff = 0;
-
-  if (!UseStack)
-    for (unsigned i = 0; i < Index; i++)
-      RowOff += (getValueSize(T->getContainedType(i)) + GrfByteSize - 1) /
-                GrfByteSize;
-
-  if (UseStack) {
-    VISA_StateOpndHandle *StackSurfOp = nullptr;
-    VISA_SurfaceVar *StackSurfVar = nullptr;
-    CISA_CALL(Kernel->GetPredefinedSurface(StackSurfVar, StackSurf));
-    CISA_CALL(Kernel->CreateVISAStateOperandHandle(StackSurfOp, StackSurfVar));
-    pushStackArg(StackSurfOp, Inst->getOperand(1),
-                 getValueSize(T->getContainedType(Index)), RowOff, ColOff,
-                 SrcRowOff, SrcColOff);
-  } else
-    emitVectorCopy(RetVar->getAlias(Inst->getOperand(1), Kernel),
-                   Inst->getOperand(1), RowOff, ColOff, SrcRowOff, SrcColOff,
-                   getValueSize(Inst->getOperand(1)));
 }
 
 void GenXKernelBuilder::buildStackCallLight(CallInst *CI,
@@ -6363,7 +5703,7 @@ collectFinalizerArgs(StringSaver &Saver, const GenXSubtarget &ST,
     addArgument("-TotalGRFNum");
     addArgument(to_string(GRFSize));
   } else if (BC.isAutoLargeGRFMode())
-    addArgument("-regSharingHeuristics");
+    addArgument("-autoGRFSelection");
 
   if (ST.hasFusedEU()) {
     addArgument("-fusedCallWA");

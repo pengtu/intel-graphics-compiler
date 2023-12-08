@@ -38,8 +38,6 @@ class PointsToAnalysis;
 } // namespace vISA
 
 // FIXME, build a table for different platforms
-#define SWSB_MAX_ALU_DEPENDENCE_DISTANCE 11
-#define SWSB_MAX_ALU_DEPENDENCE_DISTANCE_64BIT 15
 #define SWSB_MAX_MATH_DEPENDENCE_DISTANCE 18
 #define SWSB_MAX_ALU_DEPENDENCE_DISTANCE_VALUE 7u
 
@@ -73,16 +71,6 @@ constexpr int INVALID_ID = -1;
 #define UNINIT_BUCKET -1
 
 namespace vISA {
-
-typedef enum _SB_INST_PIPE {
-  PIPE_NONE = 0,
-  PIPE_INT = 1,
-  PIPE_FLOAT = 2,
-  PIPE_LONG = 3,
-  PIPE_MATH = 4,
-  PIPE_DPAS = 6,
-  PIPE_SEND = 7,
-} SB_INST_PIPE;
 
 struct SBDep {
   SBDep(SBNode *SBNode, DepType Type, SBDependenceAttr Attr) {
@@ -143,10 +131,11 @@ typedef enum _FOOTPRINT_TYPE {
 
 struct SBFootprint {
   const FOOTPRINT_TYPE fType;
-  const G4_Type type;
+  const unsigned short type;
   const unsigned short LeftB;
   const unsigned short RightB;
   unsigned short offset = 0;
+  bool isPrecision = false;
   G4_INST *inst;
 
   // FIXME: The choice of C-style linked list seems suspect given that there are
@@ -157,15 +146,19 @@ struct SBFootprint {
   struct SBFootprint *next = nullptr;
 
   SBFootprint()
-      : fType(GRF_T), type(Type_UNDEF), LeftB(0), RightB(0), inst(nullptr) {
-    ;
+      : fType(GRF_T), type((unsigned short)Type_UNDEF), LeftB(0), RightB(0),
+        inst(nullptr) {
+    isPrecision = false;
   }
   SBFootprint(FOOTPRINT_TYPE ft, G4_Type t, unsigned short LB,
               unsigned short RB, G4_INST *i)
-      : fType(ft), type(t), LeftB(LB), RightB(RB), inst(i) {
-    ;
+      : fType(ft), type((unsigned short)t), LeftB(LB), RightB(RB), inst(i) {
+    isPrecision = false;
   }
-  ~SBFootprint() {}
+  SBFootprint(FOOTPRINT_TYPE ft, GenPrecision p, unsigned short LB,
+              unsigned short RB, G4_INST *i)
+      : fType(ft), type((unsigned short)p), LeftB(LB), RightB(RB), inst(i), isPrecision(true) {
+  }
 
   void setOffset(unsigned short o) { offset = o; }
 
@@ -176,6 +169,7 @@ struct SBFootprint {
   bool hasGRFGrainedOverlap(const SBFootprint *liveFootprint) const;
   bool isWholeOverlap(const SBFootprint *liveFootprint) const;
   bool isSameOrNoOverlap(const SBFootprint *liveFootprint) const;
+  bool hasSameType(const SBFootprint *liveFootprint) const;
 };
 
 // Bit set which is used for global dependence analysis for SBID.
@@ -327,15 +321,6 @@ public:
     instVec.push_back(i);
   }
 
-  ~SBNode() {
-    // FIXME: I'd like to replace this with type-specific allocator as well, but
-    // the ownership is unclear to me, is it safe to put the allocator in
-    // SBNode?
-    for (SBFootprint *sm : footprints) {
-      sm->~SBFootprint();
-    }
-  }
-
   void setSendID(int ID) { sendID = ID; }
 
   void setSendUseID(int ID) { sendUseID = ID; }
@@ -485,7 +470,6 @@ public:
 
   unsigned getDistInfo(SB_INST_PIPE depPipe);
   void setDistInfo(SB_INST_PIPE depPipe, unsigned distance);
-  int getMaxDepDistance() const;
   void setDepToken(unsigned short token, SWSBTokenType type, SBNode *node);
   void clearDistInfo(SB_INST_PIPE depPipe);
   int calcDiffBetweenInstDistAndPipeDepDist(
@@ -536,8 +520,6 @@ struct SBBucketNode {
                const SBFootprint *f)
       : node(node1), opndNum(opndNum1), footprint(f) {}
 
-  ~SBBucketNode() {}
-
   void setSendID(int ID) { sendID = ID; }
 
   int getSendID() const { return sendID; }
@@ -555,13 +537,16 @@ class LiveGRFBuckets {
   std::vector<SBBUCKET_VECTOR> nodeBucketsArray;
   // FIXME: Why do we need this? Do we ever change the size of nodeBucketsArray?
   const int numOfBuckets;
+  bool empty;
 
 public:
   LiveGRFBuckets(int TOTAL_BUCKETS)
-      : nodeBucketsArray(TOTAL_BUCKETS), numOfBuckets(TOTAL_BUCKETS) {}
+      : nodeBucketsArray(TOTAL_BUCKETS), numOfBuckets(TOTAL_BUCKETS) {
+    empty = true;
+  }
 
   ~LiveGRFBuckets() {}
-
+  bool isEmpty() {return empty;}
   int getNumOfBuckets() const { return numOfBuckets; }
 
   // The iterator which is used to scan the node vector of each bucket
@@ -695,6 +680,8 @@ public:
   unsigned *tokenLiveInDist;
   unsigned *tokenLiveOutDist;
   SBBitSets localReachingSends;
+  SBBitSets
+      BBGRF; // Is used to record the GRF registers accessed by each basic block
 
   SBBUCKET_VECTOR
   globalARSendOpndList; // All send source operands which live out their
@@ -705,7 +692,8 @@ public:
            SBNODE_VECT *SBNodes, SBNODE_VECT *SBSendNodes,
            SBBUCKET_VECTOR *globalSendOpndList, SWSB_INDEXES *indexes,
            uint32_t &globalSendNum, LiveGRFBuckets *lb,
-           LiveGRFBuckets *globalLB, PointsToAnalysis &p,
+           LiveGRFBuckets *globalLB, LiveGRFBuckets *GRFAlignedGlobalSendsLB,
+           PointsToAnalysis &p,
            std::map<G4_Label *, G4_BB_SB *> *LabelToBlockMap,
            const unsigned dpasLatency)
       : swsb(sb), builder(b), mem(m), bb(block),
@@ -717,7 +705,8 @@ public:
     first_send_node = -1;
     last_send_node = -1;
     totalGRFNum = block->getKernel().getNumRegTotal();
-    SBDDD(bb, lb, globalLB, SBNodes, SBSendNodes, globalSendOpndList, indexes,
+    SBDDD(bb, lb, globalLB, GRFAlignedGlobalSendsLB, SBNodes, SBSendNodes,
+          globalSendOpndList, indexes,
           globalSendNum, p, LabelToBlockMap);
   }
 
@@ -780,6 +769,7 @@ public:
                                const SBFootprint *curFP) const;
   // Local distance dependence analysis and assignment
   void SBDDD(G4_BB *bb, LiveGRFBuckets *&LB, LiveGRFBuckets *&globalSendsLB,
+             LiveGRFBuckets *&GRFAlignedGlobalSendsLB,
              SBNODE_VECT *SBNodes, SBNODE_VECT *SBSendNodes,
              SBBUCKET_VECTOR *globalSendOpndList, SWSB_INDEXES *indexes,
              uint32_t &globalSendNum, PointsToAnalysis &p,
@@ -792,6 +782,11 @@ public:
   // Global SBID dependence analysis
   void setSendOpndMayKilled(LiveGRFBuckets *globalSendsLB, SBNODE_VECT &SBNodes,
                             PointsToAnalysis &p);
+  void
+  setSendGlobalIDMayKilledByCurrentBB(std::vector<SparseBitVector> &dstTokenBit,
+                                  std::vector<SparseBitVector> &srcTokenBit,
+                                  SBNODE_VECT &SBNodes, PointsToAnalysis &p);
+
   void dumpTokenLiveInfo(SBNODE_VECT *SBSendNodes);
   void getLiveBucketsFromFootprint(const SBFootprint *firstFootprint,
                                    SBBucketNode *sBucketNode,
@@ -948,7 +943,6 @@ class SWSB {
   uint32_t AWSyncAllCount = 0;
   uint32_t tokenReuseCount = 0;
 
-  bool hasFCall = false;
   // Linear scan data structures for token allocation
   SBNODE_LIST linearScanLiveNodes;
 
@@ -1068,11 +1062,18 @@ class SWSB {
                        INST_LIST_ITER inst_it, int newInstID, BitSet *dstTokens,
                        BitSet *srcTokens, bool &keepDst, bool removeAllToken);
 
+  void
+  SWSBInitializeGlobalNodesInBuckets(std::vector<SparseBitVector> &dstGlobalIDs,
+                                     std::vector<SparseBitVector> &srcGlobalIDs,
+                                     LiveGRFBuckets &globalSendsLB);
+
   void SWSBDepDistanceGenerator(PointsToAnalysis &p, LiveGRFBuckets &LB,
-                                LiveGRFBuckets &globalSendsLB);
+                                LiveGRFBuckets &globalSendsLB,
+                                LiveGRFBuckets &GRFAlignedGlobalSendsLB);
   void handleFuncCall();
   void SWSBGlobalTokenGenerator(PointsToAnalysis &p, LiveGRFBuckets &LB,
-                                LiveGRFBuckets &globalSendsLB);
+                                LiveGRFBuckets &globalSendsLB,
+                                LiveGRFBuckets &GRFAlignedGlobalSendsLB);
   void SWSBBuildSIMDCFG();
   void addSIMDEdge(G4_BB_SB *pred, G4_BB_SB *succ);
   void SWSBGlobalScalarCFGReachAnalysis();

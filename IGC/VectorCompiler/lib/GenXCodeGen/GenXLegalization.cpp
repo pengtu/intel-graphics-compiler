@@ -152,6 +152,7 @@ SPDX-License-Identifier: MIT
 #include "GenXAlignmentInfo.h"
 #include "GenXBaling.h"
 #include "GenXIntrinsics.h"
+#include "GenXLiveElements.h"
 #include "GenXSubtarget.h"
 #include "GenXTargetMachine.h"
 #include "GenXUtil.h"
@@ -190,10 +191,6 @@ SPDX-License-Identifier: MIT
 using namespace llvm;
 using namespace genx;
 
-static cl::opt<bool> UseUpper16Lanes("vc-use-upper16-lanes", cl::init(true),
-                                     cl::Hidden,
-                                     cl::desc("Limit legalization width"));
-
 namespace {
 
 // Information on a part of a predicate.
@@ -213,6 +210,7 @@ struct LegalPredSize {
 class GenXLegalization : public FunctionPass {
   enum { DETERMINEWIDTH_UNBALE = 0, DETERMINEWIDTH_NO_SPLIT = 256 };
   GenXBaling *Baling = nullptr;
+  GenXLiveElements *LE = nullptr;
   const GenXSubtarget *ST = nullptr;
   DominatorTree *DT = nullptr;
   ScalarEvolution *SE = nullptr;
@@ -313,9 +311,6 @@ class GenXLegalization : public FunctionPass {
   // Illegally sized predicate values that need splitting at the end of
   // processing the function.
   SetVector<Instruction *> IllegalPredicates;
-  // Whether the function's module has stack calls or not. Used for making
-  // legalization decisions.
-  bool HasStackCalls = false;
 
 public:
   static char ID;
@@ -351,7 +346,8 @@ private:
   bool processBitCastFromPredicate(Instruction *Inst,
                                    Instruction *InsertBefore);
   bool processBitCastToPredicate(Instruction *Inst, Instruction *InsertBefore);
-  unsigned getExecutionWidth();
+  Value *getExecWidthValue();
+  unsigned splitDeadElements(unsigned Width, unsigned StartIdx);
   unsigned determineWidth(unsigned WholeWidth, unsigned StartIdx);
   unsigned determineNonRegionWidth(Instruction *Inst, unsigned StartIdx);
   LegalPredSize getLegalPredSize(Value *Pred, Type *ElementTy,
@@ -406,6 +402,7 @@ void initializeGenXLegalizationPass(PassRegistry &);
 INITIALIZE_PASS_BEGIN(GenXLegalization, "GenXLegalization", "GenXLegalization",
                       false, false)
 INITIALIZE_PASS_DEPENDENCY(GenXFuncBaling)
+INITIALIZE_PASS_DEPENDENCY(GenXFuncLiveElements)
 INITIALIZE_PASS_DEPENDENCY(ScalarEvolutionWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(DominatorTreeWrapperPass)
 INITIALIZE_PASS_END(GenXLegalization, "GenXLegalization", "GenXLegalization",
@@ -418,6 +415,7 @@ FunctionPass *llvm::createGenXLegalizationPass() {
 
 void GenXLegalization::getAnalysisUsage(AnalysisUsage &AU) const {
   AU.addRequired<GenXFuncBaling>();
+  AU.addRequired<GenXFuncLiveElements>();
   AU.addRequired<ScalarEvolutionWrapperPass>();
   AU.addRequired<TargetPassConfig>();
   AU.addRequired<DominatorTreeWrapperPass>();
@@ -430,17 +428,12 @@ void GenXLegalization::getAnalysisUsage(AnalysisUsage &AU) const {
  */
 bool GenXLegalization::runOnFunction(Function &F) {
   Baling = &getAnalysis<GenXFuncBaling>();
+  LE = &getAnalysis<GenXFuncLiveElements>();
   SE = &getAnalysis<ScalarEvolutionWrapperPass>().getSE();
   ST = &getAnalysis<TargetPassConfig>()
             .getTM<GenXTargetMachine>()
             .getGenXSubtarget();
   DT = &getAnalysis<DominatorTreeWrapperPass>().getDomTree();
-  // FIXME: Non-optimal solution. FGs info or some stackcalls-related analysis
-  // will be useful here.
-  HasStackCalls =
-      llvm::any_of(F.getParent()->functions(), [](const Function &MF) {
-        return vc::requiresStackCall(MF);
-      });
   // Check args for illegal predicates.
   for (Function::arg_iterator fi = F.arg_begin(), fe = F.arg_end(); fi != fe;
        ++fi) {
@@ -485,7 +478,7 @@ unsigned GenXLegalization::adjustTwiceWidthOrFixed4(const Bale &B) {
   // Spot whether we have a FIXED operand and/or a TWICEWIDTH operand.
   if (GenXIntrinsic::isGenXIntrinsic(Main->Inst)) {
     GenXIntrinsicInfo II(vc::getAnyIntrinsicID(Main->Inst));
-    for (auto ArgInfo : II.getInstDesc()) {
+    for (auto &ArgInfo : II.getInstDesc()) {
       if (!ArgInfo.isArgOrRet())
        continue;
       switch (ArgInfo.getRestriction()) {
@@ -799,10 +792,11 @@ bool GenXLegalization::processInst(Instruction *Inst) {
  */
 bool GenXLegalization::processBale(Instruction *InsertBefore) {
   // Get the current execution width.
-  unsigned WholeWidth = getExecutionWidth();
+  auto *VT = dyn_cast<IGCLLVM::FixedVectorType>(getExecWidthValue()->getType());
+  unsigned WholeWidth = VT ? VT->getNumElements() : 1;
+  // No splitting of scalar or 1-vector
   if (WholeWidth == 1)
-    return false; // No splitting of scalar or 1-vector
-
+    return false;
   // Check the bale split kind if do splitting.
   CurSplitKind = checkBaleSplittingKind();
 
@@ -1094,23 +1088,78 @@ bool GenXLegalization::processBitCastToPredicate(Instruction *Inst,
 }
 
 /***********************************************************************
- * getExecutionWidth : get the execution width of the bale
+ * getExecWidthValue : get the value, which type represents
+ *                     the actual  execution width of the bale
  *
- * If there is no wrregion at the head of the bale, then the execution width is
- * the width of the head. If there is a wrregion or wrpredpredregion, then the
- * execution width is the width of the subregion input to the wrregion.
+ * Return: If there is no wrregion at the head of the bale, then such
+ *         value is the head itself (ignoring gstore). If there is a
+ *         wrregion or wrpredpredregion, then this value is the input
+ *         to it
  */
-unsigned GenXLegalization::getExecutionWidth() {
+Value *GenXLegalization::getExecWidthValue() {
   BaleInst *Head = B.getHeadIgnoreGStore();
-  Value *Dest = Head->Inst;
   if (Head->Info.Type == BaleInfo::WRREGION ||
       Head->Info.Type == BaleInfo::WRPREDREGION ||
       Head->Info.Type == BaleInfo::WRPREDPREDREGION)
-    Dest = Head->Inst->getOperand(1);
-  auto *VT = dyn_cast<IGCLLVM::FixedVectorType>(Dest->getType());
-  if (!VT)
-    return 1;
-  return VT->getNumElements();
+    return Head->Inst->getOperand(1);
+  else
+    return Head->Inst;
+}
+
+/***********************************************************************
+ * splitDeadElements : try to reduce the width to isolate unused elements
+ *
+ * Enter:   Width = current calculated split width
+ *          StartIdx = start index of this split
+ *
+ * Return:  New width when the split is possible or the old one otherwise
+ *
+ * Live element analysis can provide info about the actual usage of every
+ * element of a vector. If some elements are unused we can do the split
+ * so that dead elements in the begining and end of a vector are isolated
+ * from a single live part in the middle.
+ */
+unsigned GenXLegalization::splitDeadElements(unsigned Width,
+                                             unsigned StartIdx) {
+  auto *V = getExecWidthValue();
+  auto *ElemTy = V->getType()->getScalarType();
+  // The most math instructions require exec size to be 8 or 16 in case of half
+  // float. Even if we reduce the width here, it will be very likely set back to
+  // the 'native' width by finalizer
+  if (ElemTy->isHalfTy())
+    return Width;
+  const auto &LiveElems = LE->getLiveElements(V);
+  if (LiveElems.size() > 1 || LiveElems.isAllDead() || !LiveElems.isAnyDead())
+    return Width;
+  // Execution mask must be 4 aligned, which is important for predicates
+  unsigned FirstLive = LiveElems[0].find_first() & ~3U;
+  // Dead parts don't need to be aligned, because the will be removed anyway
+  unsigned LastLive = LiveElems[0].find_last();
+  if ((StartIdx > FirstLive || StartIdx + Width < FirstLive) &&
+      (StartIdx > LastLive || StartIdx + Width < LastLive))
+    return Width;
+  // Instruction with current width crosses the boundary between live
+  // and dead parts
+  FirstLive = std::max(FirstLive, StartIdx);
+  LastLive = std::min(LastLive, StartIdx + Width);
+  unsigned LiveSize = LastLive - FirstLive + 1;
+  unsigned LiveWidth = 1;
+  while (LiveWidth < LiveSize)
+    LiveWidth <<= 1;
+  if (LiveWidth >= Width)
+    return Width;
+  // Live part can fit in a single instruction with smaller width
+  unsigned NewWidth = LiveWidth;
+  if (StartIdx < FirstLive) {
+    // In this iteration we have to split preceding zeroes
+    // Determine the largest width not crossing the live part's boundary
+    unsigned DeadSize = FirstLive - StartIdx;
+    unsigned DeadWidth = Width;
+    while (DeadWidth > DeadSize)
+      DeadWidth >>= 1;
+    NewWidth = DeadWidth;
+  }
+  return NewWidth;
 }
 
 /***********************************************************************
@@ -1129,10 +1178,11 @@ unsigned GenXLegalization::getExecutionWidth() {
  */
 unsigned GenXLegalization::determineWidth(unsigned WholeWidth,
                                           unsigned StartIdx) {
+  auto Head = B.getHeadIgnoreGStore();
   // Prepare to keep track of whether an instruction with a minimum width
   // (e.g. dp4) would be split too small, and whether we need to unbale.
   unsigned ExecSizeAllowedBits = adjustTwiceWidthOrFixed4(B);
-  if (!UseUpper16Lanes || (HasStackCalls && ST->hasFusedEU()))
+  if (!vc::canUseSIMD32(*(Head->Inst->getModule()), ST->hasFusedEU()))
     // Actually, we should legalize with these more strict requirements only FGs
     // of indirectly called functions. But there are two design issues that make
     // us legalize everything if the module has a stack call:
@@ -1148,7 +1198,6 @@ unsigned GenXLegalization::determineWidth(unsigned WholeWidth,
   unsigned Width = WholeWidth - StartIdx;
   unsigned PredMinWidth = 1;
   Value *WrRegionInput = nullptr;
-  auto Head = B.getHeadIgnoreGStore();
   if (Head->Info.Type == BaleInfo::WRREGION)
     WrRegionInput =
         Head->Inst->getOperand(GenXIntrinsic::GenXRegion::OldValueOperandNum);
@@ -1267,6 +1316,7 @@ unsigned GenXLegalization::determineWidth(unsigned WholeWidth,
         // valid size any more than one. If possible, increase the valid size
         // to 4 or 8 on the assumption that we are going to convert it to a
         // multi indirect.
+        IGC_ASSERT_EXIT(R.Width - StartIdx % R.Width > 0);
         auto NewThisWidth = 1 << genx::log2(R.Width - StartIdx % R.Width);
         if (NewThisWidth >= 4) {
           ThisWidth = std::min(NewThisWidth, 8);
@@ -1422,6 +1472,12 @@ unsigned GenXLegalization::determineWidth(unsigned WholeWidth,
     IGC_ASSERT(Width != 1);
     Width >>= 1;
   }
+  if (Width > 1) {
+    // Try to reduce width to isolate dead parts of the vector if there are any
+    unsigned ReducedWidth = splitDeadElements(Width, StartIdx);
+    if (ExecSizeAllowedBits & ReducedWidth)
+      Width = ReducedWidth;
+  }
   if (Width != WholeWidth && IsReadSameVector &&
       CurSplitKind == SplitKind_Normal) {
     // Splitting required, and the bale contains a rdregion from the same
@@ -1523,6 +1579,7 @@ unsigned GenXLegalization::determineNonRegionWidth(Instruction *Inst,
     // Non-predicate result.
     if (Width * BytesPerElement > TwoGRFWidth)
       Width = TwoGRFWidth / BytesPerElement;
+    IGC_ASSERT_EXIT(Width > 0);
     Width = 1 << genx::log2(Width);
   } else {
     // Predicate result. This is to handle and/or/xor/not of predicates; cmp's
@@ -1564,6 +1621,7 @@ LegalPredSize GenXLegalization::getLegalPredSize(Value *Pred, Type *ElementTy,
   // the part. For example. if the offset is 4 or 12, the size must be 4, not 8
   // or 16.
   LogMax = std::min(LogMax, findFirstSet(StartIdx - PP.Offset));
+  IGC_ASSERT_EXIT(LogMax < 32);
   Ret.Max = 1 << LogMax;
   // If Min>Max, then we're at the end of that part and we don't need to ensure
   // that the next split in the same part is legally aligned.
@@ -1748,7 +1806,7 @@ Value *GenXLegalization::splitBale(Value *PrevSliceRes, unsigned StartIdx,
                                    unsigned Width, Instruction *InsertBefore) {
   Value *LastCreatedInst = nullptr;
   auto SplittableInstsRange = SplittableInsts(B);
-  for (auto BI : SplittableInstsRange)
+  for (auto &BI : SplittableInstsRange)
     // Split the instruction.
     SplitMap[BI.Inst] = LastCreatedInst =
         splitInst(PrevSliceRes, BI, StartIdx, Width, InsertBefore,
@@ -1890,6 +1948,26 @@ Value *GenXLegalization::splitInst(Value *PrevSliceRes, BaleInst BInst,
                                    unsigned StartIdx, unsigned Width,
                                    Instruction *InsertBefore,
                                    const DebugLoc &DL) {
+  // Clone gvload on users split not to trigger false positives
+  // in global volatile clobbering checker.
+  if (B.isGStoreBale() &&
+      PrevSliceRes /*first slice uses the original vload*/) {
+    for (auto *GvLoad : genx::getSrcVLoads(BInst.Inst)) {
+      if (genx::getBitCastedValue(B.getHead()->Inst->getOperand(1)) !=
+          genx::getBitCastedValue(GvLoad->getOperand(0)))
+        continue;
+      if (GvLoad->users().end() != llvm::find(GvLoad->users(), BInst.Inst)) {
+        auto *GvLoadClone = GvLoad->clone();
+        GvLoadClone->insertBefore(InsertBefore);
+        GvLoadClone->setName(BInst.Inst->getName() + ".gvload_use_split_clone");
+        BInst.Inst->replaceUsesOfWith(GvLoad, GvLoadClone);
+      } else {
+        IGC_ASSERT_MESSAGE(
+            0, "Cloning of gvloads followed by bitcasts is not yet supported.");
+      }
+    }
+  }
+
   switch (BInst.Info.Type) {
   case BaleInfo::GSTORE:
   case BaleInfo::WRREGION:

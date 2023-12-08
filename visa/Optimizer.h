@@ -134,7 +134,6 @@ class Optimizer {
   void dumpPayload();
   void collectStats();
   void createR0Copy();
-
   void fixEndIfWhileLabels();
   void mergeScalarInst();
   void EmulateInt64Add() { ::EmulateInt64Add(builder, kernel); }
@@ -154,11 +153,10 @@ class Optimizer {
 
   void preRA_Schedule() {
     unsigned KernelPressure = 0;
-    if (kernel.useRegSharingHeuristics()) {
-      preRA_RegSharing Sched(kernel);
-      Sched.run(KernelPressure);
+    preRA_Scheduler Sched(kernel);
+    if (kernel.useAutoGRFSelection()) {
+      Sched.runWithGRFSelection(KernelPressure);
     } else {
-      preRA_Scheduler Sched(kernel);
       Sched.run(KernelPressure);
     }
     // Update Jit info for max register pressure
@@ -190,6 +188,8 @@ class Optimizer {
 
   void accSubBeforeRA();
 
+  void HWDebug();
+
 
   // return true if BuiltInR0 gets a different allocation than r0
   bool R0CopyNeeded();
@@ -211,6 +211,7 @@ private:
   void hoistBarrierHeaderToTop(G4_SrcRegRegion *);
   /* end of member functions for message header opt */
   void cleanupBindless();
+  void cleanupA0Movs();
   G4_Operand *updateSendsHeaderReuse(std::vector<std::vector<G4_INST *>> &,
                                      std::vector<G4_INST *> &, INST_LIST_ITER);
   void countGRFUsage();
@@ -221,8 +222,7 @@ private:
 
   void staticProfiling();
 
-  void removeInstrinsics();
-  void markBreakpoint();
+  void removeIntrinsics();
 
   unsigned int numBankConflicts;
 
@@ -363,7 +363,7 @@ public:
     PI_localSchedule,
     PI_HWWorkaround,        // always
     PI_fixEndIfWhileLabels, // always
-    PI_insertHashMovs,
+    PI_HWDebug,
     PI_insertDummyMovForHWRSWA,
     PI_insertDummyCompactInst,
     PI_mergeScalarInst,
@@ -376,6 +376,7 @@ public:
     PI_createR0Copy,
     PI_initializePayload,
     PI_cleanupBindless,
+    PI_cleanupA0Movs,
     PI_countGRFUsage,
     PI_changeMoveType,
     PI_accSubBeforeRA,
@@ -391,7 +392,7 @@ public:
     PI_mapOrphans,
     PI_legalizeType,
     PI_analyzeMove,
-    PI_removeInstrinsics,
+    PI_removeIntrinsics,
     PI_expandMulPostSchedule,
     PI_zeroSomeARF,
     PI_addSWSBInfo,
@@ -441,6 +442,8 @@ public:
 #endif // DLL_MODE
     initOptimizations();
   }
+  Optimizer(const Optimizer&) = delete;
+  Optimizer& operator=(const Optimizer&) = delete;
   ~Optimizer() {
     // Normally, noMask Info will be freed in postRA workaround.
     // But in case RA fails, postRA will not be invoked. Thus, need

@@ -250,6 +250,16 @@ std::vector<attr_gen_struct*> AttrOptVar;
         VISA_opnd             *surface; // can be imm or reg
         int                    surfaceIndex;
     } lsc_addr_model;
+    struct sampler_base_struct {
+        char                  *base;
+        unsigned int          offset;
+    } sampler_base;
+
+    struct {
+        VISA_opnd *reg;
+        LSC_DATA_SHAPE_TYPED_BLOCK2D shape_typed2d;
+    } lsc_data_operand_typed2d;
+    LSC_DATA_SHAPE_TYPED_BLOCK2D lsc_data_shape_typed2d;
 
     // Align Support in Declaration
     VISA_Align             align;
@@ -340,6 +350,7 @@ std::vector<attr_gen_struct*> AttrOptVar;
 %token <type>   DFTYPE         // :df
 %token <type>   FTYPE          // :f
 %token <type>   HFTYPE         // :hf
+%token <type>   BFTYPE         // :bf
 %token <type>   VTYPE          // :v and vf
 %token <cond_mod> COND_MOD     // .ne .ge ...
 
@@ -602,6 +613,7 @@ std::vector<attr_gen_struct*> AttrOptVar;
 %type <lsc_typed_addr_operand>       LscTypedAddrWithOffsetOperand
 %type <lsc_typed_addr_operand_list>  LscTypedAddrWithOffsetOperandList
 %type <lsc_typed_operand>            LscTypedAddrOperandWithOffsets
+%type<sampler_base>                  SamplerAddrOperand
 %token <lsc_addr_size>         LSC_ADDR_SIZE_TK
 %type <intval>                 LscAddrImmOffsetOpt
 %type <intval>                 LscAddrImmScaleOpt
@@ -1333,16 +1345,26 @@ SampleInstruction:
            $5, $6, $7, $8, CISAlineno));
    }
 
-Sample3dInstruction: Sample3DInstruction
-
-           //        1         2            3                      4            5                          6               7        8                     9   10  11
-Sample3DInstruction: Predicate SAMPLE_3D_OP PixelNullMaskEnableOpt CPSEnableOpt NonUniformSamplerEnableOpt SAMPLER_CHANNEL ExecSize VecSrcOperand_G_I_IMM Var Var RawOperand
+SamplerAddrOperand: Var
+                     {
+                      $$ = {$1, (unsigned int)0};
+                     }
+                     |
+                     LPAREN Var COMMA IntExpPrim RPAREN
+                     {
+                      $$ = {$2, (unsigned int)$4};
+                     }
+           //        1         2            3                      4            5                          6               7
+Sample3dInstruction: Predicate SAMPLE_3D_OP PixelNullMaskEnableOpt CPSEnableOpt NonUniformSamplerEnableOpt SAMPLER_CHANNEL ExecSize
+           //        8                     9                    10                    11
+                   VecSrcOperand_G_I_IMM SamplerAddrOperand SamplerAddrOperand RawOperand
            //        12
                      RawOperandArray
    {
        const bool success = pBuilder->create3DSampleInstruction(
            $1, $2, $3, $4, $5, ChannelMask::createFromAPI($6),
-           $7.emask, $7.exec_size, $8.cisa_gen_opnd, $9, $10,
+           $7.emask, $7.exec_size, $8.cisa_gen_opnd, $9.base, $9.offset,
+           $10.base, $10.offset,
            $11, (unsigned int)$12, rawOperandArray, CISAlineno);
 
     ABORT_ON_FAIL(success);
@@ -1355,10 +1377,8 @@ CPSEnableOpt: %empty {$$ = false;} | CPS  {$$ = true;}
 
 NonUniformSamplerEnableOpt: %empty {$$ = false;} | NON_UNIFORM_SAMPLER {$$ = true;}
 
-Load3dInstruction: Load3DInstruction
-
            //      1         2          3                      4               5        6                     7   8
-Load3DInstruction: Predicate LOAD_3D_OP PixelNullMaskEnableOpt SAMPLER_CHANNEL ExecSize VecSrcOperand_G_I_IMM Var RawOperand
+Load3dInstruction: Predicate LOAD_3D_OP PixelNullMaskEnableOpt SAMPLER_CHANNEL ExecSize VecSrcOperand_G_I_IMM Var RawOperand
            //      9
                    RawOperandArray
    {
@@ -1370,11 +1390,8 @@ Load3DInstruction: Predicate LOAD_3D_OP PixelNullMaskEnableOpt SAMPLER_CHANNEL E
     ABORT_ON_FAIL(success);
    }
 
-
-Gather43dInstruction: Gather43DInstruction
-
            //         1         2             3                      4               5        6                     7   8   9
-Gather43DInstruction: Predicate SAMPLE4_3D_OP PixelNullMaskEnableOpt SAMPLER_CHANNEL ExecSize VecSrcOperand_G_I_IMM Var Var RawOperand
+Gather43dInstruction: Predicate SAMPLE4_3D_OP PixelNullMaskEnableOpt SAMPLER_CHANNEL ExecSize VecSrcOperand_G_I_IMM Var Var RawOperand
            //      10
                    RawOperandArray
    {
@@ -1418,11 +1435,10 @@ RTWriteOperands:
         RTRWOperandsVec.push_back($2);
     }
 
-RTWriteInstruction: RTWInstruction
-
-            //      1            2                3                 4           5     6
-RTWInstruction: Predicate    RTWRITE_OP_3D    RTWriteModeOpt    ExecSize    Var
-              RTWriteOperands
+                //      1            2                3             4           5
+RTWriteInstruction: Predicate    RTWRITE_OP_3D    RTWriteModeOpt    ExecSize    Var
+                // 6
+                RTWriteOperands
    {
        bool result = pBuilder->CISA_create_rtwrite_3d_instruction(
            $1, $3, $4.emask, (unsigned int)$4.exec_size, $5,
@@ -1978,9 +1994,8 @@ LscFence:
 LscSfid: LSC_SFID_UNTYPED_TOKEN | LSC_SFID_TYPED_TOKEN
 
 LscCacheOpts:
-    %empty                          {$$ = {LSC_CACHING_DEFAULT,LSC_CACHING_DEFAULT};}
-  | LSC_CACHING_OPT                 {$$ = {$1,LSC_CACHING_DEFAULT};}
-  | LSC_CACHING_OPT LSC_CACHING_OPT {$$ = {$1,$2};}
+    %empty                          {$$ = pBuilder->CISA_create_caching_opts(CISAlineno);}
+  | LSC_CACHING_OPT LSC_CACHING_OPT {$$ = pBuilder->CISA_create_caching_opts($1,$2, CISAlineno);}
 
 LscUntypedAddrOperand:
 //  1               2      3                  4
@@ -2986,6 +3001,7 @@ DataType: DataTypeIntOrVector
         | DFTYPE
         | FTYPE
         | HFTYPE
+        | BFTYPE
 DataTypeIntOrVector:
           ITYPE
         | VTYPE

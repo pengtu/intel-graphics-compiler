@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2017-2021 Intel Corporation
+Copyright (C) 2017-2023 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -79,7 +79,7 @@ static inline void CloneFuncMetadata(IGCMD::MetaDataUtils* pM,
 {
     using namespace IGC::IGCMD;
     auto Info = pM->getFunctionsInfoItem(F);
-    auto NewInfo = FunctionInfoMetaDataHandle(FunctionInfoMetaData::get());
+    auto NewInfo = FunctionInfoMetaDataHandle(new FunctionInfoMetaData());
 
     // Copy function type info.
     if (Info->isTypeHasValue())
@@ -136,6 +136,70 @@ inline Function* getCallerFunc(Value* user)
     return caller;
 }
 
+void GenXCodeGenModule::detectUnpromotableFunctions(Module* pM)
+{
+    auto pMdUtils = getAnalysis<MetaDataUtilsWrapper>().getMetaDataUtils();
+    SmallSet<Function*, 32> tempFuncs;
+
+    // Find functions that have uses of "localSLM" globals
+    for (auto gi = pM->global_begin(), ge = pM->global_end(); gi != ge; gi++)
+    {
+        GlobalVariable* GV = dyn_cast<GlobalVariable>(gi);
+        if (GV && GV->hasSection() && GV->getSection().equals("localSLM"))
+        {
+            for (auto user : GV->users())
+            {
+                if (Instruction* U = dyn_cast<Instruction>(user))
+                {
+                    Function* pF = U->getParent()->getParent();
+                    if (!isEntryFunc(pMdUtils, pF))
+                        tempFuncs.insert(pF);
+                }
+            }
+        }
+    }
+
+    // Find functions that uses instructions that can't be handled for indirect call
+    for (auto& F : *pM)
+    {
+        // Only look at non-entry functions
+        if (F.isDeclaration() || isEntryFunc(pMdUtils, &F) || tempFuncs.count(&F) != 0)
+            continue;
+
+        // Can't make indirect if threadgroupbarrier intrinsic is set
+        for (inst_iterator I = inst_begin(F), E = inst_end(F); I != E; ++I)
+        {
+            if (auto* GII = dyn_cast<GenIntrinsicInst>(&*I))
+            {
+                if (GII->getIntrinsicID() == GenISAIntrinsic::GenISA_threadgroupbarrier)
+                {
+                    tempFuncs.insert(&F);
+                    break;
+                }
+            }
+        }
+    }
+
+    // Recursively add callers, as the whole chain of calls cannot be promoted
+    std::function<void(Function*)> AddCallerRecursive = [&](Function* F)->void
+    {
+        m_UnpromotableFuncs.insert(F);
+        for (auto user : F->users())
+        {
+            Function* parentF = getCallerFunc(user);
+            if (!isEntryFunc(pMdUtils, F))
+            {
+                AddCallerRecursive(parentF);
+            }
+        }
+    };
+
+    for (auto F : tempFuncs)
+    {
+        AddCallerRecursive(F);
+    }
+}
+
 void GenXCodeGenModule::processFunction(Function& F)
 {
     // See what FunctionGroups this Function is called from.
@@ -184,11 +248,11 @@ void GenXCodeGenModule::processFunction(Function& F)
         // have the same SIMD sizes, otherwise we cannot make it an indirect call
         int simd_size = 0;
         unsigned CallersPerSIMD[3] = { 0, 0, 0 };
-        for (auto iter : CallerFGs)
+        for (const auto &iter : CallerFGs)
         {
             Function* callerKernel = iter.first->getHead();
             auto funcInfoMD = pMdUtils->getFunctionsInfoItem(callerKernel);
-            int sz = funcInfoMD->getSubGroupSize()->getSIMD_size();
+            int sz = funcInfoMD->getSubGroupSize()->getSIMDSize();
             if (sz != 0) {
                 if (simd_size == 0)
                     simd_size = sz;
@@ -220,17 +284,12 @@ void GenXCodeGenModule::processFunction(Function& F)
             return false;
         }
 
-        // Can't make indirect if threadgroupbarrier intrinsic is set
-        for (inst_iterator I = inst_begin(F), E = inst_end(F); I != E; ++I)
+        // Detect if function is part of the unpromotable set
+        if (m_UnpromotableFuncs.count(F) != 0)
         {
-            if (auto* GII = dyn_cast<GenIntrinsicInst>(&*I))
-            {
-                if (GII->getIntrinsicID() == GenISAIntrinsic::GenISA_threadgroupbarrier)
-                {
-                    return false;
-                }
-            }
+            return false;
         }
+
         return true;
     };
 
@@ -255,7 +314,7 @@ void GenXCodeGenModule::processFunction(Function& F)
     }
 
     bool FirstPair = true;
-    for (auto FGPair : CallerFGs)
+    for (const auto &FGPair : CallerFGs)
     {
         if (FirstPair)
         {
@@ -484,6 +543,12 @@ bool GenXCodeGenModule::runOnModule(Module& M)
     // Add all indirect functions to the default kernel group
     FGA->addIndirectFuncsToKernelGroup(&M);
 
+    // If FunctionCloningThreshold is enabled, detect functions that cannot be promoted to indirect
+    if (m_FunctionCloningThreshold > 0)
+    {
+        detectUnpromotableFunctions(&M);
+    }
+
     for (auto I = SCCVec.rbegin(), IE = SCCVec.rend(); I != IE; ++I)
     {
         std::vector<CallGraphNode*>* SCCNodes = (*I);
@@ -650,8 +715,8 @@ static inline int getDefaultSIMDSize(CodeGenContext* ctx)
         if (defaultDummyKernel)
         {
             auto subGrpSz = ctx->getMetaDataUtils()->getFunctionsInfoItem(defaultDummyKernel)->getSubGroupSize();
-            if (subGrpSz->isSIMD_sizeHasValue())
-                defaultSz = subGrpSz->getSIMD_size();
+            if (subGrpSz->isSIMDSizeHasValue())
+                defaultSz = subGrpSz->getSIMDSize();
         }
     }
     return defaultSz;
@@ -691,7 +756,7 @@ FunctionGroup* GenXFunctionGroupAnalysis::getOrCreateIndirectCallGroup(Module* p
 
         // Set spirv calling convention and kernel metadata
         pNewFunc->setCallingConv(llvm::CallingConv::SPIR_KERNEL);
-        IGCMD::FunctionInfoMetaDataHandle fHandle = IGCMD::FunctionInfoMetaDataHandle(IGCMD::FunctionInfoMetaData::get());
+        IGCMD::FunctionInfoMetaDataHandle fHandle = IGCMD::FunctionInfoMetaDataHandle(new IGCMD::FunctionInfoMetaData());
         FunctionMetaData* funcMD = &pModMD->FuncMD[pNewFunc];
         funcMD->functionType = IGC::FunctionTypeMD::KernelFunction;
         fHandle->setType(FunctionTypeMD::KernelFunction);
@@ -699,7 +764,7 @@ FunctionGroup* GenXFunctionGroupAnalysis::getOrCreateIndirectCallGroup(Module* p
         defaultKernel = pNewFunc;
     }
     // Set the requested sub_group_size value for this kernel
-    pMdUtil->getFunctionsInfoItem(defaultKernel)->getSubGroupSize()->setSIMD_size(SimdSize);
+    pMdUtil->getFunctionsInfoItem(defaultKernel)->getSubGroupSize()->setSIMDSize(SimdSize);
     pMdUtil->save(pModule->getContext());
 
     auto FG = getGroup(defaultKernel);
@@ -891,7 +956,7 @@ void GenXFunctionGroupAnalysis::CloneFunctionGroupForMultiSIMDCompile(llvm::Modu
                 {
                     auto FG = getGroup(callerF);
                     auto funcInfoMD = pMdUtils->getFunctionsInfoItem(FG->getHead());
-                    int sz = funcInfoMD->getSubGroupSize()->getSIMD_size();
+                    int sz = funcInfoMD->getSubGroupSize()->getSIMDSize();
                     if (sz != 0)
                     {
                         IGC_ASSERT(sz == 8 || sz == 16 || sz == 32);
@@ -921,7 +986,7 @@ void GenXFunctionGroupAnalysis::CloneFunctionGroupForMultiSIMDCompile(llvm::Modu
                         auto pNewICG = getOrCreateIndirectCallGroup(pModule, simdsz);
                         addToFunctionGroup(FCloned, pNewICG, FCloned);
 
-                        for (auto iter : UsersMap)
+                        for (const auto &iter : UsersMap)
                         {
                             if (iter.second == simdsz)
                             {

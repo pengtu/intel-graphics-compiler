@@ -67,6 +67,7 @@ enum Common_ISA_Implicit_Input_Kind {
 };
 
 extern const char *implictKindStrings[IMPLICIT_INPUT_COUNT];
+extern const int implictKindValues[IMPLICIT_INPUT_COUNT];
 
 enum Common_ISA_Operand_Class {
   OPERAND_GENERAL = 0x0,
@@ -627,6 +628,13 @@ struct CISA_INST {
   }
   VISA_EMask_Ctrl getExecMask() const {
     return (VISA_EMask_Ctrl)(execsize >> 4);
+  }
+  bool isMath() const{
+    return (opcode == ISA_COS || opcode == ISA_DIV || opcode == ISA_EXP ||
+            opcode == ISA_INV || opcode == ISA_LOG || opcode == ISA_POW ||
+            opcode == ISA_RSQRT || opcode == ISA_SIN || opcode == ISA_SQRT ||
+            opcode == ISA_SIN
+            );
   }
 };
 

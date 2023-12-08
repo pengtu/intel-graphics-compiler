@@ -151,6 +151,11 @@ namespace TC
 
 static std::mutex llvm_mutex;
 
+void UnlockMutex()
+{
+    llvm_mutex.unlock();
+}
+
 extern bool ProcessElfInput(
     STB_TranslateInputArgs& InputArgs,
     STB_TranslateOutputArgs& OutputArgs,
@@ -1105,21 +1110,23 @@ void overrideOCLProgramBinary(
     binarySize = newBinarySize;
 }
 
-void dumpOCLProgramBinary(
-    OpenCLProgramContext& Ctx,
-    const char* binaryOutput,
-    size_t binarySize)
-{
-    auto name = DumpName(IGC::Debug::GetShaderOutputName())
-        .Hash(Ctx.hash)
-        .Type(ShaderType::OPENCL_SHADER)
-        .Extension("progbin");
+void dumpOCLProgramBinary(const char* fileName, const char *binaryOutput,
+                          size_t binarySize) {
+  std::error_code EC;
+  llvm::raw_fd_ostream f(fileName, EC);
 
-    std::error_code EC;
-    llvm::raw_fd_ostream f(name.str(), EC);
+  if (!EC)
+    f.write(binaryOutput, binarySize);
+}
 
-    if (!EC)
-        f.write(binaryOutput, binarySize);
+void dumpOCLProgramBinary(OpenCLProgramContext &Ctx, const char *binaryOutput,
+                          size_t binarySize) {
+  auto name = DumpName(IGC::Debug::GetShaderOutputName())
+                  .Hash(Ctx.hash)
+                  .Type(ShaderType::OPENCL_SHADER)
+                  .Extension("progbin");
+
+  dumpOCLProgramBinary(name.str().data(), binaryOutput, binarySize);
 }
 
 static std::unique_ptr<llvm::MemoryBuffer> GetGenericModuleBuffer()
@@ -1169,7 +1176,7 @@ bool TranslateBuildSPMD(
             if (instCombineSinkingSwitch->getValue()->getNumOccurrences() == 0)
             {
                 const char* const args[] = { "igc", instCombineFlag.data() };
-                llvm::cl::ParseCommandLineOptions(sizeof(args) / sizeof(args[0]), args);
+                llvm::cl::ParseCommandLineOptions(std::size(args), args);
             }
         }
     }
@@ -1307,6 +1314,10 @@ bool TranslateBuildSPMD(
         oclContext.m_floatDenormMode16 = FLOAT_DENORM_RETAIN;
         oclContext.m_floatDenormMode32 = FLOAT_DENORM_RETAIN;
         oclContext.m_floatDenormMode64 = FLOAT_DENORM_RETAIN;
+    }
+    if (oclContext.platform.hasBFTFDenormMode())
+    {
+        oclContext.m_floatDenormModeBFTF = FLOAT_DENORM_RETAIN;
     }
 
     unsigned PtrSzInBits = pKernelModule->getDataLayout().getPointerSizeInBits();
@@ -1479,6 +1490,10 @@ bool TranslateBuildSPMD(
                     oclContext.m_floatDenormMode16 = FLOAT_DENORM_FLUSH_TO_ZERO;
                     oclContext.m_floatDenormMode32 = FLOAT_DENORM_FLUSH_TO_ZERO;
                 }
+                if (modMD->compOpt.BFTFDenormsAreZero)
+                {
+                    oclContext.m_floatDenormModeBFTF = FLOAT_DENORM_FLUSH_TO_ZERO;
+                }
                 if (IGC_GET_FLAG_VALUE(ForceFastestSIMD))
                 {
                     oclContext.m_retryManager.AdvanceState();
@@ -1541,6 +1556,10 @@ bool TranslateBuildSPMD(
                         oclContext.m_retryManager.kernelSet.find(pFunc->getName().str()) == oclContext.m_retryManager.kernelSet.end())
                     {
                         pFunc->eraseFromParent();
+                        // TODO: Consider running a proper cleanup of
+                        // !opencl.kernels metadata entries here instead of
+                        // deferring 'null' entries to the "retried"
+                        // unification phase.
                     }
                 }
             }
@@ -1617,6 +1636,9 @@ bool TranslateBuildSPMD(
 
     if (IGC_IS_FLAG_ENABLED(ShaderDumpEnable))
         dumpOCLProgramBinary(oclContext, binaryOutput, binarySize);
+
+    if (const char *progbinCustomFN = IGC_GET_REGKEYSTRING(ProgbinDumpFileName))
+      dumpOCLProgramBinary(progbinCustomFN, binaryOutput, binarySize);
 
     if (IGC_IS_FLAG_ENABLED(ShaderOverride))
         overrideOCLProgramBinary(oclContext, binaryOutput, binarySize);
@@ -1807,9 +1829,7 @@ static constexpr STB_TranslationCode g_cICBETranslationCodes[] =
 TRANSLATION_BLOCK_API void Register(STB_RegisterArgs* pRegisterArgs)
 {
     pRegisterArgs->Version = TC::STB_VERSION;
-    pRegisterArgs->NumTranslationCodes =
-        sizeof(g_cICBETranslationCodes) /
-        sizeof(g_cICBETranslationCodes[0]);
+    pRegisterArgs->NumTranslationCodes = std::size(g_cICBETranslationCodes);
 
     if (pRegisterArgs->pTranslationCodes)
     {

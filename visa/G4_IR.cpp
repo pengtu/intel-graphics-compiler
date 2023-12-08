@@ -62,6 +62,7 @@ static const G4_InstOptInfo InstOptInfo[] = {
     {InstOpt_NoSrcDepSet, "NoSrcDepSet"},
     {InstOpt_NoPreempt, "NoPreempt"},
     {InstOpt_Serialize, "Serialize"},
+    {InstOpt_CachelineAligned, "CachelineAligned"},
     {InstOpt_END, "END"}};
 
 #define HANDLE_INST(op, nsrc, ndst, type, plat, attr)                          \
@@ -72,7 +73,7 @@ static const G4_InstOptInfo InstOptInfo[] = {
   {G4_##op, name, nsrc, ndst, type, plat, attr},
 
 const G4_Inst_Info G4_Inst_Table[] = {
-#include "G4Instruction.h"
+#include "G4_Instruction.h"
 };
 
 // global functions
@@ -382,7 +383,8 @@ G4_Type G4_INST::getExecType2() const {
     if (!src)
       continue;
     G4_Type srcType = srcs[i]->getType();
-    if (builder.hasBFMixMode() && srcType == Type_BF) {
+    if (builder.hasBFMixMode() && srcType == Type_BF &&
+        !builder.supportPureBF()) {
       execType = Type_F;
     } else if (isLowPrecisionFloatTy(srcType) &&
                TypeSize(srcType) >= TypeSize(execType)) {
@@ -814,13 +816,15 @@ bool G4_INST::isMathPipeInst() const {
   if (isDFInstruction()) {
     if (builder.getPlatform() == Xe_MTL)
       return true;
+    if (builder.getPlatform() == Xe_ARL)
+      return true;
   }
 
   return false;
 }
 
 bool G4_INST::distanceHonourInstruction() const {
-  if (isSend() || op == G4_nop || isWait() || isDpas()) {
+  if (isSend() || hasNoPipe() || isDpas()) {
     return false;
   }
   if (isMathPipeInst()) {
@@ -846,14 +850,16 @@ bool G4_INST::tokenHonourInstruction() const {
   }
 }
 
-bool G4_INST::hasNoPipe() {
+bool G4_INST::hasNoPipe() const {
   if (op == G4_wait || op == G4_halt || op == G4_nop) {
     return true;
   }
-  // PVC only
-  if (op == G4_sync_fence) {
+
+  if (op == G4_sync_fence || op == G4_sync_nop || op == G4_sync_allrd ||
+      op == G4_sync_allwr) {
     return true;
   }
+
   return false;
 }
 
@@ -1013,6 +1019,78 @@ bool G4_INST::isFloatPipeInstructionXe() const {
   }
 
   return false;
+}
+
+int G4_INST::getMaxDepDistance() const {
+  if (getDst() &&
+      getDst()->getTypeSize() ==
+          8) { // Note that for XeLP, there are no 8 bytes ALU instruction.
+    return SWSB_MAX_ALU_DEPENDENCE_DISTANCE_64BIT;
+  } else {
+    return SWSB_MAX_ALU_DEPENDENCE_DISTANCE;
+  }
+}
+
+SB_INST_PIPE G4_INST::getInstructionPipeXe() const {
+
+  if (isLongPipeInstructionXe()) {
+    return PIPE_LONG;
+  }
+
+  if (isIntegerPipeInstructionXe()) {
+    return PIPE_INT;
+  }
+
+  if (isFloatPipeInstructionXe()) {
+    return PIPE_FLOAT;
+  }
+
+  if (isMathPipeInst()) {
+    return PIPE_MATH;
+  }
+
+  if (tokenHonourInstruction()) {
+    if (isDpas()) {
+      return PIPE_DPAS;
+    }
+
+    if (isSend()) {
+      return PIPE_SEND;
+    }
+    vISA_ASSERT_UNREACHABLE("Wrong token pipe instruction!");
+  }
+
+  vISA_ASSERT(hasNoPipe(), "No pipe instruction");
+  return PIPE_NONE;
+}
+
+SB_INST_PIPE G4_INST::getDistDepPipeXe() const {
+  SB_INST_PIPE depPipe = PIPE_NONE;
+  vISA_ASSERT(getDistance(), "has no distance dep");
+
+  switch (getDistanceTypeXe()) {
+  case DistanceType::DIST:
+    depPipe = getInstructionPipeXe();
+    break;
+  case DistanceType::DISTALL: // keep PIPE_NONE as DISTALL
+    break;
+  case DistanceType::DISTINT:
+    depPipe = PIPE_INT;
+    break;
+  case DistanceType::DISTFLOAT:
+    depPipe = PIPE_FLOAT;
+    break;
+  case DistanceType::DISTLONG:
+    depPipe = PIPE_LONG;
+    break;
+  case DistanceType::DISTMATH:
+    depPipe = PIPE_MATH;
+    break;
+  default:
+    vISA_ASSERT(0, "Unknown distance dependence type");
+    break;
+  }
+  return depPipe;
 }
 
 template <typename T> static std::string fmtHexBody(T t, int cols = 0) {
@@ -1235,7 +1313,7 @@ bool G4_INST::hasACCOpnd() const {
           (srcs[1] && srcs[1]->isAccReg()) || (srcs[2] && srcs[2]->isAccReg()));
 }
 
-G4_Type G4_INST::getOpExecType(int &extypesize) {
+G4_Type G4_INST::getOpExecType(int &extypesize) const {
   G4_Type extype;
   if (isRawMov()) {
     extype = srcs[0]->getType();
@@ -2565,7 +2643,7 @@ bool G4_INST::hasNULLDst() const {
   return false;
 }
 
-bool G4_INST::goodTwoGRFDst(bool &evenSplitDst) {
+bool G4_INST::goodTwoGRFDst(bool &evenSplitDst) const {
   evenSplitDst = false;
   // The following applies to all platforms
   // The problem is , the first case is really an instruction with two
@@ -2920,7 +2998,7 @@ bool G4_INST::isPartialWriteForSpill(bool inSIMDCF,
 
     //For DPAS, always Nomask
     //For send, !isWriteEnableInst in if covers the case with Nomask.
-    if (mayExceedTwoGRF()) {
+    if (isSend() || isDpas()) {
       return true;
     }
 
@@ -3071,9 +3149,11 @@ static const char *SFIDToString(vISA::SFID sfid)
 //         and (16|M0)  ...
 //                      ^ aligns operand start to same place here
 static const int INST_START_COLUMN_WIDTH = 24;
-const char *const MathOpNames[16] = {
+const char* const MathOpNames[16] = {
     "reserved",  "inv",  "log", "exp",    "sqrt", "rsq", "sin",  "cos",
-    "undefined", "fdiv", "pow", "intdiv", "quot", "rem", "invm", "rsqrtm"};
+    "undefined", "fdiv", "pow", "intdiv", "quot", "rem", "invm", "rsqrtm"
+    };
+
 
 // emits the first part of an instruction in an aligned column
 static void emitInstructionStartColumn(std::ostream &output, G4_INST &inst) {
@@ -3351,7 +3431,7 @@ void G4_INST::emitDefUse(std::ostream &output) const {
 }
 
 bool G4_INST::isMixedMode() const {
-  if (mayExceedTwoGRF() || !getDst()) {
+  if (isSend() || isDpas() || !getDst()) {
     return false;
   }
   for (int i = 0; i < getNumSrc(); ++i) {
@@ -3380,7 +3460,7 @@ bool G4_INST::isMixedMode() const {
 // precision float type.
 // TODO: Merge the logics with isMixedMode()?
 bool G4_INST::isIllegalMixedMode() const {
-  if (mayExceedTwoGRF() || !getDst()) {
+  if (isSend() || isDpas() || !getDst()) {
     return false;
   }
   for (int i = 0; i < getNumSrc(); ++i) {
@@ -3417,7 +3497,7 @@ void G4_InstSend::setMsgDesc(G4_SendDesc *in) {
   resetRightBound(srcs[0]);
 }
 
-bool G4_InstSend::isDirectSplittableSend() {
+bool G4_InstSend::isDirectSplittableSend() const {
   unsigned short elemSize = dst->getElemSize();
   SFID funcID = msgDesc->getSFID();
   const G4_SendDescRaw *desc = getMsgDescRaw();
@@ -5672,13 +5752,14 @@ void G4_SrcRegRegion::setSrcBitVec(uint8_t exec_size, const IR_Builder &irb) {
   } else if (desc->isContiguous(exec_size)) {
     // fast path
     int totalBytes = exec_size * typeSize;
-    vISA_ASSERT(totalBytes <= 2 * irb.getGRFSize(),
-                "total bytes exceed 2 GRFs");
+    if (!irb.supportNativeSIMD32())
+      vISA_ASSERT(totalBytes <= 2 * irb.getGRFSize(),
+                  "total bytes exceed 2 GRFs");
 
     footPrint0 = totalBytes < 64 ? (1ULL << totalBytes) - 1 : ULLONG_MAX;
     if (totalBytes > 64) {
       footPrint1 =
-          totalBytes == 128 ? ULLONG_MAX : (1ULL << (totalBytes - 64)) - 1;
+          totalBytes >= 128 ? ULLONG_MAX : (1ULL << (totalBytes - 64)) - 1;
     }
   } else {
     for (int i = 0, numRows = exec_size / desc->width; i < numRows; ++i) {
@@ -6121,12 +6202,15 @@ void G4_Operand::updateFootPrint(BitSet &footprint, bool isSet,
       return true;
     return lb <= rb && rb < footprint.getSize();
   };
-  //  vISA_ASSERT(!builder.getOption(vISA_boundsChecking) || boundsChecking(),
-  //              "Out-of-bounds access found in "
-  //                  << *getInst() << "\n"
-  //                  << "For operand " << *this << ", the footprint size is "
-  //                 << footprint.getSize() << " and the accessing range is ["
-  //                  << lb << ", " << rb << "]\n");
+  std::ostringstream instDump, opndDump;
+  vISA_ASSERT(!builder.getOption(vISA_boundsChecking) || boundsChecking(),
+              "Out-of-bounds access found in %s\nFor operand %s, the footprint "
+              "size is %u and the accessing range is [%u, %u]\n",
+              reinterpret_cast<std::ostringstream&>(instDump << *getInst())
+                  .str().c_str(),
+              reinterpret_cast<std::ostringstream&>(opndDump << *this).str()
+                  .c_str(),
+              footprint.getSize(), lb, rb);
 
   if (doFastPath && lb % N == 0 && (rb + 1) % N == 0) {
     // lb is 32-byte aligned, set one dword at a time
@@ -6285,44 +6369,29 @@ void G4_InstSend::computeRightBound(G4_Operand *opnd) {
   associateOpndWithInst(opnd, this);
 
   if (opnd && !opnd->isImm() && !opnd->isNullReg()) {
-    auto computeSendOperandBound = [this](G4_Operand *opnd, int numReg) {
-      if (numReg == 0) {
-        return;
-      }
-
-      // Sends read/write in units of GRF. With a narrower simd width,
-      // the variable may have size smaller than one GRF, or smaller
-      // the reponse or message length. In this case, limit the right
-      // bound up to the variable size.
-      unsigned LB = opnd->left_bound;
-      unsigned RB =
-          std::min(opnd->getTopDcl()->getByteSize(),
-                   LB + numReg * getBuilder().numEltPerGRF<Type_UB>()) -
-          1;
-
-      unsigned NBytes = RB - LB + 1;
-      opnd->setBitVecFromSize(NBytes, getBuilder());
-      opnd->setRightBound(RB);
-    };
-
-    if (srcs[0] == opnd || (isSplitSend() && srcs[1] == opnd)) {
-      // For send instruction's msg operand rightbound depends
-      // on msg descriptor
-      uint16_t numReg = (srcs[0] == opnd) ? getMsgDesc()->getSrc0LenRegs()
-                                          : getMsgDesc()->getSrc1LenRegs();
-      computeSendOperandBound(opnd, numReg);
-    } else if (dst == opnd) {
-      // Compute right bound for dst operand
+    if (dst == opnd || srcs[0] == opnd || (isSplitSend() && srcs[1] == opnd)) {
+      // Compute right bound for dst/src0/src1 operands
       const auto *desc = getMsgDesc();
-      uint32_t dstBytes = desc->getDstLenBytes();
-      if (dstBytes < getBuilder().getGRFSize()) {
-        // e.g. OWord block read x1
-        opnd->setBitVecL((1ULL << dstBytes) - 1);
-        opnd->setRightBound(opnd->left_bound + dstBytes - 1);
+      uint32_t opndBytes = 0;
+      if (dst == opnd)
+        opndBytes = desc->getDstLenBytes();
+      else if (srcs[0] == opnd)
+        opndBytes = desc->getSrc0LenBytes();
+      else
+        opndBytes = desc->getSrc1LenBytes();
 
+      if (opndBytes < getBuilder().getGRFSize()) {
+        // e.g. OWord block read x1
+        opnd->setBitVecL((1ULL << opndBytes) - 1);
+        opnd->setRightBound(opnd->left_bound + opndBytes - 1);
       } else {
-        uint16_t numReg = desc->getDstLenRegs();
-        computeSendOperandBound(opnd, numReg);
+        // For some sends, the operands's size is in GRF unit but not the exact
+        // size, e.g. block2d. The variable size may be a smaller value. In
+        // this case, limit the right bound up to the variable size.
+        auto dclSize = opnd->getTopDcl()->getByteSize();
+        opndBytes = std::min(dclSize, opndBytes);
+        opnd->setBitVecFromSize(opndBytes, getBuilder());
+        opnd->setRightBound(opnd->left_bound + opndBytes - 1);
       }
     } else {
       opnd->computeRightBound(execSize);
@@ -6738,7 +6807,8 @@ bool G4_INST::supportsNullDst() const {
 }
 
 bool G4_INST::isAlign1Ternary() const {
-  return builder.hasAlign1Ternary() && getNumSrc() == 3 && !mayExceedTwoGRF();
+  return builder.hasAlign1Ternary() && getNumSrc() == 3 &&
+         !(isSend() || isDpas());
 }
 
 // Detect packed low-precision instruction. This is used by the scheduler.
@@ -7700,6 +7770,15 @@ bool G4_InstDpas::isInt() const {
   return false;
 }
 
+bool G4_InstDpas::isInt8() const {
+  if (Src1Precision == GenPrecision::S8 || Src1Precision == GenPrecision::U8 ||
+      Src2Precision == GenPrecision::S8 || Src2Precision == GenPrecision::U8) {
+    return true;
+  }
+
+  return false;
+}
+
 bool G4_InstDpas::is2xInt8() const {
   if ((Src1Precision == GenPrecision::S4 || Src1Precision == GenPrecision::U4 ||
        Src1Precision == GenPrecision::S2 ||
@@ -7765,6 +7844,20 @@ void G4_InstDpas::computeRightBound(G4_Operand *opnd) {
       computeDpasOperandBound(opnd, opnd->left_bound,
                               opnd->left_bound + bytes - 1);
     }
+
+    else if (opnd && opnd == srcs[3]) {
+      uint32_t bytes;
+      if (dpasInst->isInt())
+      {
+        bytes = 2 * getBuilder().getGRFSize();
+      } else if (dpasInst->isFP16() || dpasInst->isBF16()) {
+        bytes = getBuilder().getGRFSize();
+      } else { // isTF32()
+        bytes = getBuilder().getGRFSize() / 2;
+      }
+      computeDpasOperandBound(opnd, opnd->left_bound,
+                              opnd->left_bound + bytes - 1);
+    }
   }
 }
 
@@ -7817,4 +7910,19 @@ bool G4_INST::canSrcBeFlagForPropagation(Gen4_Operand_Number opndNum) const {
     return false;
 
   return true;
+}
+
+bool G4_InstCF::requireNopAfter() const {
+  if (!getBuilder().needNopAfterCFInstWA())
+    return false;
+
+  if (opcode() == G4_jmpi)
+    return true;
+
+  if (opcode() == G4_goto) {
+    if (getPredicate() && isBackward())
+      return false;
+    return true;
+  }
+  return false;
 }

@@ -33,6 +33,7 @@ SPDX-License-Identifier: MIT
 #include <llvm/Transforms/Utils/Local.h>
 #include "common/LLVMWarningsPop.hpp"
 #include "Compiler/CISACodeGen/ShaderCodeGen.hpp"
+#include "Compiler/CISACodeGen/OpenCLKernelCodeGen.hpp"
 #include "Compiler/CISACodeGen/SLMConstProp.hpp"
 #include "Compiler/IGCPassSupport.h"
 #include "Compiler/MetaDataUtilsWrapper.h"
@@ -264,7 +265,20 @@ namespace {
             SmallVector<std::tuple<AccessInstruction*, int64_t, MemRefListTy::iterator>, 8> & AccessIntrs,
             unsigned& NumElts)
         {
-            if (IGCLLVM::getAlignmentValue(inst) < 4 && !WI->isUniform(inst))
+            auto alignment = IGCLLVM::getAlignmentValue(inst);
+            if (alignment == 0)
+            {
+                // SROA LLVM pass may sometimes set a load/store alignment to 0. It happens when
+                // deduced alignment (based on GEP instructions) matches an alignment specified
+                // in datalayout for a specific type. It can be problematic as MemOpt merging
+                // logic is implemented in a way that a product of merging inherits an alignment
+                // from the leading load/store. It results in creating memory instruction with
+                // different type, without alignment set, therefore the information about the
+                // correct alignment gets lost.
+                CGC->EmitWarning("MemOpt expects alignment to be always explicitly set for the leading instruction!");
+            }
+
+            if (alignment < 4 && !WI->isUniform(inst))
             {
                 llvm::Type* dataType = isa<LoadInst>(inst) ? inst->getType() : inst->getOperand(0)->getType();
                 unsigned scalarTypeSizeInBytes = unsigned(DL->getTypeSizeInBits(dataType->getScalarType()) / 8);
@@ -483,11 +497,12 @@ bool MemOpt::runOnFunction(Function& F) {
     bool Changed = false;
 
     IGC::IGCMD::FunctionInfoMetaDataHandle funcInfoMD = MDU->getFunctionsInfoItem(&F);
-    unsigned SimdSize = funcInfoMD->getSubGroupSize()->getSIMD_size();
+    unsigned SimdSize = funcInfoMD->getSubGroupSize()->getSIMDSize();
 
-    for (Function::iterator BB = F.begin(), BBE = F.end(); BB != BBE; ++BB) {
+    for (Function::iterator BBI = F.begin(), BBE = F.end(); BBI != BBE; ++BBI) {
         // Find all instructions with memory reference. Remember the distance one
         // by one.
+        BasicBlock* BB = &*BBI;
         MemRefListTy MemRefs;
         TrivialMemRefListTy MemRefsToOptimize;
         unsigned Distance = 0;
@@ -511,10 +526,12 @@ bool MemOpt::runOnFunction(Function& F) {
         if (MemRefs.size() < 2)
             continue;
 
-        // Canonicalize 64-bit GEP to help SCEV find constant offset by
-        // distributing `zext`/`sext` over safe expressions.
-        for (auto& M : MemRefs)
-            Changed |= canonicalizeGEP64(M.first);
+        if (IGC_IS_FLAG_ENABLED(EnableMemOptGEPCanon)) {
+            // Canonicalize 64-bit GEP to help SCEV find constant offset by
+            // distributing `zext`/`sext` over safe expressions.
+            for (auto& M : MemRefs)
+                Changed |= canonicalizeGEP64(M.first);
+        }
 
         for (auto MI = MemRefs.begin(), ME = MemRefs.end(); MI != ME; ++MI) {
             Instruction* I = MI->first;
@@ -536,10 +553,12 @@ bool MemOpt::runOnFunction(Function& F) {
             }
         }
 
-        // Optimize 64-bit GEP to reduce strength by factoring out `zext`/`sext`
-        // over safe expressions.
-        for (auto I : MemRefsToOptimize)
-            Changed |= optimizeGEP64(I);
+        if (IGC_IS_FLAG_ENABLED(EnableMemOptGEPCanon)) {
+            // Optimize 64-bit GEP to reduce strength by factoring out `zext`/`sext`
+            // over safe expressions.
+            for (auto I : MemRefsToOptimize)
+                Changed |= optimizeGEP64(I);
+        }
     }
 
     DL = nullptr;
@@ -979,6 +998,81 @@ bool MemOpt::mergeLoad(LoadInst* LeadingLoad,
     TrivialMemRefListTy& ToOpt)
 {
     MemRefListTy::iterator MI = aMI;
+    // For cases like the following:
+    //   ix0 = sext i32 a0 to i64
+    //   addr0 = gep base, i64 ix0
+    //
+    //   ix1 = sext i32 a1 to i64
+    //   addr1 = gep base, i64 ix1
+    // Since SCEV does not do well with sext/zext/longer expression on
+    // comparing addr0 with addr1, this function compares a0 with a1 instead.
+    // In doing so, it skip sext/zext and only on the last index (thus shorter
+    // expression). The condition for doing so is that if all indices are
+    // identical except the last one.
+    //
+    // Return value:  byte offset to LeadLastIdx. Return 0 if unknown.
+    auto getGEPIdxDiffIfAppliable = [this](const SCEV*& LeadLastIdx,
+        LoadInst* LeadLd, LoadInst* NextLd)
+    {
+        // Only handle single-index GEP for now.
+        auto LeadGEP = dyn_cast<GetElementPtrInst>(LeadLd->getPointerOperand());
+        auto NextGEP = dyn_cast<GetElementPtrInst>(NextLd->getPointerOperand());
+        if (LeadGEP && NextGEP &&
+            LeadGEP->getPointerOperand() == NextGEP->getPointerOperand() &&
+            LeadGEP->getNumIndices() == NextGEP->getNumIndices() &&
+            LeadLd->getType() == NextLd->getType() &&
+            LeadGEP->getNumIndices() > 0) {
+            const int N = LeadGEP->getNumIndices();
+            for (int i = 1; i < N; ++i) {
+                // GEP  0:base, 1:1st_index, 2:2nd_index, ..., N:Nth_index
+                Value* ix0 = LeadGEP->getOperand(i);
+                Value* ix1 = NextGEP->getOperand(i);
+                if (ix0 == ix1)
+                    continue;
+                ConstantInt* Cix0 = dyn_cast<ConstantInt>(ix0);
+                ConstantInt* Cix1 = dyn_cast<ConstantInt>(ix1);
+                if (Cix0 && Cix1 && Cix0->getSExtValue() == Cix1->getSExtValue())
+                    continue;
+                // don't handle, skip
+                return (int64_t)0;
+            }
+
+            // Make sure the last index is to the array (indexed type is array
+            // element type).
+            //   For N = 1, the type is an implicit array of the pointee type
+            //   of GEP's pointer operand. But N > 1, need to check as the last
+            //   index might be to a struct.
+            if (N > 1) {
+                // get type of the second index from the last.
+                SmallVector<Value*, 4> Indices (LeadGEP->idx_begin(), std::prev(LeadGEP->idx_end()));
+                Type* srcEltTy = LeadGEP->getSourceElementType();
+                Type* Idx2Ty = GetElementPtrInst::getIndexedType(srcEltTy, Indices);
+                if (!Idx2Ty || !Idx2Ty->isArrayTy())
+                    return (int64_t)0;
+            }
+
+            CastInst* lastIx0 = dyn_cast<CastInst>(LeadGEP->getOperand(N));
+            CastInst* lastIx1 = dyn_cast<CastInst>(NextGEP->getOperand(N));
+            if (lastIx0 && lastIx1 &&
+                lastIx0->getOpcode() == lastIx1->getOpcode() &&
+                (isa<SExtInst>(lastIx0) || isa<ZExtInst>(lastIx0)) &&
+                lastIx0->getType() == lastIx1->getType() &&
+                lastIx0->getSrcTy() == lastIx1->getSrcTy()) {
+                if (!LeadLastIdx)
+                    LeadLastIdx = SE->getSCEV(lastIx0->getOperand(0));
+                const SCEV* NextIdx = SE->getSCEV(lastIx1->getOperand(0));
+                auto Diff = dyn_cast<SCEVConstant>(SE->getMinusSCEV(NextIdx, LeadLastIdx));
+                if (Diff) {
+                    // This returns 16 for <3 x i32>, not 12!
+                    uint32_t LoadedBytes = (uint32_t)DL->getTypeStoreSize(NextLd->getType());
+
+                    int64_t eltDiff = Diff->getValue()->getSExtValue();
+                    return (int64_t)(eltDiff * LoadedBytes);
+                }
+            }
+        }
+        return (int64_t)0;
+    };
 
     // Push the leading load into the list to be optimized (after
     // canonicalization.) It will be swapped with the new one if it's merged.
@@ -1041,6 +1135,16 @@ bool MemOpt::mergeLoad(LoadInst* LeadingLoad,
     const SCEV* LeadingPtr = SE->getSCEV(LeadingLoad->getPointerOperand());
     if (isa<SCEVCouldNotCompute>(LeadingPtr))
         return false;
+    const SCEV* LeadingLastIdx = nullptr; // set on-demand
+    bool DoCmpOnLastIdx = false;
+    if (IGC_IS_FLAG_DISABLED(EnableMemOptGEPCanon)) {
+        auto aGEP = dyn_cast<GetElementPtrInst>(LeadingLoad->getPointerOperand());
+        if (aGEP && aGEP->hasIndices()) {
+            // index starts from 1
+            Value* ix = aGEP->getOperand(aGEP->getNumIndices());
+            DoCmpOnLastIdx = (isa<SExtInst>(ix) || isa<ZExtInst>(ix));
+        }
+    }
 
     // LoadInst, Offset, MemRefListTy::iterator, LeadingLoad's int2PtrOffset
     SmallVector<std::tuple<LoadInst*, int64_t, MemRefListTy::iterator>, 8>
@@ -1115,25 +1219,30 @@ bool MemOpt::mergeLoad(LoadInst* LeadingLoad,
         int64_t Off = 0;
         const SCEVConstant* Offset
             = dyn_cast<SCEVConstant>(SE->getMinusSCEV(NextPtr, LeadingPtr));
+        // If addr cmp fails, try whether index cmp can be applied.
+        if (DoCmpOnLastIdx && Offset == nullptr)
+            Off = getGEPIdxDiffIfAppliable(LeadingLastIdx, LeadingLoad, NextLoad);
         // Skip load with non-constant distance.
-        if (!Offset) {
-
-            SymbolicPointer LeadingSymPtr;
-            SymbolicPointer NextSymPtr;
-            if (SymbolicPointer::decomposePointer(LeadingLoad->getPointerOperand(),
-                LeadingSymPtr, CGC) ||
-                SymbolicPointer::decomposePointer(NextLoad->getPointerOperand(),
-                    NextSymPtr, CGC) ||
-                NextSymPtr.getConstantOffset(LeadingSymPtr, Off)) {
-                continue;
+        // If Off != 0, it is already a constant via index cmp
+        if (Off == 0) {
+            if (!Offset) {
+                SymbolicPointer LeadingSymPtr;
+                SymbolicPointer NextSymPtr;
+                if (SymbolicPointer::decomposePointer(LeadingLoad->getPointerOperand(),
+                    LeadingSymPtr, CGC) ||
+                    SymbolicPointer::decomposePointer(NextLoad->getPointerOperand(),
+                        NextSymPtr, CGC) ||
+                    NextSymPtr.getConstantOffset(LeadingSymPtr, Off)) {
+                        continue;
+                }
+                else {
+                    if (!AllowNegativeSymPtrsForLoad && LeadingSymPtr.Offset < 0)
+                        continue;
+                }
             }
             else {
-                if (!AllowNegativeSymPtrsForLoad && LeadingSymPtr.Offset < 0)
-                    continue;
+                Off = Offset->getValue()->getSExtValue();
             }
-        }
-        else {
-            Off = Offset->getValue()->getSExtValue();
         }
 
         unsigned NextLoadSize = unsigned(DL->getTypeStoreSize(NextLoadType));
@@ -2288,36 +2397,20 @@ namespace {
     // BundleConfig:
     //    To tell what vector size is legit. It may need GEN platform as input.
     class BundleConfig {
+    public:
         enum {
             STORE_DEFAULT_BYTES_PER_LANE = 16, // 4 DW for non-uniform
             LOAD_DEFAULT_BYTES_PER_LANE = 16   // 4 DW for non-uniform
         };
 
-    public:
         BundleConfig(LdStKind K, int ByteAlign, bool Uniform,
             const AddressModel AddrModel, CodeGenContext* Ctx)
         {
             uint32_t maxBytes = 0;
-            if (K == LdStKind::IS_STORE) {
-                maxBytes = IGC_GET_FLAG_VALUE(MaxStoreVectorSizeInBytes);
-                if (maxBytes != 0) {
-                    // legal values: [8, 32].
-                    maxBytes = std::min(maxBytes, 32u);
-                    maxBytes = std::max(maxBytes, 8u);
-                }
-                else
-                    maxBytes = STORE_DEFAULT_BYTES_PER_LANE;
-            }
-            else {
-                maxBytes = IGC_GET_FLAG_VALUE(MaxLoadVectorSizeInBytes);
-                if (maxBytes != 0) {
-                    // legal values: [8, 32]
-                    maxBytes = std::min(maxBytes, 32u);
-                    maxBytes = std::max(maxBytes, 8u);
-                }
-                else
-                    maxBytes = LOAD_DEFAULT_BYTES_PER_LANE;
-            }
+            if (K == LdStKind::IS_STORE)
+                maxBytes = getMaxStoreBytes(Ctx);
+            else
+                maxBytes = getMaxLoadBytes(Ctx);
 
             auto calculateSize = [=](bool Uniform) -> uint32_t
             {
@@ -2504,7 +2597,13 @@ namespace {
         bool m_hasLoadCombined;
         bool m_hasStoreCombined;
 
-        // All insts that have been combined and can be deleted.
+        //
+        // Caching
+        //
+        // If true, IGC needs to emulate I64.
+        bool m_hasI64Emu;
+
+        // All insts that have been combined and will be deleted at the end.
         SmallVector<Instruction*, 16> m_combinedInsts;
 
         //
@@ -2518,9 +2617,6 @@ namespace {
         std::list<BundleInfo> m_bundles;
 
         DenseMap<const Instruction*, int> m_visited;
-
-        // If true, IGC needs to emulate I64.
-        bool m_hasI64Emu;
 
         void init(BasicBlock* BB) {
             m_visited.clear();
@@ -2573,10 +2669,17 @@ namespace {
         bool getAddressDiffIfConstant(Instruction* I0, Instruction* I1, int64_t& ConstBO);
 
         // Create unique identified struct type
-        SmallVector<StructType*, 16> m_allLayoutStructTypes;
-        void initLayoutStructType(Module* M);
         StructType* getOrCreateUniqueIdentifiedStructType(
             ArrayRef<Type*> EltTys, bool IsSOA, bool IsPacked = true);
+
+        // Skip counting those insts as no code shall be emitted for them.
+        bool skipCounting(Instruction* I) {
+            if (auto* IntrinsicI = dyn_cast<llvm::IntrinsicInst>(I)) {
+                if (IntrinsicI->getIntrinsicID() == Intrinsic::assume)
+                    return true;
+            }
+            return isDbgIntrinsic(I) || isa<BitCastInst>(I);
+        }
 
         void eraseDeadInsts();
 
@@ -2588,7 +2691,6 @@ namespace {
             m_visited.clear();
             m_instOrder.clear();
             m_bundles.clear();
-            m_allLayoutStructTypes.clear();
         }
     };
 }
@@ -2599,6 +2701,44 @@ const BundleSize_t BundleConfig::m_d8VecSizes = { 2,4,8 };
 const BundleSize_t BundleConfig::m_d64VecSizes_u = { 2,3,4,8,16,32,64 };
 const BundleSize_t BundleConfig::m_d32VecSizes_u = { 2,3,4,8,16,32,64 };
 const BundleSize_t BundleConfig::m_d8VecSizes_u = { 2,4,8,16,32 };
+
+bool IGC::doLdStCombine(const CodeGenContext* CGC) {
+    if (CGC->type == ShaderType::OPENCL_SHADER) {
+       auto oclCtx = (const OpenCLProgramContext*)CGC;
+       // internal flag overrides IGC key
+       switch (oclCtx->m_InternalOptions.LdStCombine) {
+       default:
+           break;
+       case 0:
+           return false;
+       case 1:
+           return true;
+       }
+    }
+    return IGC_IS_FLAG_ENABLED(EnableLdStCombine);
+}
+
+uint32_t IGC::getMaxStoreBytes(const CodeGenContext* CGC) {
+    if (CGC->type == ShaderType::OPENCL_SHADER) {
+       auto oclCtx = (const OpenCLProgramContext*)CGC;
+       // internal flag overrides IGC key
+       if (oclCtx->m_InternalOptions.MaxStoreBytes != 0)
+           return oclCtx->m_InternalOptions.MaxStoreBytes;
+    }
+    uint32_t bytes = IGC_GET_FLAG_VALUE(MaxStoreVectorSizeInBytes);
+    // Use default if bytes from the key is not set or invalid
+    if (!(bytes >= 4 && bytes <= 32 && isPowerOf2_32(bytes)))
+        bytes = BundleConfig::STORE_DEFAULT_BYTES_PER_LANE;
+    return bytes;
+}
+
+uint32_t IGC::getMaxLoadBytes(const CodeGenContext* CGC) {
+    uint32_t bytes = IGC_GET_FLAG_VALUE(MaxLoadVectorSizeInBytes);
+    // Use default if bytes from the key is not set or invalid
+    if (!(bytes >=4 && bytes <= 32 && isPowerOf2_32(bytes)))
+        bytes = BundleConfig::LOAD_DEFAULT_BYTES_PER_LANE;
+    return bytes;
+}
 
 FunctionPass* IGC::createLdStCombinePass() {
     return new LdStCombine();
@@ -2773,13 +2913,11 @@ bool LdStCombine::runOnFunction(Function& F)
     }
     m_F = &F;
 
-    initLayoutStructType(m_F->getParent());
-
     // Initialize symbolic evaluation
     m_symEval.setDataLayout(m_DL);
 
     // i64Emu: mimic Emu64Ops's enabling condition. Seems conservative
-    //         and be improved in the future if needed.
+    //         but can be improved in the future if needed.
     m_hasI64Emu = (m_CGC->platform.need64BitEmulation() &&
             (IGC_GET_FLAG_VALUE(Enable64BitEmulation) ||
              IGC_GET_FLAG_VALUE(Enable64BitEmulationOnSelectedPlatform)));
@@ -2787,9 +2925,6 @@ bool LdStCombine::runOnFunction(Function& F)
     combineStores(F);
 
     bool changed = (m_hasLoadCombined || m_hasStoreCombined);
-
-    clear();
-
     return changed;
 }
 
@@ -2859,7 +2994,7 @@ void LdStCombine::getOrCreateElements(
     IRBuilder<> builder(InsertBefore);
     for (int i = 0; i < nelts; ++i) {
         if (isa<UndefValue>(EltV[i])) {
-            Value* v = builder.CreateExtractElement(V, i);
+            Value* v = builder.CreateExtractElement(V, builder.getInt32(i));
             EltV[i] = v;
         }
     }
@@ -2905,6 +3040,8 @@ void LdStCombine::combineStores(Function& F)
         return true;
     };
 
+    // Only handle stores within the given instruction window.
+    constexpr uint32_t WINDOWSIZE = 150;
     m_hasStoreCombined = false;
     for (auto& BB : F)
     {
@@ -2919,36 +3056,40 @@ void LdStCombine::combineStores(Function& F)
                 continue;
             }
 
+            uint32_t numInsts = 1;
             Stores.push_back(LdStInfo(base, 0));
             AST.clear();
             AST.add(base);
             for (auto JI = std::next(II); JI != IE; ++JI) {
                 Instruction* I = &*JI;
-                if (canCombineStoresAcross(I)) {
-                    int64_t offset;
-                    if (isStoreCandidate(I) &&
-                        getAddressDiffIfConstant(base, I, offset)) {
-                        Stores.push_back(LdStInfo(I, offset));
-                        AST.add(I);
-                    }
-                    continue;
+                if (!skipCounting(I))
+                    ++numInsts;
+                if (!canCombineStoresAcross(I) || numInsts > WINDOWSIZE) {
+                    // Cannot add more stores.
+                    break;
                 }
-
-                // Cannot add more stores, create bundles now.
-                //   Note: For now, each store is considered once. For example,
-                //     store a
-                //     store b
-                //     store c        // alias to store a
-                //     store d
-                //   As 'store c' aliases to 'store a', candidate 'Stores' stop
-                //   growing at 'store c', giving the first set {a, b}. Even
-                //   though {a, b} cannot combined, 'store b' will not be
-                //   reconsidered for a potential merging of {b, c, d}.
-                //   This can be changed if needed.
-                createBundles(&BB, Stores);
+                int64_t offset;
+                if (isStoreCandidate(I) &&
+                    getAddressDiffIfConstant(base, I, offset)) {
+                    Stores.push_back(LdStInfo(I, offset));
+                    AST.add(I);
+                }
             }
 
-            // last one
+            // Create bundles from those stores.
+            //   Note: createBundles() will markt all stores as visited when
+            //         it is returend, meaning each store is considered only
+            //         once. For example,
+            //     store a
+            //     store b
+            //     store c        // alias to store a
+            //     store d
+            //   As 'store c' aliases to 'store a', candidate 'Stores' stop
+            //   growing at 'store c', giving the first set {a, b} for
+            //   combining. Even if {a, b} cannot be combined, but {b, c, d}
+            //   can; it will go on with the next candidate set {c, d},  not
+            //   {b, c, d}; missing opportunity to combine {b, c, d}.
+            //   So far, this is fine as this case isn't important.
             createBundles(&BB, Stores);
         }
 
@@ -3008,7 +3149,8 @@ void LdStCombine::createBundles(BasicBlock* BB, InstAndOffsetPairs& Stores)
 
             Type* Ty = LSI->getLdStType();
             Type* eTy = Ty->getScalarType();
-            if (!(eTy->isIntegerTy() || eTy->isFloatingPointTy()))
+            // sanity check
+            if (!(eTy->isIntOrPtrTy() || eTy->isFloatingPointTy()))
                 return;
 
             uint32_t eBytes = (uint32_t)DL->getTypeStoreSize(eTy);
@@ -3148,12 +3290,13 @@ void LdStCombine::createBundles(BasicBlock* BB, InstAndOffsetPairs& Stores)
         const uint32_t theAlign = bundleAlign[ix];
 
         // If i64 insts are not supported, don't do D64 as it might
-        // require i64 mov (I64 Emu only handles 1-level insertvalue
-        // and extractvalue so far), etc in codegen emit.
+        // require i64 mov in codegen emit (I64 Emu only handles 1-level
+        // insertvalue and extractvalue so far).
         if (m_hasI64Emu && theAlign > 4)
             continue;
 
-        // Element size is the same as the alignment.
+        // Use alignment as element size, which maps to gen load/store element
+        // size as follows:
         //   1) For byte-aligned, use vecEltBytes = 1 with different
         //      number of vector elements to map D16U32, D32, D64. The final
         //      store's type would be <2xi8> or i16 for D16U32, i32 for D32,
@@ -3400,23 +3543,6 @@ void LdStCombine::mergeConstElements(
     EltVals.insert(EltVals.end(), mergedElts.begin(), mergedElts.end());
 }
 
-// Get all layout struct types created already for different functions in
-// the same module.
-//
-// This is for creating unique struct layout type per module. Layout
-// struct type is identified, but if two identified layout structs are
-// the same layout, they are the same.
-void LdStCombine::initLayoutStructType(Module* M)
-{
-    auto modAllNamedStructTys = M->getIdentifiedStructTypes();
-    for (auto II : modAllNamedStructTys) {
-        StructType* stTy = II;
-        if (isLayoutStructType(stTy)) {
-            m_allLayoutStructTypes.push_back(stTy);
-        }
-    }
-}
-
 // This is to make sure to reuse the layout types. Two identified structs have
 // the same layout if
 //   1. both are SOA or both are AOS; and
@@ -3425,7 +3551,8 @@ void LdStCombine::initLayoutStructType(Module* M)
 StructType* LdStCombine::getOrCreateUniqueIdentifiedStructType(
     ArrayRef<Type*> EltTys, bool IsSOA, bool IsPacked)
 {
-    for (auto II : m_allLayoutStructTypes) {
+    auto& layoutStructTypes = m_CGC->getLayoutStructTypes();
+    for (auto II : layoutStructTypes) {
         StructType* stTy = II;
         if (IsPacked == stTy->isPacked() &&
             IsSOA == isLayoutStructTypeSOA(stTy) &&
@@ -3437,7 +3564,7 @@ StructType* LdStCombine::getOrCreateUniqueIdentifiedStructType(
     StructType* StTy = StructType::create(EltTys,
         IsSOA ? getStructNameForSOALayout() : getStructNameForAOSLayout(),
         IsPacked);
-    m_allLayoutStructTypes.push_back(StTy);
+    layoutStructTypes.push_back(StTy);
     return StTy;
 }
 
@@ -3634,7 +3761,7 @@ Value* LdStCombine::gatherCopy(
             Value* new_v = irBuilder.CreateCast(Instruction::BitCast, v, nVTy);
             auto insPos = worklist.begin();
             for (int i = 0; i < n; ++i) {
-                Value* v = irBuilder.CreateExtractElement(new_v, i);
+                Value* v = irBuilder.CreateExtractElement(new_v, irBuilder.getInt32(i));
                 worklist.insert(insPos, v);
             }
             continue;
@@ -3800,7 +3927,7 @@ Value* LdStCombine::gatherCopy(
             for (int i = 0; i < sz; ++i) {
                 SmallVector<Value*, 4>& eltVals = allEltVals[i];
                 Value* tV = irBuilder.CreateBitCast(eltVals[0], DstEltTy);
-                retVal = irBuilder.CreateInsertElement(retVal, tV, i);
+                retVal = irBuilder.CreateInsertElement(retVal, tV, irBuilder.getInt32(i));
             }
         }
     }
@@ -3925,17 +4052,33 @@ void LdStCombine::createCombinedStores(Function& F)
             nAddr, IGCLLVM::getAlign(*leadStore), leadStore->isVolatile());
         finalStore->setDebugLoc(anchorStore->getDebugLoc());
 
-        // Only keep metadata based on leadStore.
+        // Only keep metadata from leadStore.
         // (If each store has a different metadata, should they be merged
         //  in the first place?)
-        if (MDNode* Node = leadStore->getMetadata("lsc.cache.ctrl"))
-            finalStore->setMetadata("lsc.cache.ctrl", Node);
-        if (MDNode* Node = leadStore->getMetadata(LLVMContext::MD_nontemporal))
-            finalStore->setMetadata(LLVMContext::MD_nontemporal, Node);
+        //
+        //   Special case:
+        //     1. set nontemporal if any merged store has it (make sense?)
+        SmallVector<std::pair<unsigned, llvm::MDNode*>, 4> MDs;
+        leadStore->getAllMetadata(MDs);
+        for (auto MII : MDs) {
+            finalStore->setMetadata(MII.first, MII.second);
+        }
+
+        if (finalStore->getMetadata("nontemporal") == nullptr) {
+            for (int i = 1, sz = (int)bundle.LoadStores.size(); i < sz; ++i) {
+                StoreInst* SI = static_cast<StoreInst*>(Stores[i].Inst);
+                if (MDNode* N = SI->getMetadata("nontemporal")) {
+                    finalStore->setMetadata("nontemporal", N);
+                    break;
+                }
+            }
+        }
     }
 
     // Delete stores that have been combined.
     eraseDeadInsts();
+
+    m_hasStoreCombined = (!m_bundles.empty());
 
     m_bundles.clear();
 }

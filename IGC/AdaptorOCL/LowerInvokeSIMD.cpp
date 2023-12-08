@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2021 Intel Corporation
+Copyright (C) 2023 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -172,7 +172,7 @@ void LowerInvokeSIMD::fixUniformParamsAndSIMDSize(
       auto MdUtils = getAnalysis<MetaDataUtilsWrapper>().getMetaDataUtils();
       if (MdUtils->findFunctionsInfoItem(NewCall.getFunction()) == MdUtils->end_FunctionsInfo()) continue;
       auto FuncInfoMD = MdUtils->getFunctionsInfoItem(NewCall.getFunction());
-      int  CurrentSIMDSize = FuncInfoMD->getSubGroupSize()->getSIMD_size();
+      int  CurrentSIMDSize = FuncInfoMD->getSubGroupSize()->getSIMDSize();
 
       if (CurrentSIMDSize != 0 && CurrentSIMDSize != DeducedSIMDSize) {
         auto Ctx = static_cast<OpenCLProgramContext *>(
@@ -181,7 +181,7 @@ void LowerInvokeSIMD::fixUniformParamsAndSIMDSize(
         return;
       }
 
-      FuncInfoMD->getSubGroupSize()->setSIMD_size(DeducedSIMDSize);
+      FuncInfoMD->getSubGroupSize()->setSIMDSize(DeducedSIMDSize);
     }
   }
 }
@@ -195,7 +195,7 @@ bool LowerInvokeSIMD::runOnModule(Module &M) {
 
   // If there are uses of vc functions outside invoke_simd calls (e.g. function
   // pointer is taken), replace the old functions with new.
-  for (auto it : m_OldFuncToNewFuncMap) {
+  for (const auto &it : m_OldFuncToNewFuncMap) {
     Function *OldFunc = it.first;
     Function *NewFunc = it.second;
     for (auto &use : OldFunc->uses()) {

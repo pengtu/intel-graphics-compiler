@@ -285,23 +285,24 @@ namespace IGC
             ResourceDescriptor * resource,
             LSC_ADDR_SIZE addrSize, int addrImmOffset,
             LSC_CACHE_OPTS cacheOpts);
-        void LSC_AtomicRaw(
-            AtomicOp atomic_op, CVariable * dst, CVariable * offset,
-            CVariable * src0, CVariable * src1,
-            unsigned short bitwidth, ResourceDescriptor * resource,
-            LSC_ADDR_SIZE addr_size,
-            int immOff, LSC_CACHE_OPTS cacheOpts);
+        void LSC_AtomicRaw(AtomicOp atomic_op, CVariable *dst,
+                           CVariable *offset, CVariable *src0, CVariable *src1,
+                           unsigned short bitwidth,
+                           ResourceDescriptor *resource,
+                           LSC_ADDR_SIZE addr_size, int immOff, int immScale,
+                           LSC_CACHE_OPTS cacheOpts);
         void LSC_Fence(LSC_SFID sfid, LSC_SCOPE scope, LSC_FENCE_OP op);
         void LSC_2DBlockMessage(
             LSC_OP subOp, ResourceDescriptor* resource,
             CVariable* dst, CVariable* bufId,
             CVariable* xOffset, CVariable* yOffset,
-            unsigned char blockWidth,
-            unsigned char blockHeight,
+            unsigned blockWidth,
+            unsigned blockHeight,
             unsigned elemSize, unsigned numBlocks,
             bool isTranspose, bool isVnni,
             CVariable* flatImageBaseoffset, CVariable* flatImageWidth,
-            CVariable* flatImageHeight, CVariable* flatImagePitch);
+            CVariable* flatImageHeight, CVariable* flatImagePitch,
+            LSC_CACHE_OPTS cacheOpts = { LSC_CACHING_DEFAULT, LSC_CACHING_DEFAULT });
         void NamedBarrier(e_barrierKind BarrierKind, CVariable* src0, CVariable* src1);
         void LSC_TypedReadWrite(
             LSC_OP subOp, ResourceDescriptor* resource,

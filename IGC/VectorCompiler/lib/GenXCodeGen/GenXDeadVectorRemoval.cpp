@@ -151,6 +151,10 @@ Constant *GenXDeadVectorRemoval::trySimplify(Constant *C,
   if (!LiveElems.isAnyDead())
     return C;
 
+  // Do not modify predicates. GenXConstant gets no befefit from it
+  if (C->getType()->getScalarType()->isIntegerTy(1))
+    return C;
+
   if (auto CA = dyn_cast<ConstantAggregate>(C))
     return trySimplify(CA, LiveElems);
 
@@ -176,7 +180,8 @@ Constant *GenXDeadVectorRemoval::trySimplify(ConstantAggregate *CA,
     IGC_ASSERT(LiveElems.size() == CA->getNumOperands());
     SmallVector<Constant *, 8> Elems;
     for (auto &U : CA->operands()) {
-      auto OpLiveElems = LiveElements(LiveElems[U.getOperandNo()]);
+      auto LE = LiveElems[U.getOperandNo()];
+      auto OpLiveElems = LiveElements(std::move(LE));
       Elems.push_back(OpLiveElems.isAllDead()
                           ? UndefValue::get(U->getType())
                           : trySimplify(cast<Constant>(U.get()), OpLiveElems));

@@ -46,6 +46,7 @@ if llvm_config.add_tool_substitutions([ToolSubst('ocloc', unresolved='break')], 
 
 llvm_config.add_tool_substitutions([ToolSubst('llvm-dwarfdump')], tool_dirs)
 llvm_config.add_tool_substitutions([ToolSubst('opt')], tool_dirs)
+llvm_config.add_tool_substitutions([ToolSubst('not')], tool_dirs)
 
 if not config.regkeys_disabled:
   config.available_features.add('regkeys')
@@ -56,6 +57,9 @@ if config.spirv_as_enabled:
 
 if config.is32b == "1":
   config.available_features.add('sys32')
+
+if config.debug_build:
+  config.available_features.add('debug')
 
 if config.use_khronos_spirv_translator_in_sc == "1":
   config.available_features.add('khronos-translator')

@@ -121,7 +121,6 @@ SPDX-License-Identifier: MIT
 
 #include "vc/Support/GenXDiagnostic.h"
 #include "vc/Utils/GenX/GlobalVariable.h"
-#include "vc/Utils/GenX/KernelInfo.h"
 
 #include "Probe/Assertion.h"
 #include <algorithm>
@@ -254,7 +253,6 @@ private:
   bool lowerMathIntrinsic(CallInst *CI, GenXIntrinsic::ID GenXID,
                           bool IsHalfAllowed = false);
   bool lowerFastMathIntrinsic(CallInst *CI, GenXIntrinsic::ID GenXID);
-  bool lowerSlmInit(CallInst *CI);
   bool lowerStackSave(CallInst *CI);
   bool lowerStackRestore(CallInst *CI);
   bool lowerHardwareThreadID(CallInst *CI);
@@ -830,6 +828,7 @@ bool GenXLowering::splitGatherScatter(CallInst *CI, unsigned IID) {
     PredIdx = 0;
     AddrIdx = 1;
     AtomicNumSrc = 0;
+    break;
   case GenXIntrinsic::genx_svm_atomic_add:
   case GenXIntrinsic::genx_svm_atomic_and:
   case GenXIntrinsic::genx_svm_atomic_fmax:
@@ -1885,17 +1884,16 @@ bool GenXLowering::processInst(Instruction *Inst) {
       IntrinsicID = vc::getAnyIntrinsicID(Callee);
       IGC_ASSERT(IGCLLVM::getNumArgOperands(CI) < GenXIntrinsicInfo::OPNDMASK);
     }
-    if (ST) {
-      // use gather/scatter to implement SLM oword load/store on
-      // legacy platforms
-      if (!ST->hasSLMOWord()) {
-        if (translateSLMOWord(CI, IntrinsicID))
-          return true;
-      }
-      if (ST->getGRFByteSize() > 32) {
-        if (widenSIMD8GatherScatter(CI, IntrinsicID))
-          return true;
-      }
+    IGC_ASSERT_EXIT(ST);
+    // use gather/scatter to implement SLM oword load/store on
+    // legacy platforms
+    if (!ST->hasSLMOWord()) {
+      if (translateSLMOWord(CI, IntrinsicID))
+        return true;
+    }
+    if (ST->getGRFByteSize() > 32) {
+      if (widenSIMD8GatherScatter(CI, IntrinsicID))
+        return true;
     }
     // split gather/scatter/atomic into the width legal to the target
     if (splitGatherScatter(CI, IntrinsicID))
@@ -1967,8 +1965,6 @@ bool GenXLowering::processInst(Instruction *Inst) {
       return lowerGenXIMad(CI, IntrinsicID);
     case GenXIntrinsic::genx_lzd:
       return lowerLzd(Inst);
-    case GenXIntrinsic::genx_slm_init:
-      return lowerSlmInit(CI);
     case Intrinsic::debugtrap:
       return lowerDebugTrap(CI);
     case Intrinsic::trap:
@@ -2057,9 +2053,6 @@ bool GenXLowering::processInst(Instruction *Inst) {
     return lowerExtractValue(EV);
   if (InsertValueInst *IV = dyn_cast<InsertValueInst>(Inst))
     return lowerInsertValue(IV);
-  if (isa<AllocaInst>(Inst) && !ST->isOCLRuntime())
-    Inst->getContext().emitError(
-        Inst, "GenX backend cannot handle allocas with CMRT yet");
   return false;
 }
 
@@ -3648,8 +3641,23 @@ bool GenXLowering::lowerGenXMul(CallInst *CI, unsigned IID) {
   ToErase.push_back(CI);
   return true;
 }
-// Lower integer mul with saturation since VISA support mul.sat only for float.
+
+// Lower integer DWxDW mul with saturation since it is not supported on HW.
 bool GenXLowering::lowerGenXMulSat(CallInst *CI, unsigned IntrinsicID) {
+  Type *ResType = CI->getType();
+  IGC_ASSERT(ResType->isIntOrIntVectorTy());
+
+  IGC_ASSERT(CI->getOperand(0)->getType() == CI->getOperand(1)->getType());
+  Type *OpType = CI->getOperand(0)->getType();
+  IGC_ASSERT(OpType->isIntOrIntVectorTy());
+
+  unsigned OpTypeWidth =
+      cast<IntegerType>(OpType->getScalarType())->getBitWidth();
+  IGC_ASSERT_MESSAGE(OpTypeWidth != 64, "i64 types are not supported");
+
+  if (OpTypeWidth != 32)
+    return false;
+
   auto IsSignedMulSat = [](unsigned ID) -> std::pair<bool, bool> {
     switch (ID) {
     case GenXIntrinsic::genx_uumul_sat:
@@ -3674,17 +3682,7 @@ bool GenXLowering::lowerGenXMulSat(CallInst *CI, unsigned IntrinsicID) {
 
   auto [IsSignedRes, IsSignedOps] = IsSignedMulSat(IntrinsicID);
 
-  Type *ResType = CI->getType();
-  IGC_ASSERT(ResType->isIntOrIntVectorTy());
-
-  IGC_ASSERT(CI->getOperand(0)->getType() == CI->getOperand(1)->getType());
-  Type *OpType = CI->getOperand(0)->getType();
-  IGC_ASSERT(OpType->isIntOrIntVectorTy());
-
   // Create type that doesn't overflow in multiplication.
-  unsigned OpTypeWidth =
-      cast<IntegerType>(OpType->getScalarType())->getBitWidth();
-  IGC_ASSERT_MESSAGE(OpTypeWidth != 64, "i64 types are not supported");
   Type *MulType = IntegerType::get(OpType->getContext(), 2 * OpTypeWidth);
   if (auto *OpVTy = dyn_cast<IGCLLVM::FixedVectorType>(OpType))
     MulType = IGCLLVM::FixedVectorType::get(MulType, OpVTy->getNumElements());
@@ -4334,33 +4332,6 @@ bool GenXLowering::lowerFastMathIntrinsic(CallInst *CI,
   return lowerMathIntrinsic(CI, GenXID, /*IsHalfAllowed=*/true);
 }
 
-bool GenXLowering::lowerSlmInit(CallInst *CI) {
-  auto *BB = CI->getParent();
-  auto *F = BB->getParent();
-  if (F->getCallingConv() != CallingConv::SPIR_KERNEL) {
-    vc::fatal(CI->getContext(), "GenXLowering",
-              "SLM init call is supported only in kernels", CI);
-  }
-
-  auto *V = dyn_cast<ConstantInt>(CI->getArgOperand(0));
-  if (!V) {
-    vc::fatal(CI->getContext(), "GenXLowering",
-              "Cannot reserve non-constant amount of SLM", CI);
-  }
-
-  unsigned SLMSize = V->getValue().getZExtValue();
-
-  vc::KernelMetadata MD{F};
-
-  if (SLMSize > MD.getSLMSize()) {
-    MD.updateSLMSizeMD(SLMSize);
-  }
-
-  ToErase.push_back(CI);
-
-  return true;
-}
-
 bool GenXLowering::lowerStackSave(CallInst *CI) {
   IRBuilder<> IRB{CI};
 
@@ -4409,7 +4380,7 @@ bool GenXLowering::lowerHardwareThreadID(CallInst *CI) {
 
   if (!ST->getsHWTIDFromPredef()) {
     // Drop reserved bits
-    for (auto [Offset, Width] : ST->getThreadIdReservedBits()) {
+    for (auto &[Offset, Width] : ST->getThreadIdReservedBits()) {
       auto Mask = (1 << Offset) - 1;
 
       // res = (src & mask) | ((src >> width) & ~mask)
@@ -4432,7 +4403,7 @@ static Value *extractBitfields(IRBuilder<> &IRB, Value *To, Value *From,
                                ArrayRef<std::pair<int, int>> Fields,
                                int &InsertTo) {
   auto *Ty = From->getType();
-  for (auto [Offset, Width] : Fields) {
+  for (auto &[Offset, Width] : Fields) {
     auto Mask = ((1 << Width) - 1) << Offset;
     auto Shift = Offset - InsertTo;
 
@@ -4486,6 +4457,7 @@ bool GenXLowering::lowerLogicalThreadID(CallInst *CI) {
 
   if (!isPowerOf2_32(NumThreads)) {
     IGC_ASSERT_EXIT(Res);
+    IGC_ASSERT_EXIT(TID);
     auto *Mul = IRB.CreateMul(Res, ConstantInt::get(Ty, NumThreads));
     Res = IRB.CreateAdd(Mul, TID);
   }

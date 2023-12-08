@@ -124,6 +124,27 @@ enum class AddrType {
 };
 std::string ToSymbol(AddrType op);
 
+// documentation reference
+struct DocRef {
+  enum Kind {
+    INVALID = 0,
+    //
+    DST,  // load or atomic payload
+    SRC0, // headers/addresses etc...
+    SRC1, // store/atomic payload
+    //
+    MSGOP,  // the message opcode (always bits of the descriptor)
+    DESC,   // descriptor
+    EXDESC, // extended descriptor (imm or reg)
+  } kind;
+  // the documentation symbol name corresponding to this
+  const char *symbol;
+  const char *link;
+  constexpr DocRef() : DocRef(DocRef::INVALID, nullptr, nullptr) {}
+  constexpr DocRef(Kind _kind, const char *sym, const char *lnk)
+      : kind(_kind), symbol(sym), link(lnk) {}
+};
+
 ///////////////////////////////////////////////////////////////////////////
 // Generic processing of basic buffer messages.   This includes data port
 // vector reads and writes as well block and atomic messages.  There may be
@@ -246,7 +267,8 @@ struct MessageInfo {
   // to change at any time. The nullptr is a possible value.
   std::string description;
 
-  const char *docs[4] = {nullptr, nullptr, nullptr, nullptr};
+  // documentation references
+  std::vector<DocRef> refs;
   //
   // A block message
   bool isBlock() const { return execWidth == 1 && (isLoad() || isStore()); }
@@ -390,8 +412,15 @@ DecodeResult tryDecode(const Instruction &inst, DecodedDescFields *fields);
 
 // Attempts to decode the descriptor for send instructions
 DecodeResult tryDecode(Platform p, SFID sfid, ExecSize execSize,
+                       uint32_t exImmOffDesc,
                        SendDesc exDesc, SendDesc desc,
                        DecodedDescFields *fields);
+
+static inline DecodeResult tryDecode(Platform p, SFID sfid, ExecSize execSize,
+                                     SendDesc exDesc, SendDesc desc,
+                                     DecodedDescFields *fields) {
+  return tryDecode(p, sfid, execSize, 0, exDesc, desc, fields);
+}
 
 
 //
@@ -456,7 +485,8 @@ struct VectorMessageArgs {
 }; // VectorMessageArgs
 
 bool encodeDescriptors(Platform p, const VectorMessageArgs &vma,
-                       SendDesc &exDesc, SendDesc &desc, std::string &err);
+                       uint32_t &exImmOffDesc, SendDesc &exDesc, SendDesc &desc,
+                       std::string &err);
 } // namespace iga
 
 #endif

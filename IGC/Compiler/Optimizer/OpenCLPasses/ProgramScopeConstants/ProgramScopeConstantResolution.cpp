@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2017-2021 Intel Corporation
+Copyright (C) 2017-2023 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -132,8 +132,10 @@ bool ProgramScopeConstantResolution::runOnModule(Module& M)
 
         // Get the offset of this constant from the base.
         int64_t offset = bufferOffset->second;
-        ConstantInt* pOffset = ConstantInt::get(Type::getInt64Ty(C), offset);
+        if (offset == -1)
+            continue;
 
+        ConstantInt* pOffset = ConstantInt::get(Type::getInt64Ty(C), offset);
         const ImplicitArg::ArgType argType =
             AS == ADDRESS_SPACE_GLOBAL ? ImplicitArg::GLOBAL_BASE : ImplicitArg::CONSTANT_BASE;
 
@@ -174,8 +176,7 @@ bool ProgramScopeConstantResolution::runOnModule(Module& M)
             unsigned int ImplicitArgsBaseIndex = userFunc->arg_size() - implicitArgs.size();
             unsigned int implicitArgIndex = implicitArgs.getArgIndex(argType);
             unsigned int implicitArgIndexInFunc = ImplicitArgsBaseIndex + implicitArgIndex;
-            Function::arg_iterator bufArg = userFunc->arg_begin();
-            for (unsigned int i = 0; i < implicitArgIndexInFunc; ++i, ++bufArg);
+            Function::arg_iterator bufArg = std::next(userFunc->arg_begin(), implicitArgIndexInFunc);
 
             if (!funcToVarSet[userFunc].count(pGlobalVar))
             {

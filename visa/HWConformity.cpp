@@ -851,7 +851,7 @@ bool HWConformity::hasSameSubregOffset(G4_INST *inst,
 // -- ARF may not be in src1
 void HWConformity::fixImmAndARFSrc(INST_LIST_ITER it, G4_BB *bb) {
   G4_INST *inst = *it;
-  if (inst->mayExceedTwoGRF()) {
+  if (inst->isSend() || inst->isDpas()) {
     return;
   }
 
@@ -1102,7 +1102,7 @@ bool HWConformity::fixOpndType(INST_LIST_ITER it, G4_BB *bb) {
   bool has_float = false;
   bool has_int = false;
 
-  if (inst->mayExceedTwoGRF() || inst->opcode() == G4_smov) {
+  if (inst->isSend() || inst->isDpas() || inst->opcode() == G4_smov) {
     // skip special instructions
     return false;
   }
@@ -1367,7 +1367,7 @@ void HWConformity::fixAlign13SrcInst(INST_LIST_ITER iter, G4_BB *bb) {
 
 void HWConformity::fix3SrcInst(INST_LIST_ITER iter, G4_BB *bb) {
   G4_INST *inst = *iter;
-  if (inst->getNumSrc() != 3 || inst->mayExceedTwoGRF() ||
+  if (inst->getNumSrc() != 3 || inst->isSend() || inst->isDpas() ||
       inst->opcode() == G4_madm) {
     return;
   }
@@ -1898,7 +1898,7 @@ bool HWConformity::fixIndirectSrcForCompressedInst(INST_LIST_ITER i, G4_BB *bb) 
     return false;
 
   G4_INST *inst = *i;
-  if (inst->mayExceedTwoGRF() || inst->opcode() == G4_nop ||
+  if (inst->isSend() || inst->isDpas() || inst->opcode() == G4_nop ||
       inst->opcode() == G4_madm || inst->isLabel() ||
       inst->isIntrinsic())
     return false;
@@ -2387,7 +2387,7 @@ bool HWConformity::fixMULInst(INST_LIST_ITER &i, G4_BB *bb) {
     return false;
   }
 
-  if (builder.hasMacl() && !IS_QTYPE(dst->getType()) &&
+  if (builder.hasMacMacl() && !IS_QTYPE(dst->getType()) &&
       (builder.noDwDstForDwordMul() || inst->getExecSize() > g4::SIMD1)) {
     // use macl for D = D x D. We use macl when possible
     // except on scalar inst on platforms that support native DMul
@@ -3340,7 +3340,7 @@ bool HWConformity::fix64bInst(INST_LIST_ITER iter, G4_BB *bb) {
   bool isDWMultiply = false;
   uint8_t execSize = inst->getExecSize();
 
-  if (inst->mayExceedTwoGRF()) {
+  if (inst->isSend() || inst->isDpas()) {
     return false;
   }
   if (inst->getDst() && inst->getDst()->getTypeSize() == 8) {
@@ -4230,6 +4230,8 @@ bool HWConformity::generateAlign1Mad(G4_BB *bb, INST_LIST_ITER iter) {
 
   // check src
   bool canBeImm = true;
+  bool anyByteSrc = false;
+  bool allByteSrc = true;
   for (int k = inst->getNumSrc() - 1; k >= 0; k--) {
     G4_Operand *src = inst->getSrc(k);
     if (!isGoodAlign1TernarySrc(inst, k, canBeImm)) {
@@ -4277,6 +4279,23 @@ bool HWConformity::generateAlign1Mad(G4_BB *bb, INST_LIST_ITER iter) {
     } else {
       if (src->isImm()) {
         canBeImm = false;
+      }
+    }
+    if (IS_BTYPE(inst->getSrc(k)->getType())) {
+      anyByteSrc = true;
+    }
+    else {
+      allByteSrc = false;
+    }
+  }
+
+  if (anyByteSrc && !(allByteSrc && IS_WTYPE(inst->getDst()->getType()))) {
+    for (int k = inst->getNumSrc() - 1; k >= 0; k--) {
+      G4_Operand *src = inst->getSrc(k);
+      G4_Type srcType = src->getType();
+      if (IS_BTYPE(srcType)) {
+        G4_Type newSrcType = IS_UNSIGNED_INT(srcType) ? Type_UW : Type_W;
+        inst->setSrc(insertMovBefore(iter, k, newSrcType, bb), k);
       }
     }
   }
@@ -5318,7 +5337,7 @@ void HWConformity::avoidInstDstSrcOverlap(INST_LIST_ITER it, G4_BB *bb,
                                           PointsToAnalysis &p) {
   G4_INST *inst = *it;
 
-  if (inst->mayExceedTwoGRF() || inst->opcode() == G4_nop ||
+  if (inst->isSend() || inst->isDpas() || inst->opcode() == G4_nop ||
       inst->opcode() == G4_madm || inst->isLabel()) {
     return;
   }
@@ -5430,6 +5449,10 @@ void HWConformity::avoidInstDstSrcOverlap(INST_LIST_ITER it, G4_BB *bb,
       newDst->setAccRegSel(accSel);
       inst->setDest(newDst);
     }
+  }
+
+  if (!builder.supportFloatOr64bRegioning()) {
+    fixUnalignedRegions(it, bb);
   }
 }
 
@@ -5591,8 +5614,7 @@ void HWConformity::conformBB(G4_BB *bb) {
         VISA_WA_CHECK(builder.getPWaTable(), Wa_1608127078))
       fixCalla(i, bb);
 
-    if ((inst->mayExceedTwoGRF() && !inst->isSend()) || opcode == G4_nop ||
-        opcode == G4_label) {
+    if (opcode == G4_nop || opcode == G4_label) {
       continue;
     }
 
@@ -6230,7 +6252,7 @@ void HWConformity::fixBFMixedMode() {
       //    (isBFAllowedInst should be still valid to check if any new
       //    instruction
       //     from splitting is BF allowed or not.)
-      for (auto LI : instsToCheck) {
+      for (const auto &LI : instsToCheck) {
         INST_LIST_ITER thisII = LI;
         G4_INST *tI = *thisII;
         for (int i = 0, nsrc = (int)tI->getNumSrc(); i < nsrc; ++i) {
@@ -6979,7 +7001,7 @@ bool HWConformity::markPackedByteReference(G4_Kernel &kernel, G4_Operand *opnd,
 
   if (topdcl != NULL && topdcl->getRegFile() == G4_GRF &&
       !(topdcl->getAddressed())) {
-    if (topdcl->doNotWiden() || inst->mayExceedTwoGRF()) {
+    if (topdcl->doNotWiden() || inst->isSend() || inst->isDpas()) {
       // send has no regioning so it is certainly illegal to change data layout
       setAccessPattern(topdcl, ACCESS_PATTERN_INVALID);
       return false;
@@ -7524,9 +7546,6 @@ void HWConformity::helperGenerateTempDst(G4_BB *bb, INST_LIST_ITER instIter,
   // create a move to dst.
 
   uint32_t numElt = execSize == 1 ? 1 : execSize * hStride;
-  if (numElt > 1 && isLowPrecisionFloatTy(tempDstType) && hStride == 1 &&
-      subAlign < Eight_Word)
-    subAlign = Eight_Word;
   subAlign = getDclAlignment(dstSize, inst, execSize == 1);
 
   G4_Declare *dcl = builder.createTempVar(numElt, tempDstType, subAlign);
@@ -7596,7 +7615,7 @@ void HWConformity::fixMixedHFInst(G4_BB *bb) {
   for (auto instIter = bb->begin(); instIter != bb->end(); ++instIter) {
     G4_INST *inst = *instIter;
 
-    if (inst->mayExceedTwoGRF() || !inst->getDst()) {
+    if (inst->isSend() || inst->isDpas() || !inst->getDst()) {
       continue;
     }
 

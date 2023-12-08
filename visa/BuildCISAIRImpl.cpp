@@ -15,7 +15,6 @@ SPDX-License-Identifier: MIT
 #else
 #include "JitterDataStruct.h"
 #endif
-#include "BinaryCISAEmission.h"
 #include "BinaryEncoding.h"
 #include "IsaDisassembly.h"
 #include "Timer.h"
@@ -53,8 +52,6 @@ using namespace vISA;
   (mBuildOption == VISA_BUILDER_VISA || mBuildOption == VISA_BUILDER_BOTH)
 
 CISA_IR_Builder::~CISA_IR_Builder() {
-  m_cisaBinary->~CisaBinary();
-
   for (auto k : m_kernelsAndFunctions) {
     // don't call delete since vISAKernelImpl is allocated in memory pool
     k->~VISAKernelImpl();
@@ -673,6 +670,25 @@ void CISA_IR_Builder::LinkTimeOptimization(
   unsigned int raUID = 0;
   unsigned int funcUID = 0;
 
+  auto initializeRedirectMap = [&](
+      IR_Builder *callee,
+      IR_Builder *caller,
+      std::map<G4_Declare*, G4_Declare*> &redirectMap) {
+    redirectMap.insert(std::make_pair(callee->getFE_SP(), caller->getFE_SP()));
+    redirectMap.insert(std::make_pair(callee->getFE_FP(), caller->getFE_FP()));
+    redirectMap.insert(std::make_pair(callee->getStackCallArg(), caller->getStackCallArg()));
+    redirectMap.insert(std::make_pair(callee->getStackCallRet(), caller->getStackCallRet()));
+    redirectMap.insert(std::make_pair(callee->getRealR0(), caller->getRealR0()));
+    redirectMap.insert(std::make_pair(callee->getBuiltinR0(), caller->getBuiltinR0()));
+    redirectMap.insert(std::make_pair(callee->getBuiltinA0(), caller->getBuiltinA0()));
+    redirectMap.insert(std::make_pair(callee->getBuiltinA0Dot2(), caller->getBuiltinA0Dot2()));
+    redirectMap.insert(std::make_pair(callee->getBuiltinHWTID(), caller->getBuiltinHWTID()));
+    redirectMap.insert(std::make_pair(callee->getBuiltinT252(), caller->getBuiltinT252()));
+    redirectMap.insert(std::make_pair(callee->getBuiltinBindlessSampler(), caller->getBuiltinBindlessSampler()));
+    redirectMap.insert(std::make_pair(callee->getBuiltinSamplerHeader(), caller->getBuiltinSamplerHeader()));
+    redirectMap.insert(std::make_pair(callee->getBuiltinScratchSurface(), caller->getBuiltinScratchSurface()));
+  };
+
   // append instructions from callee to caller
   for (auto &[callee, sgInvokeList] : callee2Callers) {
     G4_Declare *replacedArgDcl = nullptr;
@@ -683,6 +699,10 @@ void CISA_IR_Builder::LinkTimeOptimization(
       vASSERT(fcall->opcode() == G4_pseudo_fcall);
       G4_Kernel *caller = GetCallerKernel(fcall);
       G4_Kernel *callee = GetCalleeKernel(fcall);
+
+      std::map<G4_Declare*, G4_Declare*> redirectMap;
+      initializeRedirectMap(callee->fg.builder, caller->fg.builder, redirectMap);
+
       bool inlining = (options & (1U << Linker_Inline));
       bool removeArgRet = (options & (1U << Linker_RemoveArgRet));
       bool removeStackArg = (options & (1U << Linker_RemoveStackArg)) && caller->fg.builder->hasInt64Add();
@@ -1096,6 +1116,20 @@ void CISA_IR_Builder::LinkTimeOptimization(
       }
 
       std::map<G4_Declare *, G4_Declare *> newDclMap;
+
+      auto redirectBuiltin = [&](
+          G4_Operand *opd,
+          G4_Declare *dcl,
+          G4_Declare *redirectDcl) {
+        G4_Declare *newDcl =
+          caller->fg.builder->cloneDeclare(newDclMap, dcl);
+        opd->setTopDcl(redirectDcl);
+        opd->setBase(newDcl->getRegVar());
+        newDcl->setAliasDeclare(redirectDcl,
+            newDcl->getAliasOffset());
+
+      };
+
       auto cloneDcl = [&](G4_Operand *opd) {
         if (opd) {
           G4_Declare *topDcl = opd->getTopDcl();
@@ -1108,42 +1142,15 @@ void CISA_IR_Builder::LinkTimeOptimization(
           if (avoidCloning.find(topDcl) != avoidCloning.end())
             return;
           G4_Declare *dcl = var->getDeclare();
-          if (topDcl && topDcl == callee->fg.builder->getFE_SP()) {
-            G4_Declare *newDcl =
-                caller->fg.builder->cloneDeclare(newDclMap, dcl);
-            opd->setTopDcl(caller->fg.builder->getFE_SP());
-            opd->setBase(newDcl->getRegVar());
-            newDcl->setAliasDeclare(caller->fg.builder->getFE_SP(),
-                                    newDcl->getAliasOffset());
-          } else if (topDcl && topDcl == callee->fg.builder->getFE_FP()) {
-            G4_Declare *newDcl =
-                caller->fg.builder->cloneDeclare(newDclMap, dcl);
-            opd->setTopDcl(caller->fg.builder->getFE_FP());
-            opd->setBase(newDcl->getRegVar());
-            newDcl->setAliasDeclare(caller->fg.builder->getFE_FP(),
-                                    newDcl->getAliasOffset());
-          } else if (topDcl &&
-                     topDcl == callee->fg.builder->getStackCallArg()) {
-            G4_Declare *newDcl =
-                caller->fg.builder->cloneDeclare(newDclMap, dcl);
-            opd->setTopDcl(caller->fg.builder->getStackCallArg());
-            opd->setBase(newDcl->getRegVar());
-            newDcl->setAliasDeclare(caller->fg.builder->getStackCallArg(),
-                                    newDcl->getAliasOffset());
-          } else if (topDcl &&
-                     topDcl == callee->fg.builder->getStackCallRet()) {
-            G4_Declare *newDcl =
-                caller->fg.builder->cloneDeclare(newDclMap, dcl);
-            opd->setTopDcl(caller->fg.builder->getStackCallRet());
-            opd->setBase(newDcl->getRegVar());
-            newDcl->setAliasDeclare(caller->fg.builder->getStackCallRet(),
-                                    newDcl->getAliasOffset());
+          if (topDcl && redirectMap.find(topDcl) != redirectMap.end()) {
+            redirectBuiltin(opd, dcl, redirectMap[topDcl]);
           } else if (topDcl &&
                      (topDcl == replacedArgDcl || topDcl == replacedRetDcl)) {
             G4_Declare *newDcl = caller->fg.builder->createTempVar(
                 dcl->getTotalElems(), dcl->getElemType(), Any, dcl->getName());
             newDcl->setAliasDeclare(topDcl, dcl->getAliasOffset());
           } else {
+            vASSERT(!topDcl || !topDcl->isBuiltin());
             G4_Declare *newDcl =
                 caller->fg.builder->cloneDeclare(newDclMap, dcl);
             if (opd->isAddrExp()) {
@@ -1394,9 +1401,6 @@ static void Stitch_Compiled_Units(G4_Kernel *mainFunc,
           mainFunc->getRelocationTable().end(),
           callee->getRelocationTable().begin(),
           callee->getRelocationTable().end());
-
-    vISA_ASSERT(mainFunc->getNumRegTotal() == callee->getNumRegTotal(),
-                "caller and callee cannot have different GRF modes");
   }
 
   mainFunc->fg.reassignBlockIDs();
@@ -1477,9 +1481,9 @@ static void Stitch_Compiled_Units(G4_Kernel *mainFunc,
   }
 
   // Append declarations and color attributes from all callees to mainFunc
-  for (auto iter : subFuncs) {
+  for (const auto &iter : subFuncs) {
     G4_Kernel *callee = iter.second;
-    for (auto curDcl : callee->Declares) {
+    for (const auto &curDcl : callee->Declares) {
       mainFunc->Declares.push_back(curDcl);
     }
   }
@@ -1575,37 +1579,15 @@ int CISA_IR_Builder::Compile(const char *isaasmFileName, bool emit_visa_only) {
   stopTimer(TimerID::BUILDER);
   int status = VISA_SUCCESS;
 
-  // TODO: remove vISA binary emission code.
-  const bool emitVISABinary = false;
   if (IS_VISA_BOTH_PATH) {
     if (m_builderMode == vISA_ASM_WRITER) {
       vISA_ASSERT(false, "Should not be calling Compile() in asm text writer mode!");
       return VISA_FAILURE;
     }
-    if (emitVISABinary) {
-      if (IS_BOTH_PATH)
-        m_options.setOptionInternally(vISA_NumGenBinariesWillBePatched, 1u);
-      m_cisaBinary->initCisaBinary(m_kernel_count, m_function_count);
-      m_cisaBinary->setMajorVersion((unsigned char)m_header.major_version);
-      m_cisaBinary->setMinorVersion((unsigned char)m_header.minor_version);
-      m_cisaBinary->setMagicNumber(COMMON_ISA_MAGIC_NUM);
-    }
 
-    CBinaryCISAEmitter cisaBinaryEmitter;
     int status = VISA_SUCCESS;
     for (auto func : m_kernelsAndFunctions) {
       func->finalizeAttributes();
-      if (emitVISABinary) {
-        unsigned int binarySize = 0;
-        status = cisaBinaryEmitter.Emit(func, binarySize);
-        m_cisaBinary->initKernel(func);
-      }
-    }
-    if (emitVISABinary)
-      m_cisaBinary->finalizeCisaBinary();
-
-    if (status != VISA_SUCCESS) {
-      return status;
     }
 
     if (m_options.getOption(vISA_GenerateISAASM) ||
@@ -2431,8 +2413,8 @@ bool CISA_IR_Builder::CISA_implicit_input_directive(const char *argName,
     auto implicitInputName =
         implicitArgName.substr(implicitStr.length(), implicitArgName.length());
     for (; numVal < IMPLICIT_INPUT_COUNT; ++numVal) {
-      if (!implicitInputName.compare(
-              input_info_t::getImplicitKindString(numVal))) {
+      if (!implicitInputName.compare(implictKindStrings[numVal])) {
+        numVal = implictKindValues[numVal];
         break;
       }
     }
@@ -2444,8 +2426,8 @@ bool CISA_IR_Builder::CISA_implicit_input_directive(const char *argName,
     RecordParseError(lineNum, varName, ": undefined variable");
     return false;
   }
-  status = m_kernel->CreateVISAImplicitInputVar((VISA_GenVar *)temp, offset,
-                                                size, numVal);
+  status = m_kernel->CreateVISAImplicitInputVar(
+      (VISA_GenVar *)temp, offset, size, numVal);
   if (status != VISA_SUCCESS) {
     RecordParseError(lineNum, "failed to create input variable");
     return false;
@@ -3295,10 +3277,12 @@ bool CISA_IR_Builder::CISA_create_rtwrite_3d_instruction(
     A = operands[counter++];
   }
 
-  VISA_StateOpndHandle *surface =
-      CISA_get_surface_variable(surfaceName, lineNum);
-  if (!surface)
-    return false; // error recorded
+  VISA_StateOpndHandle* surface = nullptr;
+  if (surfaceName != nullptr) {
+    surface = CISA_get_surface_variable(surfaceName, lineNum);
+    if (!surface)
+      return false; // error recorded
+  }
 
   uint8_t numMsgSpecificOpnd = 0;
   VISA_RawOpnd *rawOpnds[20];
@@ -3394,21 +3378,26 @@ bool CISA_IR_Builder::create3DLoadInstruction(
   VISA_RESULT_CALL_TO_BOOL(status);
   return true;
 }
+
 bool CISA_IR_Builder::create3DSampleInstruction(
     VISA_opnd *pred, VISASampler3DSubOpCode subOpcode, bool pixelNullMask,
     bool cpsEnable, bool uniformSampler, ChannelMask channels,
     VISA_EMask_Ctrl emask, unsigned exec_size, VISA_opnd *aoffimmi,
-    const char *samplerName, const char *surfaceName,
+    const char *samplerName, unsigned int samplerIdx,
+    const char *surfaceName, unsigned int surfaceIdx,
     VISA_opnd *dst, unsigned int numParameters, VISA_RawOpnd **params,
     int lineNum) {
-  VISA_StateOpndHandle *surface =
-      CISA_get_surface_variable(surfaceName, lineNum);
+  VISA_StateOpndHandle *surface = nullptr;
+  vISA_ASSERT_INPUT(samplerIdx == 0 && surfaceIdx == 0,
+      "sampler and surface index must be 0");
+
+  surface = CISA_get_surface_variable(surfaceName, lineNum);
   if (!surface) {
     return false; // error already reported
   }
 
-  VISA_StateOpndHandle *sampler =
-      CISA_get_sampler_variable(samplerName, lineNum);
+  VISA_StateOpndHandle *sampler = nullptr;
+  sampler = CISA_get_sampler_variable(samplerName, lineNum);
   if (!sampler) {
     return false; // error already reported
   }
@@ -3418,11 +3407,12 @@ bool CISA_IR_Builder::create3DSampleInstruction(
   int status = m_kernel->AppendVISA3dSampler(
       subOpcode, pixelNullMask, cpsEnable, uniformSampler,
       (VISA_PredOpnd *)pred, emask, executionSize, channels.getAPI(),
-      (VISA_VectorOpnd *)aoffimmi, sampler, surface,
+      (VISA_VectorOpnd *)aoffimmi, sampler, samplerIdx, surface, surfaceIdx,
       (VISA_RawOpnd *)dst, numParameters, params);
   VISA_RESULT_CALL_TO_BOOL(status);
   return true;
 }
+
 bool CISA_IR_Builder::CISA_create_sample_instruction(
     ISA_Opcode opcode, ChannelMask channel, int simd_mode,
     const char *samplerName, const char *surfaceName, VISA_opnd *u_opnd,
@@ -4090,6 +4080,16 @@ bool CISA_IR_Builder::CISA_create_lsc_typed_inst(
                     static_cast<VISA_RawOpnd *>(src1_data),
                     static_cast<VISA_RawOpnd *>(src2_data));
   return true;
+}
+
+LSC_CACHE_OPTS CISA_IR_Builder::CISA_create_caching_opts(int lineNum) {
+  return LSC_CACHE_OPTS(LSC_CACHING_DEFAULT, LSC_CACHING_DEFAULT);
+}
+
+LSC_CACHE_OPTS CISA_IR_Builder::CISA_create_caching_opts(LSC_CACHE_OPT l1,
+                                                         LSC_CACHE_OPT l3,
+                                                         int lineNum) {
+  return LSC_CACHE_OPTS(l1, l3);
 }
 
 bool CISA_IR_Builder::CISA_create_lsc_fence(LSC_SFID sfid, LSC_FENCE_OP fence,

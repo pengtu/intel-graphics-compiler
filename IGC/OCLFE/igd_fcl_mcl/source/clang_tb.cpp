@@ -1330,6 +1330,7 @@ namespace TC
                             (strcmp(pParam, "-igc_opts") == 0) || //temporary options
                             (strcmp(pParam, "-cl-intel-gtpin-rera") == 0) || //temporary options
                             (strcmp(pParam, "-cl-intel-256-GRF-per-thread") == 0) || //temporary options
+                            (strcmp(pParam, "-ze-opt-256-GRF-per-thread") == 0) || //temporary options
                             (strcmp(pParam, "-ze-opt-large-register-file") == 0) || //temporary options
                             (strcmp(pParam, "-ze-opt-disable-recompilation") == 0) || //temporary options
                             (strcmp(pParam, "-cl-intel-num-thread-per-eu") == 0) || //temporary options
@@ -1347,8 +1348,6 @@ namespace TC
                             (strcmp(pParam, "-ze-opt-has-buffer-offset-arg") == 0) || //temporary options
                             (strcmp(pParam, "-cl-intel-buffer-offset-arg-required") == 0) || //temporary options
                             (strcmp(pParam, "-ze-opt-buffer-offset-arg-required") == 0) || //temporary options
-                            (strcmp(pParam, "-cl-intel-has-subDW-aligned-ptr-arg") == 0) || //temporary options
-                            (strcmp(pParam, "-ze-opt-has-subDW-aligned-ptr-arg") == 0) || //temporary options
                             (strcmp(pParam, "-cl-force-global-mem-allocation") == 0) || // temp
                             (strcmp(pParam, "-ze-force-global-mem-allocation") == 0) || // temp
                             (strcmp(pParam, "-cl-no-local-to-generic") == 0) || // temp
@@ -1981,7 +1980,7 @@ namespace TC
         }
 
         unsigned int i;
-        for (i = 0; i < sizeof(g_cClangTranslationCodes) / sizeof(g_cClangTranslationCodes[0]); i++)
+        for (i = 0; i < std::size(g_cClangTranslationCodes); i++)
         {
             // Some quick checks to ensure that the input and output types
             // are compatible with this translation blocks
@@ -1992,7 +1991,7 @@ namespace TC
             }
         }
 
-        if (i >= sizeof(g_cClangTranslationCodes) / sizeof(g_cClangTranslationCodes[0]))
+        if (i >= std::size(g_cClangTranslationCodes))
         {
             return false;
         }

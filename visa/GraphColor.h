@@ -46,6 +46,8 @@ enum BankConflict {
   BANK_CONFLICT_SECOND_HALF_ODD
 };
 
+class VarSplit;
+
 class BankConflictPass {
 private:
   GlobalRA &gra;
@@ -776,6 +778,8 @@ public:
     return nullptr;
   }
 
+  size_t numVarsWithWeakEdges() const { return compatibleSparseIntf.size(); }
+
   void init() {
     if (useDenseMatrix()) {
       auto N = (size_t)rowSize * (size_t)maxId;
@@ -887,6 +891,53 @@ class GraphColor {
 
   unsigned edgeWeightGRF(const LiveRange *lr1, const LiveRange *lr2);
   unsigned edgeWeightARF(const LiveRange *lr1, const LiveRange *lr2);
+  static unsigned edgeWeightGRF(bool lr1EvenAlign, bool lr2EvenAlign,
+                                unsigned lr1_nreg, unsigned lr2_nreg) {
+    if (!lr1EvenAlign) {
+      return lr1_nreg + lr2_nreg - 1;
+    }
+
+    unsigned sum = lr1_nreg + lr2_nreg;
+    if (!lr2EvenAlign)
+      return sum + 1 - ((sum) % 2);
+
+    return sum - 1 + (lr1_nreg % 2) + (lr2_nreg % 2);
+  }
+
+  static unsigned edgeWeightWith4GRF(int lr1Align, int lr2Align,
+                                     unsigned lr1_nreg, unsigned lr2_nreg) {
+    if (lr1Align < 4 && lr2Align < 4)
+      return edgeWeightGRF(lr1Align % 2, lr2Align % 2, lr1_nreg, lr2_nreg);
+
+    if (lr2Align == 4) {
+      if (lr1Align < 2)
+        return lr1_nreg + lr2_nreg - 1;
+      if (lr1Align == 2) {
+        // if (lr2_nreg % 2 == 0) -- lr2 size is even
+        // return lr2_nreg + lr1_nreg;
+        // if (lr2_nreg % 2 == 1) -- lr2 size is odd
+        // return lr2_nreg + lr1_nreg + 1;
+
+        return lr1_nreg + lr2_nreg + (lr2_nreg % 2);
+      } else if (lr1Align == 4) {
+        if (lr2_nreg % 4 == 0)
+          // lr2 size is multiple of 4
+          return lr1_nreg + lr2_nreg;
+
+        // if lr2_nreg % 4 == 1 --  lr2 size is 1 + (4*n)
+        // return lr1_nreg + lr2_nreg + 3;
+        // if lr2_nreg % 2 == 0 -- lr2 size is 2 + (4*n)
+        // return lr2_nreg + lr1_nreg + 2;
+        // if lr2_nreg % 4 == 3 -- lr2 size is 3 + (4*n)
+        // return lr2_nreg + lr1_nreg + 1;
+
+        return lr1_nreg + lr2_nreg + 4 - (lr2_nreg % 4);
+      }
+    }
+
+    vISA_ASSERT(lr1Align == 4, "unexpected condition");
+    return edgeWeightWith4GRF(lr2Align, lr1Align, lr2_nreg, lr1_nreg);
+  }
 
   void computeDegreeForGRF();
   void computeDegreeForARF();
@@ -967,7 +1018,7 @@ struct RAVarInfo {
   unsigned subOff = 0;
   std::vector<BundleConflict> bundleConflicts;
   G4_SubReg_Align subAlign = G4_SubReg_Align::Any;
-  bool isEvenAlign = false;
+  int augAlignInGRF = 0;
   AugmentationMasks augMask = AugmentationMasks::Undetermined;
 };
 
@@ -1092,6 +1143,8 @@ public:
   // The pre assigned forbidden register bits for different kinds
   ForbiddenRegs fbdRegs;
 
+  const bool use4GRFAlign = false;
+
 private:
   template <class REGION_TYPE>
   static unsigned getRegionDisp(REGION_TYPE *region, const IR_Builder &irb);
@@ -1114,6 +1167,7 @@ private:
   void expandFillIntrinsic(G4_BB *);
   void expandSpillFillIntrinsics(unsigned);
   void saveRestoreA0(G4_BB *);
+  void initAddrRegForImmOffUseNonStackCall();
   static const RAVarInfo defaultValues;
   std::vector<RAVarInfo> vars;
   std::vector<G4_Declare *> UndeclaredVars;
@@ -1136,6 +1190,9 @@ private:
   // store instructions that shouldnt be rematerialized.
   std::unordered_set<G4_INST *> dontRemat;
 
+  // [-2^16...2^16) in bytes
+  //   (frame pointer is biased 2^16 so that -2^16 references scratch[0x0])
+  static constexpr unsigned SPILL_FILL_IMMOFF_MAX = 0x10000; // 64k
 
   // map each BB to its local RA GRF usage summary, populated in local RA.
   std::map<G4_BB *, PhyRegSummary *> bbLocalRAMap;
@@ -1178,6 +1235,7 @@ private:
 
   uint32_t numGRFSpill = 0;
   uint32_t numGRFFill = 0;
+  bool canUseLscImmediateOffsetSpillFill = false;
 
   unsigned int numReservedGRFsFailSafe = BoundedRA::NOT_FOUND;
 
@@ -1242,6 +1300,8 @@ public:
   bool useFastRA = false;
   bool useHybridRAwithSpill = false;
   bool useLocalRA = false;
+  uint32_t nextSpillOffset = 0;
+  uint32_t scratchOffset = 0;
 
   InterferenceMatrixStorage intfStorage;
   IncrementalRA incRA;
@@ -1470,8 +1530,14 @@ public:
   }
 
   unsigned get_bundle(unsigned baseReg, int offset) const {
+    if (builder.has64bundleSize2GRFPerBank()) {
+      return (((baseReg + offset) % 32) / 4);
+    }
     if (builder.hasPartialInt64Support()) {
       return (((baseReg + offset) % 32) / 2);
+    }
+    if (builder.has64bundleSize()) {
+      return (((baseReg + offset) % 16) / 2);
     }
     return (((baseReg + offset) % 64) / 4);
   }
@@ -1483,11 +1549,17 @@ public:
       bankID = ((baseReg + offset) % 4) / 2;
     }
 
+    if (builder.has64bundleSize2GRFPerBank()) {
+      bankID = ((baseReg + offset) % 4) / 2;
+    }
 
     if (builder.hasOneGRFBank16Bundles()) {
       bankID = (baseReg + offset) % 2;
     }
 
+    if (builder.has64bundleSize()) {
+      bankID = (baseReg + offset) % 2;
+    }
     return bankID;
   }
 
@@ -1535,12 +1607,35 @@ public:
     return true;
   }
 
-  bool isEvenAligned(const G4_Declare *dcl) const {
-    return getVar(dcl).isEvenAlign;
+  bool isQuadAligned(const G4_Declare *dcl) const {
+    auto augAlign = getAugAlign(dcl);
+    return augAlign == 4;
   }
 
-  void setEvenAligned(const G4_Declare *dcl, bool e) {
-    allocVar(dcl).isEvenAlign = e;
+  bool isEvenAligned(const G4_Declare* dcl) const {
+    auto augAlign = getAugAlign(dcl);
+    return augAlign > 0 && augAlign % 2 == 0;
+  }
+
+  int getAugAlign(const G4_Declare *dcl) const {
+    return getVar(dcl).augAlignInGRF;
+  }
+
+  void forceQuadAlign(const G4_Declare *dcl) { setAugAlign(dcl, 4); }
+
+  void resetAlign(const G4_Declare *dcl) { setAugAlign(dcl, 0); }
+
+  // Due to legacy usage, this method takes a boolean that, when set,
+  // causes alignment to be set to Even (2). When boolean flag is
+  // reset, it also resets alignment to Either (0).
+  void setEvenAligned(const G4_Declare *dcl, bool align) {
+    setAugAlign(dcl, align ? 2 : 0);
+  }
+
+  void setAugAlign(const G4_Declare *dcl, int align) {
+    vISA_ASSERT(align <= 2 || use4GRFAlign, "unexpected alignment");
+    vISA_ASSERT(align <= 4, "unsupported alignment");
+    allocVar(dcl).augAlignInGRF = align;
   }
 
   BankAlign getBankAlign(const G4_Declare *) const;
@@ -1555,7 +1650,8 @@ public:
         useLscForNonStackCallSpillFill(
             k.fg.builder->useLscForNonStackSpillFill()),
         useLscForScatterSpill(k.fg.builder->supportsLSC() &&
-                              k.fg.builder->getOption(vISA_scatterSpill)) {
+                              k.fg.builder->getOption(vISA_scatterSpill)),
+        use4GRFAlign(k.fg.builder->supports4GRFAlign()) {
     vars.resize(k.Declares.size());
 
     if (kernel.getOptions()->getOption(vISA_VerifyAugmentation)) {
@@ -1579,8 +1675,9 @@ public:
   static uint32_t getRefCount(int loopNestLevel);
   void updateSubRegAlignment(G4_SubReg_Align subAlign);
   bool isChannelSliced();
-  void evenAlign();
-  bool evenAlignNeeded(G4_Declare *);
+  // Used by LRA/GRA/hybrid RA
+  void augAlign();
+  int getAlignFromAugBucket(G4_Declare *);
   void getBankAlignment(LiveRange *lr, BankAlign &align);
   void printLiveIntervals();
   void reportUndefinedUses(LivenessAnalysis &liveAnalysis, G4_BB *bb,
@@ -1665,7 +1762,7 @@ public:
   }
 
   void copyAlignment(G4_Declare *dst, G4_Declare *src) {
-    setEvenAligned(dst, isEvenAligned(src));
+    setAugAlign(dst, getAugAlign(src));
     setSubRegAlign(dst, getSubRegAlign(src));
   }
 
@@ -1721,12 +1818,81 @@ public:
     return iter != bbLocalRAMap.end() ? iter->second : nullptr;
   }
 
+  unsigned computeSpillSize(const LIVERANGE_LIST &spilledLRs);
+  unsigned computeSpillSize(std::list<LSLiveRange *> &spilledLRs);
+  bool spillSpaceCompression(int spillSize,
+                             const int globalScratchOffset);
+
 public:
   // Store new variables created when inserting scalar imm
   // spill/fill code. Such variables are not infinite spill
   // cost. So if the variable spills again, we shouldn't
   // get in an infinite loop by retrying same spill/fill.
   std::unordered_set<G4_Declare *> scalarSpills;
+
+private:
+  // Following methods are invoked from coloringRegAlloc() method. Any
+  // operation needed in global graph coloring loop should be extracted to a
+  // method instead of inlining logic in code directly in interest of keeping
+  // the loop maintainable.
+  void stackCallSaveRestore(bool hasStackCall);
+  int doGlobalLinearScanRA();
+  void incRABookKeeping();
+  // return pair <whether remat modified program, rematDone>
+  std::pair<bool, bool> remat(bool fastCompile, bool rematDone,
+                              LivenessAnalysis &liveAnalysis,
+                              GraphColor &coloring, RPE &rpe);
+  // rerun GRA, alignedScalarSplitDone, isEarlyExit
+  std::tuple<bool, bool, bool> alignedScalarSplit(bool fastCompile,
+                                                  bool alignedScalarSplitDone,
+                                                  GraphColor &coloring);
+  bool globalSplit(VarSplit &splitPass, GraphColor &coloring);
+  void localSplit(bool fastCompile, VarSplit &splitPass);
+  // return <doBCReduction, highInternalConflict>
+  std::pair<bool, bool> bankConflict();
+  // return reserveSpillReg
+  bool setupFailSafeIfNeeded(bool fastCompile, bool hasStackCall,
+                             unsigned int maxRAIterations,
+                             unsigned int failSafeRAIteration);
+  void undefinedUses(bool rematDone, LivenessAnalysis &liveAnalysis);
+  void writeVerboseStatsNumVars(LivenessAnalysis &liveAnalysis,
+                                FINALIZER_INFO *jitInfo);
+  void writeVerboseRPEStats(RPE &rpe);
+  void splitOnSpill(bool fastCompile, GraphColor &coloring,
+                    LivenessAnalysis &livenessAnalysis);
+  bool convertToFailSafe(bool reserveSpillReg, GraphColor &coloring,
+                         LivenessAnalysis &liveAnalysis,
+                         unsigned int nextSpillOffset);
+  unsigned int instCount() const {
+    unsigned int instNum = 0;
+    for (auto bb : kernel.fg) {
+      instNum += (int)bb->size();
+    }
+    return instNum;
+  }
+  // pair of abort, updated GRFSpillFillCount
+  std::pair<bool, unsigned int> abortOnSpill(unsigned int GRFSpillFillCount,
+                                             GraphColor &coloring);
+  void verifyNoInfCostSpill(GraphColor &coloring, bool reserveSpillReg);
+  void setupA0Dot2OnSpill(bool hasStackCall, unsigned int nextSpillOffset,
+                          int globalScratchOffset);
+  // isEarlyExit
+  bool spillCleanup(bool fastCompile, bool useScratchMsgForSpill,
+                    bool hasStackCall, bool reserveSpillReg, RPE &rpe,
+                    GraphColor &coloring, LivenessAnalysis &liveAnalysis,
+                    SpillManagerGRF &spillGRF);
+
+  // success, enableSpillSpaceCompression, isEarlyExit, scratchOffset,
+  // nextSpillOffset
+  std::tuple<bool, bool, bool, unsigned int, unsigned int>
+  insertSpillCode(bool enableSpillSpaceCompression, GraphColor &coloring,
+                  LivenessAnalysis &liveAnalysis, RPE &rpe,
+                  unsigned int scratchOffset, bool fastCompile,
+                  bool hasStackCall, int globalScratchOffset,
+                  unsigned int nextSpillOffset, bool reserveSpillReg,
+                  unsigned int spillRegSize, unsigned int indrSpillRegSize,
+                  bool useScratchMsgForSpill);
+  bool rerunGRAIter(bool rerunGRA);
 };
 
 inline G4_Declare *Interference::getGRFDclForHRA(int GRFNum) const {

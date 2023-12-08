@@ -59,6 +59,8 @@ public:
                     std::unique_ptr<GenXBackendConfig> BC);
 
   ~GenXTargetMachine() override;
+  GenXTargetMachine(const GenXTargetMachine &) = delete;
+  GenXTargetMachine &operator=(const GenXTargetMachine &) = delete;
 
   bool addPassesToEmitFile(PassManagerBase &PM, raw_pwrite_stream &o, raw_pwrite_stream *pi,
                            CodeGenFileType FileType,
@@ -272,7 +274,7 @@ void initializeGenXGASDynamicResolutionPass(PassRegistry &);
 void initializeGenXInitBiFConstantsPass(PassRegistry &);
 void initializeGenXFinalizerPass(PassRegistry &);
 void initializeGenXBuiltinFunctionsPass(PassRegistry &);
-
+void initializeGenXSLMResolutionPass(PassRegistry &);
 } // End llvm namespace
 
 #endif

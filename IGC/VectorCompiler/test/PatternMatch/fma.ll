@@ -6,8 +6,8 @@
 ;
 ;============================ end_copyright_notice =============================
 
-; RUN: opt %use_old_pass_manager% -GenXPatternMatch --enable-mad=true --fp-contract=fast  -march=genx64 -mcpu=Gen9 -mtriple=spir64-unknown-unknown -S < %s | FileCheck %s
-; RUN: opt %use_old_pass_manager% -GenXPatternMatch --enable-mad=true --fp-contract=off  -march=genx64 -mcpu=Gen9 -mtriple=spir64-unknown-unknown -S < %s |  FileCheck  --check-prefix=CHECK-NOFMA %s
+; RUN: %opt %use_old_pass_manager% -GenXPatternMatch --enable-mad=true --fp-contract=fast  -march=genx64 -mcpu=Gen9 -mtriple=spir64-unknown-unknown -S < %s | FileCheck %s
+; RUN: %opt %use_old_pass_manager% -GenXPatternMatch --enable-mad=true --fp-contract=off  -march=genx64 -mcpu=Gen9 -mtriple=spir64-unknown-unknown -S < %s |  FileCheck  --check-prefix=CHECK-NOFMA %s
 
 ; CHECK-LABEL: @test_mul_add_f32
 ; CHECK-NOFMA-LABEL: @test_mul_add_f32
@@ -17,6 +17,18 @@ define <16 x float> @test_mul_add_f32(<16 x float> %op0, <16 x float> %op1, <16 
 ; CHECK-NOFMA-NEXT: %add = fadd <16 x float> %mul, %op2
   %mul = fmul <16 x float> %op0, %op1
   %add = fadd <16 x float> %mul, %op2
+  ret <16 x float> %add
+}
+
+; CHECK-LABEL: @test_mul_addzero_f32
+; CHECK-NOFMA-LABEL: @test_mul_addzero_f32
+define <16 x float> @test_mul_addzero_f32(<16 x float> %op0, <16 x float> %op1) {
+; CHECK: %mul = fmul <16 x float> %op0, %op1
+; CHECK-NEXT: %add = fadd <16 x float> %mul, zeroinitializer
+; CHECK-NOFMA: %mul = fmul <16 x float> %op0, %op1
+; CHECK-NOFMA-NEXT: %add = fadd <16 x float> %mul, zeroinitializer
+  %mul = fmul <16 x float> %op0, %op1
+  %add = fadd <16 x float> %mul, zeroinitializer
   ret <16 x float> %add
 }
 

@@ -141,12 +141,20 @@ bool MemInstCluster::isSafeToMoveTo(Instruction* I, Instruction* Pos, const Smal
         case GenISAIntrinsic::GenISA_cmpxchgatomicstructured:
         case GenISAIntrinsic::GenISA_fcmpxchgatomicstructured:
         case GenISAIntrinsic::GenISA_icmpxchgatomictyped:
+        case GenISAIntrinsic::GenISA_floatatomictyped:
+        case GenISAIntrinsic::GenISA_fcmpxchgatomictyped:
         case GenISAIntrinsic::GenISA_atomiccounterinc:
         case GenISAIntrinsic::GenISA_atomiccounterpredec:
             return false;
         default:
             break;
         }
+    }
+    if (auto CI = dyn_cast<CallInst>(I)) {
+        // So far, conservatively assume that any call instruction that can operate on memory
+        // is not safe to be moved.
+        if (CI->mayReadOrWriteMemory())
+            return false;
     }
     return true;
 }

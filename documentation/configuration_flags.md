@@ -276,7 +276,7 @@ $ export IGC_ShaderDumpEnable=1
 | `EnableBitcastExtractInsertPattern` | Enable BitcastExtractInsertPattern in CustomSafeOptPass. | Available |
 | `EnableCSSIMD32` | Enable computer shader SIMD32 mode, and fall back to lower SIMD when spill | - |
 | `EnableDivergentBarrierCheck` | Uses WIAnalysis to find barriers in divergent flow control. May have false positives. | - |
-| `EnableHashMovsAtPrologue` | Rather than after EOT, insert hash code movs at shader entry | - |
+| `EnableHashMovsAtPrologue` | Rather than after EOT, insert hash code movs at shader entry | Available |
 | `EnableLSCFenceUGMBeforeEOT` | Enable inserting fence.ugm.06.tile before EOT if a kernel has any write to UGM [XeHPC, PVC]. | Available |
 | `EnableOptionalBufferOffset` | For StatelessToStateful optimization [OCL], if true, make buffer offset optional. Valid only if buffer offset is supported. | Available |
 | `EnableRTLSCFenceUGMBeforeEOT` | [tmp]Enable inserting fence.ugm.06.tile before EOT for RT shader [XeHPC, PVC]. | - |
@@ -290,9 +290,9 @@ $ export IGC_ShaderDumpEnable=1
 | `ForceCSLeastSIMD` | Force computer shader to the lowest allowed SIMD mode | - |
 | `ForceCSSIMD16` | Force computer shader SIMD16 mode if allowed, otherwise it will use SIMD32 | - |
 | `ForceCSSIMD32` | Force computer shader SIMD32 mode | - |
-| `ForceDisableShaderDebugHashCodeInKernel` | Disable hash code addition to the binary after EOT | - |
+| `ForceDisableShaderDebugHashCodeInKernel` | Disable hash code addition to the binary after EOT | Available |
 | `ForceMemoryFenceBeforeEOT` | Forces inserting SLM or gloabal memory fence before EOT if shader writes to SLM or goblam memory respectively. | - |
-| `ForcePerThreadPrivateMemorySize` | Useful for ensuring a certain amount of private memory when doing a shader override. | - |
+| `ForcePerThreadPrivateMemorySize` | Useful for ensuring a certain amount of private memory when doing a shader override. | Available |
 | `ForceStatelessForQueueT` | In OCL, force to use stateless memory to hold queue_t*. This is a legacy feature to be removed. | - |
 | `MSAAClearedKernel` | Insert the discard code for MSAA_MSC_Cleared kernels. 2/4/8/16 | - |
 | `PrintVerboseGenericControlFlowLog` | Forces compiler to print detailed log about additional control flow generated due to a presence of generic memory operations | Available |
@@ -301,13 +301,12 @@ $ export IGC_ShaderDumpEnable=1
 | `SIPOverrideFilePath` | This key when enabled with EnableSIPOverride load of SIP from a specified path. | - |
 | `SToSProducesPositivePointer` | This key is for StatelessToStateful optimization if the  user knows the pointer offset is postive to the kernel argument. | - |
 | `ShaderDebugHashCode` | The driver will set a breakpoint in the first instruction of the shader which has the provided hash code.<br/>                                                                It works only when the value is different then 0 and SystemThreadEnable is set to TRUE.<br/>                                                                Ex: VS_asm2df26246434553ad_nos0000000000000000 , only the LowPart Need<br/>                                                                to be Enterd in Registry Ex : 0x434553ad ,i.e Lower 8 Hex Digits of the 16 Digit Hash Code<br/>                                                                for Compatibilty Reasons | - |
-| `ShaderDebugHashCodeInKernel` | Add hash code to the binary | - |
+| `ShaderDebugHashCodeInKernel` | Add hash code to the binary | Available |
 | `ShaderDisableOptPassesAfter` | Will only run first N optimization passes, any further passes will be ignored. This flag can be used to bisect optimization passes. | - |
 | `ShaderDisplayAllPassesNames` | Display to console all passes name with their ID and occurrence number. | - |
 | `ShaderOverride` | Will override any LLVM shader with matching name in c:\\Intel\\IGC\\ShaderOverride | - |
 | `ShaderPassDisable` | Disable specific passes eg. '9;17-19;239-;Error Check;ResolveOCLAtomics:2;Dead Code Elimination:3-5;BreakConstantExprPass:7-'<br/>                                                                disable pass 9, disable passes from 17 to 19, disable all passes after 238, disable all occurrences of pass Error Check,<br/>                                                                disable second occurrence of ResolveOCLAtomics, disable pass Dead Code Elimination occurrences from 3 to 5,<br/>                                                                disable all BreakConstantExprPass after his 6 occurrence<br/>                                                                To show a list of pass names and their occurrence set ShaderDisplayAllPassesNames.<br/>                                                                Must be used with ShaderDumpEnableAll flag. | - |
 | `SystemThreadEnable` | This key forces software to create a system thread. The system thread may still be created by software even<br/>                                                                if this control is set to false.The system thread is invoked if either the software requires<br/>                                                                exception handling or if kernel debugging is active and a breakpoint is hit. | - |
-| `UseSubDWAlignedPtrArg` | [OCL]If set, for kernel pointer arg such as ptr to char or short, the arg is not necessarily DW aligned | - |
 | `ld2dmsInstsClubbingThreshold` | Do not club more than these ld2dms insts into the new BB during MCSOpt | - |
 | `manualEnableRSWA` | Enable read suppression WA for the send and indirect access | - |
 ## Shader dumping
@@ -376,6 +375,7 @@ $ export IGC_ShaderDumpEnable=1
 | `UseVISAVarNames` | Make VISA generate names for virtual variables so they match with dbg file | Available |
 | `ZeBinCompatibleDebugging` | Setting this to 1 (true) enables embed debug info in zeBinary | Available |
 | `deadLoopForFloatException` | enable a dead loop if float exception happened | - |
+| `StackOverflowDetection` | Inserts checks for stack overflow when stack calls are used. | Available |
 ## IGC Features
 | Flag  | Description | Release builds |
 |:---- | :---- | :----: |

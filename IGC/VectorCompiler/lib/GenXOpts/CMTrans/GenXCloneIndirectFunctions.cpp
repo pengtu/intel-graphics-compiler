@@ -128,7 +128,6 @@ static void cloneIndirectFunction(Function &F,
   auto *Direct = CloneFunction(&F, VMap);
   Direct->setName(F.getName() + "_direct");
   Direct->setLinkage(GlobalValue::InternalLinkage);
-  Direct->removeFnAttr(genx::FunctionMD::CMStackCall);
 
   // Replace all uses of the original function that are direct calls.
   IGCLLVM::replaceUsesWithIf(&F, Direct, [&F](Use &U) {
@@ -164,7 +163,7 @@ bool GenXCloneIndirectFunctions::runOnModule(Module &M) {
 
   bool Modified = false;
 
-  for (auto [F, IsExternal] : IndirectFuncs) {
+  for (auto &[F, IsExternal] : IndirectFuncs) {
     if (BECfg.directCallsOnly(F->getName()))
       continue;
 

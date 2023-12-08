@@ -168,17 +168,6 @@ public:
     m_pDbgInst = pInst;
   }
 
-  /// If this type is derived from a base type then return base type size
-  /// even if it derived directly or indirectly from Composite Type
-  uint64_t getBasicTypeSize(const llvm::DIDerivedType *Ty) const;
-  /// If this type is derived from a base type then return base type size
-  /// even if it derived directly or indirectly from Derived Type
-  uint64_t getBasicTypeSize(const llvm::DICompositeType *Ty) const;
-
-  /// Return base type size even if it derived directly or indirectly from
-  /// Composite Type
-  uint64_t getBasicSize(const DwarfDebug *DD) const;
-
   // TODO: re-design required since current approach does not support
   // DIArgList
   /// Returns size of the location associated with the current instance
@@ -186,22 +175,26 @@ public:
   /// storage required
   unsigned getRegisterValueSizeInBits(const DwarfDebug *DD) const;
 
+  // Location is implicit when it's DIExpression ends with
+  // !DIExpression(DW_OP_stack_value)
   bool currentLocationIsImplicit() const;
+
+  // Location is memory address when it is described with llvm.dbg.declare
   bool currentLocationIsMemoryAddress() const;
 
   // "Simple Indirect Value" is a dbg.value of the following form:
-  //      llvm.dbg.value(pointer to <whatever>, <nevermind>,
-  //                     !DIExpression(DW_OP_deref, [DW_OP_LLVM_fragment]))
+  //  llvm.dbg.value(pointer to ..., ..., !DIExpression(DW_OP_deref,
+  //  [DW_OP_LLVM_fragment]))
+  //
   // Other types of indirect values are currently not supported.
-       // For example, if we encounter an expression like this:
-       //     call void @llvm.dbg.value(metadata i32* %<whatever>,
-       //          metadata !<nevermind>,
-       //          metadata !DIExpression(DW_OP_deref), DW_OP_plus_uconst, 3)
-       // We won't be able to emit a proper expression, due to limitations
-       // of the current *implementation*. A proper expression should have
-       // DW_OP_stack_value to form a proper location descriptor needed in
-       // this context.
+  // For example, if we encounter an expression like this:
+  // call void @llvm.dbg.value(metadata ..., ..., metadata
+  // !DIExpression(DW_OP_deref), DW_OP_plus_uconst, 3) We won't be able to emit
+  // a proper expression, due to limitations of the current *implementation*. A
+  // proper expression should have DW_OP_stack_value to form a proper location
+  // descriptor needed in this context.
   bool currentLocationIsSimpleIndirectValue() const;
+  bool currentLocationIsVector() const;
 
   void emitExpression(CompileUnit *CU, IGC::DIEBlock *Block) const;
 
@@ -737,6 +730,9 @@ public:
   const VISAModule *GetVISAModule() const { return m_pModule; }
 
   llvm::MCSymbol *GetLabelBeforeIp(unsigned int ip);
+
+  // If this type is derived from a base type then return base type size.
+  static uint64_t getBaseTypeSize(const llvm::DIType *Ty);
 
   uint32_t getBEFPSubReg() {
     auto ver = GetABIVersion();

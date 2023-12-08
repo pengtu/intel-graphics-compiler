@@ -101,9 +101,9 @@ bool ProgramScopeConstantAnalysis::runOnModule(Module& M)
             }
             // Include the variable in 'inlineProgramScopeOffsets', otherwise
             // code gen will not emit relocation. In case of S_UNDEF/extenal
-            // variable offset is not expected to be used. Using -1 as a
-            // placeholder so the unexpected usage will fail visibly when
-            // trying to emit variable with 0xffffffff offset
+            // variable offset is not expected to be used.
+            // Using -1 to communicate to ProgramScopeConstantResolution that
+            // this offset shouldn't be resolved.
             inlineProgramScopeOffsets[globalVar] = -1;
             continue;
         }
@@ -251,7 +251,7 @@ bool ProgramScopeConstantAnalysis::runOnModule(Module& M)
     {
         // Add globals tracked in metadata to the "llvm.used" list so they won't be deleted by optimizations
         llvm::SmallVector<GlobalValue*, 4> gvec;
-        for (auto Node : inlineProgramScopeOffsets)
+        for (const auto &Node : inlineProgramScopeOffsets)
         {
             gvec.push_back(Node.first);
         }
@@ -346,9 +346,19 @@ bool ProgramScopeConstantAnalysis::runOnModule(Module& M)
     }
 
     const bool changed = !inlineProgramScopeOffsets.empty();
-    for (auto offset : inlineProgramScopeOffsets)
+    for (const auto &offset : inlineProgramScopeOffsets)
     {
-        m_pModuleMd->inlineProgramScopeOffsets[offset.first] = static_cast<uint64_t>(offset.second);
+        std::string globalName = offset.first->getName().str();
+        if (Ctx->m_retryManager.IsFirstTry())
+        {
+            m_pModuleMd->inlineProgramScopeOffsets[offset.first] = static_cast<uint64_t>(offset.second);
+            Ctx->inlineProgramScopeGlobalOffsets[globalName] = static_cast<uint64_t>(offset.second);
+        }
+        else
+        {
+            IGC_ASSERT_MESSAGE(Ctx->inlineProgramScopeGlobalOffsets[globalName], "No offset recorded for global during initial compilation");
+            m_pModuleMd->inlineProgramScopeOffsets[offset.first] = Ctx->inlineProgramScopeGlobalOffsets[globalName];
+        }
     }
 
     // Update LLVM metadata based on IGC MetadataUtils

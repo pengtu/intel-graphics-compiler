@@ -176,9 +176,8 @@ namespace IGC
 
                 if (GenIntrinsicInst * intrinsic = llvm::dyn_cast<llvm::GenIntrinsicInst>(DefMI))
                 {
-                    GenISAIntrinsic::ID IID = intrinsic->getIntrinsicID();
                     if ((isURBWriteIntrinsic(intrinsic) && !(IGC_IS_FLAG_ENABLED(DisablePayloadCoalescing_URB))) ||
-                        (IID == GenISAIntrinsic::GenISA_RTWrite && !(IGC_IS_FLAG_ENABLED(DisablePayloadCoalescing_RT))))
+                        (llvm::isa<llvm::RTWriteIntrinsic>(intrinsic) && !(IGC_IS_FLAG_ENABLED(DisablePayloadCoalescing_RT))))
                     {
                         ProcessTuple(DefMI);
                     }
@@ -450,15 +449,15 @@ namespace IGC
         if (ccTuple->HasNonHomogeneousElements())
         {
             // Finding a supremum instruction for a homogeneous part is implemented
-            // only for render target write instructions (RTWritIntrinsic).
+            // only for render target write instructions (RTWriteIntrinsic).
             // An only other possible combination for non-homogeneous instructions comprises
-            // RTWritIntrinsic and RTDualBlendSourceIntrinsic.
+            // RTWriteIntrinsic and RTDualBlendSourceIntrinsic.
             // In some cases there is an opportunity to coalesce their payloads but there exists
             // a danger that they are compiled in different SIMD modes so there is a safe assumption
             // that they cannot be coalesced.
-            // A comparison of the payload of RTWritIntrinsic and RTDualBlendSourceIntrinsic:
+            // A comparison of the payload of RTWriteIntrinsic and RTDualBlendSourceIntrinsic:
             // +----------------------------+----------------------------+
-            // | RTWritIntrinsic            | RTDualBlendSourceIntrinsic |
+            // | RTWriteIntrinsic            | RTDualBlendSourceIntrinsic |
             // +----------------------------+----------------------------+
             // | src0 Alpha (optional)      | src0 Alpha (unavailable)*  |
             // +----------------------------+----------------------------+
@@ -488,8 +487,8 @@ namespace IGC
             // * RTDualBlendSourceIntrinsic doesn't have such an argument but it is defined in its payload.
             if (offsetDiff == 0 &&
                 ccTuple->GetNumElements() == numOperands &&
-                llvm::isa<llvm::RTWritIntrinsic>(ccTuple->GetRoot()) &&
-                llvm::isa<llvm::RTWritIntrinsic>(tupleGeneratingInstruction))
+                llvm::isa<llvm::RTWriteIntrinsic>(ccTuple->GetRoot()) &&
+                llvm::isa<llvm::RTWriteIntrinsic>(tupleGeneratingInstruction))
             {
                 if (m_PayloadMapping.HasNonHomogeneousPayloadElements(tupleGeneratingInstruction))
                 {
@@ -1255,6 +1254,13 @@ namespace IGC
     //   (W)     mov (1|M0)               r18.0<1>:f    0.0:f
     //   (W)     mov (1|M0)               r19.0<1>:f    1.0:f
     //   (W)     send.urb (1|M0)          null     r2   r16:4  0x0  0x020827F7
+    // On Xe2+ URB write messages are transposed LSC store messages that write
+    // consecutive DWORDs of payload, e.g.:
+    //   (W)     mov (1|M0)               r16.0<1>:ud   0x0:ud
+    //   (W)     mov (1|M0)               r16.1<1>:f   -1.0:f
+    //   (W)     mov (1|M0)               r16.2<1>:f    0.0:f
+    //   (W)     mov (1|M0)               r16.3<1>:f    1.0:f
+    //   (W)     store.urb.d32x4t.a32 (1|M0)  [r2:1+0x27F0] r16:1
     CVariable* CoalescingEngine::PrepareUniformUrbWritePayload(
         CShader* shader,
         CEncoder* encoder,
@@ -1264,6 +1270,15 @@ namespace IGC
         CVariable* payload = nullptr;
         const uint numOperands = m_PayloadMapping.GetNumPayloadElements(inst);
         const uint grfSize = shader->GetContext()->platform.getGRFSize();
+        if (shader->GetContext()->platform.hasLSCUrbMessage())
+        {
+            // Payload for transposed LSC URB Write - all data chunks stored in subsequent DWORDs
+            payload = shader->GetNewVariable(
+                numOperands, ISA_TYPE_F,
+                (grfSize == 64 ? EALIGN_32WORD : EALIGN_HWORD),
+                true /*uniform*/, "CEExplicitPayload_Uniform");
+        }
+        else
         {
             // Payload spans multiple GRFs, only the first DWORD of each GRF
             // will be populated with (uniform) data.
@@ -1280,6 +1295,11 @@ namespace IGC
             IGC_ASSERT(isUniform(val) && data->IsUniform());
             encoder->SetNoMask();
             encoder->SetSimdSize(SIMDMode::SIMD1);
+            if (shader->GetContext()->platform.hasLSCUrbMessage())
+            {
+                encoder->SetDstSubReg(i);
+            }
+            else
             {
                 encoder->SetDstSubVar(i);
             }
@@ -1408,11 +1428,10 @@ namespace IGC
 
     bool CoalescingEngine::MatchSingleInstruction(llvm::GenIntrinsicInst* inst)
     {
-        GenISAIntrinsic::ID IID = inst->getIntrinsicID();
         if (isSampleInstruction(inst) ||
             isLdInstruction(inst) ||
             isURBWriteIntrinsic(inst) ||
-            IID == GenISAIntrinsic::GenISA_RTWrite)
+            llvm::isa<llvm::RTWriteIntrinsic>(inst))
         {
             uint numOperands = inst->getNumOperands();
             for (uint i = 0; i < numOperands; i++)
@@ -1466,6 +1485,8 @@ namespace IGC
             case GenISAIntrinsic::GenISA_fcmpxchgatomicstructured:
             case GenISAIntrinsic::GenISA_intatomictyped:
             case GenISAIntrinsic::GenISA_icmpxchgatomictyped:
+            case GenISAIntrinsic::GenISA_floatatomictyped:
+            case GenISAIntrinsic::GenISA_fcmpxchgatomictyped:
             case GenISAIntrinsic::GenISA_ldstructured:
             case GenISAIntrinsic::GenISA_atomiccounterinc:
             case GenISAIntrinsic::GenISA_atomiccounterpredec:

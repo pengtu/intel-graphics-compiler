@@ -69,7 +69,6 @@ namespace llvm
 }
 
 #define MAX_VSHADER_INPUT_REGISTERS_PACKAGEABLE 32
-static const unsigned int g_c_Max_PS_attributes = 32;
 
 namespace IGCOpts
 {
@@ -136,10 +135,7 @@ namespace IGC
         unsigned int    m_funcRelocationTableSize = 0;
         unsigned int    m_funcRelocationTableEntries = 0;
         RelocListTy     m_relocs;                  // duplicated information of m_funcRelocationTable, for zebin
-        void* m_funcAttributeTable = nullptr;
-        unsigned int    m_funcAttributeTableSize = 0;
-        unsigned int    m_funcAttributeTableEntries = 0;
-        FuncAttrListTy  m_funcAttrs;               // duplicated information of m_funcAttributeTable, for zebin
+        FuncAttrListTy  m_funcAttrs;
         void* m_globalHostAccessTable = nullptr;
         unsigned int    m_globalHostAccessTableSize = 0;
         unsigned int    m_globalHostAccessTableEntries = 0;
@@ -177,10 +173,6 @@ namespace IGC
             if (m_debugDataGenISA)
             {
                 IGC::aligned_free(m_debugDataGenISA);
-            }
-            if (m_funcAttributeTable)
-            {
-                IGC::aligned_free(m_funcAttributeTable);
             }
             if (m_funcSymbolTable)
             {
@@ -831,7 +823,9 @@ namespace IGC
 
     };
 
-    /// this class adds intrinsic cache to LLVM context
+    /// This class:
+    ///    Add intrinsic cache to LLVM context
+    ///    Add llvm metadata cache
     class LLVMContextWrapper : public llvm::LLVMContext
     {
         LLVMContextWrapper(LLVMContextWrapper&) = delete;
@@ -845,6 +839,10 @@ namespace IGC
         /// requested in this context
         typedef llvm::ValueMap<const llvm::Function*, unsigned> SafeIntrinsicIDCacheTy;
         SafeIntrinsicIDCacheTy m_SafeIntrinsicIDCache;
+        /// metadata caching
+        UserAddrSpaceMD m_UserAddrSpaceMD;
+        // structType caching : for unique identified struct type
+        llvm::SmallVector<llvm::StructType*, 16> m_allLayoutStructTypes;
         void AddRef();
         void Release();
     };
@@ -883,6 +881,7 @@ namespace IGC
         Float_DenormMode    m_floatDenormMode16 = FLOAT_DENORM_FLUSH_TO_ZERO;
         Float_DenormMode    m_floatDenormMode32 = FLOAT_DENORM_FLUSH_TO_ZERO;
         Float_DenormMode    m_floatDenormMode64 = FLOAT_DENORM_FLUSH_TO_ZERO;
+        Float_DenormMode    m_floatDenormModeBFTF = FLOAT_DENORM_FLUSH_TO_ZERO;
 
         PushConstantMode m_pushConstantMode = PushConstantMode::DEFAULT;
 
@@ -914,8 +913,6 @@ namespace IGC
         RetryManager m_retryManager;
 
         IGCMetrics::IGCMetric metrics;
-
-        UserAddrSpaceMD m_UserAddrSpaceMD;
 
         // Used scratch space for private variables
         llvm::DenseMap<llvm::Function*, uint64_t> m_ScratchSpaceUsage;
@@ -991,6 +988,8 @@ namespace IGC
         // Ignore per module fast math flag and use only per instruction fast math flags
         // Add few changes to CustomUnsafeOptPass related to fast flag propagation
         bool m_checkFastFlagPerInstructionInCustomUnsafeOptPass = false;
+        // Map to store global offsets in original global buffer
+        std::map<std::string, uint64_t> inlineProgramScopeGlobalOffsets;
 
     private:
         //For storing error message
@@ -1044,12 +1043,16 @@ namespace IGC
 
             // Set retry behavor for Disable()
             m_retryManager.perKernel = (type == ShaderType::OPENCL_SHADER);
-
-            m_UserAddrSpaceMD = UserAddrSpaceMD(llvmCtxWrapper);
         }
 
         CodeGenContext(CodeGenContext&) = delete;
         CodeGenContext& operator =(CodeGenContext&) = delete;
+
+        // TODO: Right now CodeGenContext::print method must be manually updated for each
+        // new member added. Modify the printer to automatically support new members based
+        // on some "printable" metadata available with member's definition.
+        // Possible solution: TableGen.
+        void print(llvm::raw_ostream& stream) const;
 
         void initLLVMContextWrapper(bool createResourceDimTypes = true);
         llvm::LLVMContext* getLLVMContext() const;
@@ -1096,6 +1099,15 @@ namespace IGC
         virtual uint32_t getIntelScratchSpacePrivateMemoryMinimalSizePerThread() const;
         virtual bool enableZEBinary() const;
         bool isPOSH() const;
+
+        UserAddrSpaceMD& getUserAddrSpaceMD() {
+            IGC_ASSERT(llvmCtxWrapper);
+            return llvmCtxWrapper->m_UserAddrSpaceMD;
+        }
+        llvm::SmallVector<llvm::StructType*, 16>& getLayoutStructTypes() {
+            IGC_ASSERT(llvmCtxWrapper);
+            return llvmCtxWrapper->m_allLayoutStructTypes;
+        }
 
         unsigned int GetSIMDInfoOffset(SIMDMode simd, ShaderDispatchMode mode)
         {

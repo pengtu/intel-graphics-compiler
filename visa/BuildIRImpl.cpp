@@ -9,6 +9,7 @@ SPDX-License-Identifier: MIT
 #include <fstream>
 #include <iostream>
 #include <list>
+#include <math.h>
 #include <sstream>
 #include <string>
 
@@ -20,6 +21,7 @@ SPDX-License-Identifier: MIT
 #include "Timer.h"
 #include "common.h"
 #include "visa_igc_common_header.h"
+
 
 using namespace vISA;
 
@@ -75,7 +77,8 @@ G4_Declare *DeclarePool::createDeclare(const char *name, G4_RegFileKind regFile,
   if (kind == DeclareType::Regular)
     regVar = new (mem) G4_RegVar(dcl, G4_RegVar::RegVarType::Default);
   else if (kind == DeclareType::AddrSpill)
-    regVar = new (mem) G4_RegVarAddrSpillLoc(dcl, addrSpillLocCount);
+    regVar = new (mem) G4_RegVarAddrSpillLoc(dcl, addrSpillLocCount,
+                                             irb.getNumAddrRegisters());
   else if (kind == DeclareType::Tmp)
     regVar = new (mem) G4_RegVarTmp(dcl, base);
   else if (kind == DeclareType::Spill)
@@ -747,7 +750,7 @@ IR_Builder::IR_Builder(INST_LIST_NODE_ALLOCATOR &alloc, G4_Kernel &k,
       CanonicalRegionStride4(4, 1, 0), mem(m),
       phyregpool(m, k.getNumRegTotal()), hashtable(m), rgnpool(m),
       dclpool(m, *this), instList(alloc), kernel(k), metadataMem(4096),
-      debugNameMem(4096), r0AccessMode(getR0AccessFromOptions()) {
+      debugNameMem(4096), r0AccessMode(getR0AccessFromOptions()), freqInfoManager(this,k) {
   num_temp_dcl = 0;
   kernel.setBuilder(this); // kernel needs pointer to the builder
   if (!getIsPayload())
@@ -2126,7 +2129,9 @@ G4_MathOp IR_Builder::Get_MathFuncCtrl(ISA_Opcode op, G4_Type type) {
   case ISA_INV:
     return MATH_INV;
   case ISA_DIV:
-    return IS_FTYPE(type) || IS_HFTYPE(type) ? MATH_FDIV : MATH_INT_DIV_QUOT;
+    return (IS_FTYPE(type) || IS_HFTYPE(type) || IS_BFTYPE(type))
+               ? MATH_FDIV
+               : MATH_INT_DIV_QUOT;
   case ISA_EXP:
     return MATH_EXP;
   default:
@@ -2516,6 +2521,12 @@ G4_SendDescRaw *IR_Builder::createLscMsgDesc(
     }
   }
 
+  uint32_t exDescImmOff = 0;
+  if (lscTryPromoteImmOffToExDesc(op, lscSfid, addr, dataSizeBits / 8, surface,
+                                  exDesc, exDescImmOff)) {
+    addr.immOffset = 0;
+  }
+
   vISA_ASSERT(addr.immOffset == 0, "invalid address immediate offset");
 
   SFID sfid = LSC_SFID_To_SFID(lscSfid);
@@ -2564,6 +2575,9 @@ G4_SendDescRaw *IR_Builder::createLscMsgDesc(
 
   G4_SendDescRaw *g4desc =
       createSendMsgDesc(sfid, desc, exDesc, src1Len, access, surface);
+  if (exDescImmOff) {
+    g4desc->setExDescImmOff(exDescImmOff);
+  }
   g4desc->setLdStAttr(otherAttrs);
   return g4desc;
 }
@@ -2974,6 +2988,8 @@ void IR_Builder::createMovSendSrcInst(G4_Declare *dcl, short regoff,
     }
   }
 }
+
+
 // create an opnd without regpoff and subregoff
 G4_DstRegRegion *IR_Builder::createDstRegRegion(G4_Declare *dcl,
                                                 unsigned short hstride) {
@@ -3104,6 +3120,41 @@ IR_Builder::vISAPredicateToG4Predicate(VISA_PREDICATE_CONTROL control,
   }
 }
 
+// Helper function to fold Unary Op with immediate operand
+// Currently it only supports inv/log/exp/sqrt math functions
+// Returns nullptr if the instruction cannot be optimized
+G4_Imm *IR_Builder::foldConstVal(G4_Imm *opnd, G4_INST *inst) {
+  if (!(inst->isMath() && inst->asMathInst()->isOneSrcMath())) {
+    return nullptr;
+  }
+
+  G4_Type srcT = opnd->getType();
+  if (srcT != Type_F) {
+    return nullptr;
+  }
+
+  float res;
+  G4_MathOp mathOp = inst->asMathInst()->getMathCtrl();
+  switch (mathOp) {
+  case MATH_INV:
+    res = 1.0f / opnd->getFloat();
+    break;
+  case MATH_LOG:
+    res = std::log2(opnd->getFloat());
+    break;
+  case MATH_EXP:
+    res = std::exp2(opnd->getFloat());
+    break;
+  case MATH_SQRT:
+    res = std::sqrt(opnd->getFloat());
+    break;
+  default:
+    return nullptr;
+  }
+
+  return createImm(res);
+}
+
 // helper function to fold BinOp with two immediate operands
 // supported opcodes are given below in doConsFolding
 // returns nullptr if the two constants may not be folded
@@ -3203,7 +3254,17 @@ void IR_Builder::doConsFolding(G4_INST *inst) {
     return op && op->isImm() && !op->isRelocImm();
   };
 
-  if (inst->getNumSrc() == 2) {
+  if (inst->isMath() && inst->asMathInst()->isOneSrcMath()) {
+    G4_Operand* src0 = inst->getSrc(0);
+    if (srcIsFoldableImm(src0)) {
+      G4_Imm* foldedImm =
+        foldConstVal(src0->asImm(), inst);
+      if (foldedImm) {
+        inst->setOpcode(G4_mov);
+        inst->setSrc(foldedImm, 0);
+      }
+    }
+  } else if (inst->getNumSrc() == 2) {
     G4_Operand *src0 = inst->getSrc(0);
     G4_Operand *src1 = inst->getSrc(1);
     if (srcIsFoldableImm(src0) && srcIsFoldableImm(src1)) {
@@ -3275,6 +3336,8 @@ void IR_Builder::doSimplification(G4_INST *inst) {
   // - indices to src are all within src.
   // - destination stride in bytes must be equal to the source element size in
   // bytes.
+
+  // - both src and dst are dword data type:
   bool canConvertMovToMovi =
       inst->opcode() == G4_mov && inst->getExecSize() == g4::SIMD8 &&
       inst->isRawMov() && inst->getDst() &&
@@ -3286,6 +3349,11 @@ void IR_Builder::doSimplification(G4_INST *inst) {
       inst->getSrc(0)->getTypeSize() ==
           inst->getDst()->getTypeSize() *
               inst->getDst()->asDstRegRegion()->getHorzStride();
+  if (getPlatform() >= Xe2) {
+    canConvertMovToMovi = canConvertMovToMovi &&
+                          IS_DTYPE(inst->getDst()->getType()) &&
+                          IS_DTYPE(inst->getSrc(0)->getType());
+  }
   if (canConvertMovToMovi) {
     // Convert 'mov' to 'movi' if the following conditions are met.
 

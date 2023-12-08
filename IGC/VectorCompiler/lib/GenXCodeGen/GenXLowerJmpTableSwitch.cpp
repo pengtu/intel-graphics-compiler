@@ -124,7 +124,7 @@ static std::vector<BlockAddress *>
 collectBlockAddresses(SwitchInst *SI, ConstantInt *MinCaseV) {
   unsigned NumCases = SI->getNumCases();
   std::vector<BlockAddress *> BAs(NumCases);
-  for (auto CaseIt : SI->cases()) {
+  for (auto &CaseIt : SI->cases()) {
     APInt Idx = CaseIt.getCaseValue()->getValue() - MinCaseV->getValue();
     IGC_ASSERT(Idx.getZExtValue() < NumCases);
     BAs[Idx.getZExtValue()] = BlockAddress::get(CaseIt.getCaseSuccessor());
@@ -225,8 +225,9 @@ bool GenXLowerJmpTableSwitch::processSwitchCandidates(
     for (BasicBlock *Succ : Br->successors()) {
       for (PHINode &Phi : Succ->phis()) {
         int Idx = Phi.getBasicBlockIndex(SIBB);
-        IGC_ASSERT_MESSAGE(Idx >= 0, "Switch successor's PHINode doesn't have "
-                                     "the switch BB as incoming block.");
+        IGC_ASSERT_EXIT_MESSAGE(Idx >= 0,
+                                "Switch successor's PHINode doesn't have "
+                                "the switch BB as incoming block.");
         Phi.setIncomingBlock(Idx, JTBB);
       }
     }

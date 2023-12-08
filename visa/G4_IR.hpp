@@ -81,6 +81,18 @@ typedef std::list<USE_DEF_NODE, USE_DEF_ALLOCATOR> DEF_EDGE_LIST;
 typedef std::list<USE_DEF_NODE, USE_DEF_ALLOCATOR>::iterator DEF_EDGE_LIST_ITER;
 
 namespace vISA {
+#define SWSB_MAX_ALU_DEPENDENCE_DISTANCE 11
+#define SWSB_MAX_ALU_DEPENDENCE_DISTANCE_64BIT 15
+
+enum SB_INST_PIPE {
+  PIPE_NONE = 0,
+  PIPE_INT = 1,
+  PIPE_FLOAT = 2,
+  PIPE_LONG = 3,
+  PIPE_MATH = 4,
+  PIPE_DPAS = 6,
+  PIPE_SEND = 7,
+};
 // forward declaration for the binary of an instruction
 class BinInst;
 
@@ -240,7 +252,7 @@ public:
   }
 
   void setNoACCSBSet() { swsb.tokenType = NoACCSBSet; }
-  bool hasNoACCSBSet() { return swsb.tokenType == NoACCSBSet; }
+  bool hasNoACCSBSet() const { return swsb.tokenType == NoACCSBSet; }
 
   void setOperandTypeIndicated(bool indicated) {
     operandTypeIndicated = indicated;
@@ -392,7 +404,6 @@ public:
     return (G4_SendDescRaw *)msgDesc;
   }
 
-  virtual bool mayExceedTwoGRF() const { return false; }
   // special instructions(e.g., send) should override
   virtual void computeRightBound(G4_Operand *opnd);
 
@@ -618,7 +629,7 @@ public:
   int32_t getLocalId() const { return localId; }
 
   void setEvenlySplitInst(bool val) { evenlySplitInst = val; }
-  bool getEvenlySplitInst() { return evenlySplitInst; }
+  bool getEvenlySplitInst() const { return evenlySplitInst; }
 
   void setVISAId(int offset) { vISAInstId = offset; }
   int getVISAId() const { return vISAInstId; }
@@ -692,13 +703,17 @@ public:
   bool isMathPipeInst() const;
   bool distanceHonourInstruction() const;
   bool tokenHonourInstruction() const;
-  bool hasNoPipe();
+  bool hasNoPipe() const;
   bool isLongPipeType(G4_Type type) const;
   bool isIntegerPipeType(G4_Type type) const;
   bool isJEUPipeInstructionXe() const;
   bool isLongPipeInstructionXe() const;
   bool isIntegerPipeInstructionXe() const;
   bool isFloatPipeInstructionXe() const;
+
+  int getMaxDepDistance() const;
+  SB_INST_PIPE getInstructionPipeXe() const;
+  SB_INST_PIPE getDistDepPipeXe() const;
 
   void swapDefUse(Gen4_Operand_Number srcIxA = Opnd_src0,
                   Gen4_Operand_Number srcIxB = Opnd_src1);
@@ -751,7 +766,7 @@ public:
   bool isRawMov() const;
   bool hasACCSrc() const;
   bool hasACCOpnd() const;
-  G4_Type getOpExecType(int &extypesize);
+  G4_Type getOpExecType(int &extypesize) const;
   bool canHoistTo(const G4_INST *defInst, bool simdBB) const;
   enum MovType {
     Copy = 0,           // MOV is a copy.
@@ -787,7 +802,7 @@ public:
   bool isCommutative() const;
 
   bool hasNULLDst() const;
-  bool goodTwoGRFDst(bool &evenSplitDst);
+  bool goodTwoGRFDst(bool &evenSplitDst) const;
   void setGenOffset(int64_t off) { genOffset = off; }
   int64_t getGenOffset() const { return genOffset; }
 
@@ -923,6 +938,25 @@ public:
 
   const IR_Builder &getBuilder() const { return builder; }
 
+  bool isPureBFInst() const {
+    G4_Operand *dst = getDst();
+    if (!dst || dst->getType() != Type_BF)
+      return false;
+    for (int i = 0, numSrcs = getNumSrc(); i < numSrcs; i++) {
+      auto src = getSrc(i);
+      if (src && src->getType() != Type_BF)
+        return false;
+    }
+    return true;
+  }
+
+  bool canSupportPureBF() const {
+    return (op == G4_mov || op == G4_add || op == G4_sel || op == G4_cmp ||
+           op == G4_csel || op == G4_cmpn || op == G4_mul || op == G4_mad ||
+           op == G4_math);
+  }
+
+  virtual bool requireNopAfter() const { return false; }
 private:
   // use inheritDIFrom() instead
   void setLocation(MDLocation *loc) { setMetadata(Metadata::InstLoc, loc); }
@@ -972,6 +1006,19 @@ public:
     return GenPrecisionTable[(int)P].BitSize;
   }
 
+  static bool hasSamePrecision(GenPrecision p1, GenPrecision p2) {
+    if (p1 == p2) {
+      return true;
+    }
+
+    return (((p1 == GenPrecision::U8 || p1 == GenPrecision::S8) &&
+             (p2 == GenPrecision::U8 || p2 == GenPrecision::S8)) ||
+            ((p1 == GenPrecision::U4 || p1 == GenPrecision::S4 ||
+              p1 == GenPrecision::U2 || p1 == GenPrecision::S2) &&
+             (p2 == GenPrecision::U4 || p2 == GenPrecision::S4 ||
+              p2 == GenPrecision::U2 || p2 == GenPrecision::S2)));
+  }
+
   G4_InstDpas(const IR_Builder &builder, G4_opcode o, G4_ExecSize size,
               G4_DstRegRegion *d, G4_Operand *s0, G4_Operand *s1,
               G4_Operand *s2, G4_Operand *s3, G4_InstOpts opt, GenPrecision a,
@@ -988,6 +1035,7 @@ public:
   bool isFP16() const { return Src1Precision == GenPrecision::FP16; }
   bool isTF32() const { return Src1Precision == GenPrecision::TF32; }
   bool isInt() const;
+  bool isInt8() const;
   bool is2xInt8() const; // true if it is 2xint8 dpas
 
   uint8_t getOpsPerChan() const;
@@ -995,6 +1043,14 @@ public:
   uint8_t getRepeatCount() const { return RepeatCount; }
   GenPrecision getSrc1Precision() const { return Src1Precision; }
   GenPrecision getSrc2Precision() const { return Src2Precision; }
+
+  bool hasSameSrc1Precision(GenPrecision p) const {
+    return hasSamePrecision(Src1Precision, p);
+  }
+
+  bool hasSameSrc2Precision(GenPrecision p) const {
+    return hasSamePrecision(Src2Precision, p);
+  }
 
   void setRepeatCount(uint8_t rc) { RepeatCount = rc; }
   // data size per lane (data size per each systolic depth)
@@ -1009,7 +1065,6 @@ public:
     return getPrecisionSizePerLaneInByte(Src2Precision);
   }
 
-  bool mayExceedTwoGRF() const override { return true; }
   void computeRightBound(G4_Operand *opnd) override;
   void setMayNeedWA(bool b) { mayNeedRSWA = b; }
   bool mayNeedWA() const { return mayNeedRSWA; }
@@ -1032,7 +1087,7 @@ typedef enum {
   MATH_INT_DIV_QUOT = 0xC,
   MATH_INT_DIV_REM = 0xD,
   MATH_INVM = 0xE,
-  MATH_RSQRTM = 0xF
+  MATH_RSQRTM = 0xF,
 } G4_MathOp;
 
 class G4_InstMath : public G4_INST {
@@ -1056,10 +1111,10 @@ public:
   }
   bool isOneSrcMath() const {
     return mathOp == MATH_INV || mathOp == MATH_LOG || mathOp == MATH_EXP ||
-           mathOp == MATH_SQRT || mathOp == MATH_RSQ || mathOp == MATH_SIN ||
-           mathOp == MATH_COS || mathOp == MATH_RSQRTM;
+      mathOp == MATH_SQRT || mathOp == MATH_RSQ || mathOp == MATH_SIN ||
+      mathOp == MATH_COS || mathOp == MATH_RSQRTM
+      ;
   }
-
   G4_MathOp getMathCtrl() const { return mathOp; }
 };
 
@@ -1189,6 +1244,8 @@ public:
     vASSERT(isReturn());
     setOpcode(G4_pseudo_fret);
   }
+
+  bool requireNopAfter() const override;
 }; // G4_InstCF
 
 class G4_InstSend : public G4_INST {
@@ -1223,7 +1280,6 @@ public:
       op = G4_sendsc;
     }
   }
-  bool mayExceedTwoGRF() const override { return true; }
 
   G4_Operand *getMsgDescOperand() const {
     return isSplitSend() ? srcs[2] : srcs[1];
@@ -1268,7 +1324,7 @@ public:
 
   bool isFence() const { return getMsgDesc()->isFence(); }
 
-  bool isDirectSplittableSend();
+  bool isDirectSplittableSend() const;
 
   void computeRightBound(G4_Operand *opnd) override;
 
@@ -1663,7 +1719,7 @@ public:
   void setOffset(uint32_t o) { offset = o; }
   void setFP(G4_Declare *f) { fp = f; }
 
-  bool isOffsetValid() { return offset != InvalidOffset; }
+  bool isOffsetValid() const { return offset != InvalidOffset; }
 
   void computeRightBound(G4_Operand *opnd) override;
 

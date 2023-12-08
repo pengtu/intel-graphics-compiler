@@ -17,13 +17,13 @@
 ; CHECK-NEXT: DW_AT_decl_file   : 1
 ; CHECK-NEXT: DW_AT_decl_line   : 6
 ; CHECK-NEXT: DW_AT_type        : <{{0x[0-9a-f]+}}>
-; CHECK-NEXT: DW_AT_location    : 0x[[BUF_LOC:[0-9a-f]+]] (location list)
+; CHECK-NEXT: DW_AT_location    : {{(0x)?}}[[BUF_LOC:[0-9a-f]+]] (location list)
 
 ; CHECK:      DW_AT_name        : artificial_vect
 ; CHECK-NEXT: DW_AT_decl_file   : 1
 ; CHECK-NEXT: DW_AT_decl_line   : 777
 ; CHECK-NEXT: DW_AT_type        : <[[VECT_TYPE:0x[0-9a-f]+]]>
-; CHECK-NEXT: DW_AT_location    : 0x[[VECT_LOC:[0-9a-f]+]] (location list)
+; CHECK-NEXT: DW_AT_location    : {{(0x)?}}[[VECT_LOC:[0-9a-f]+]] (location list)
 
 ; CHECK:      DW_AT_name        : data
 ; CHECK-NEXT: DW_AT_decl_file   : 1
@@ -32,8 +32,8 @@
 ; CHECK-NEXT: DW_AT_const_value : 64 byte block: 0 0 0 0 1 0 0 0 2 0 0 0 3 0 0 0 4 0 0 0 5 0 0 0 6 0 0 0 7 0 0 0 8 0 0 0 9 0 0 0 a 0 0 0 b 0 0 0 c 0 0 0 d 0 0 0 e 0 0 0 f 0 0 0
 
 ; debug_loc section
-; CHECK-DAG: [[BUF_LOC]] {{[^(]+}}(DW_OP_reg[[#REG_PTR:]] (r[[#]]); DW_OP_bit_piece: size: 64 offset: [[#OFFSET:]] )
-; CHECK-DAG: [[VECT_LOC]] {{[^(]+}}(DW_OP_reg[[#REG_PTR]] (r[[#REG_PTR]]); DW_OP_const1u: [[#OFFSET]]; DW_OP_const1u: 64;  DW_OP_INTEL_push_bit_piece_stack)
+; CHECK-DAG: [[BUF_LOC]] {{[^(]+}}(DW_OP_lit[[#]]; DW_OP_{{lit|const1u: }}[[#]]; DW_OP_INTEL_regval_bits: 64; DW_OP_stack_value)
+; CHECK-DAG: [[VECT_LOC]] {{[^(]+}}(DW_OP_lit[[#]]; DW_OP_{{lit|const1u: }}[[#]]; DW_OP_INTEL_regval_bits: 64)
 
 target datalayout = "e-p:64:64-i64:64-n8:16:32:64"
 target triple = "genx64-unknown-unknown"

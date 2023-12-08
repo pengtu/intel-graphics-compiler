@@ -67,7 +67,9 @@ bool PrivateMemoryUsageAnalysis::runOnModule(Module& M)
     // If there are stack called functions in the module, add PRIVATE_BASE to all kernels to be safe.
     // PRIVATE_BASE is needed for kernel to get the stack base offset.
     // Callee does not require this arg, since all stack access will be done using the stack-pointer
-    if (hasStackCall || pCtx->m_enableFunctionPointer || IGC_IS_FLAG_ENABLED(ForceAddingStackcallKernelPrerequisites))
+    if (hasStackCall || pCtx->m_enableFunctionPointer ||
+        IGC_IS_FLAG_ENABLED(ForceAddingStackcallKernelPrerequisites) ||
+        IGC_IS_FLAG_ENABLED(StackOverflowDetection))
     {
         for (Module::iterator I = M.begin(), E = M.end(); I != E; ++I)
         {
@@ -191,7 +193,7 @@ void PrivateMemoryUsageAnalysis::visitCallInst(llvm::CallInst& CI)
     if (m_hasDPDivSqrtEmu && CI.hasName())
     {
         Function* calledFunc = CI.getCalledFunction();
-        if (calledFunc->getName().startswith("__builtin_IB_native_sqrtd"))
+        if (calledFunc && calledFunc->getName().startswith("__builtin_IB_native_sqrtd"))
         {
             m_hasPrivateMem = true;
         }

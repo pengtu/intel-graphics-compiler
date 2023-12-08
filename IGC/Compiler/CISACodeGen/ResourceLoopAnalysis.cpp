@@ -109,8 +109,12 @@ bool ResourceLoopAnalysis::runOnFunction(Function &F) {
         }
       } else if (auto *LI = dyn_cast<LdRawIntrinsic>(I)) {
         if (!WI->isUniform(LI->getResourceValue())) {
-          curRes = LI->getResourceValue();
-          curOpTy = 4;
+          // need extra restrictions:
+          // no half-type because it may need extra op for packing
+          if (LI->getType()->getScalarSizeInBits() >= 32) {
+            curRes = LI->getResourceValue();
+            curOpTy = 4;
+          }
         }
       }
       // check data-dependence from mem-ops in the current set
@@ -171,6 +175,16 @@ bool ResourceLoopAnalysis::runOnFunction(Function &F) {
         }
 
         if (!LoopEnd) {
+          if (prevMemIter != BB->end()) {
+            // mark instructions in between two mem-op as inside
+            auto III = prevMemIter;
+            ++III;
+            while (III != II) {
+              auto InBetween = &*III;
+              LoopMap[InBetween] = MarkResourceLoopInside;
+              ++III;
+            }
+          }
           LoopMap[I] = MarkResourceLoopInside;
           prevMemIter = II;
           DefSet.insert(I);

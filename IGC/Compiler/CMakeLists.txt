@@ -109,6 +109,7 @@ set(IGC_BUILD__SRC__Compiler
     "${IGC_BUILD__GFX_DEV_SRC_DIR}/skuwa/igt_12_70_hw_wa.c"
     "${IGC_BUILD__GFX_DEV_SRC_DIR}/skuwa/igt_12_70_sw_wa.c"
     "${IGC_BUILD__GFX_DEV_SRC_DIR}/skuwa/igt_12_71_hw_wa.c"
+    "${IGC_BUILD__GFX_DEV_SRC_DIR}/skuwa/igt_12_74_hw_wa.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/SamplerPerfOptPass.cpp"
     ${IGC_BUILD__SRC__Compiler_CISACodeGen}
     ${IGC_BUILD__SRC__Compiler_DebugInfo}
@@ -171,6 +172,9 @@ set(IGC_BUILD__HDR__Compiler
     ${IGC_BUILD__HDR__Compiler_Legalizer}
     ${IGC_BUILD__HDR__Compiler_MetaDataApi}
     ${IGC_BUILD__HDR__Compiler_Optimizer}
+    "${IGC_BUILD__GFX_DEV_SRC_DIR}/IGC/LLVM3DBuilder/MetadataBuilder.h"
+    "${IGC_BUILD__GFX_DEV_SRC_DIR}/IGC/LLVM3DBuilder/BuiltinsFrontend.hpp"
+    "${IGC_BUILD__GFX_DEV_SRC_DIR}/IGC/LLVM3DBuilder/BuiltinsFrontendDefinitions.hpp"
   )
 if(NOT ANDROID)
   set(IGC_BUILD__HDR_Win_Lin_Dar__Compiler

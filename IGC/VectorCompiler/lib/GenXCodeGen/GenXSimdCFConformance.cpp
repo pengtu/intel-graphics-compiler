@@ -1869,8 +1869,7 @@ void GenXSimdCFConformance::ensureConformance() {
       EMValsStack.insert(*i);
       LLVM_DEBUG(if (auto *Inst = dyn_cast<Instruction>(i->getValue())) {
         auto FuncName = Inst->getFunction()->getName();
-        dbgs() << "Entry EMVals " << FuncName << " - ";
-        i->getValue()->dump();
+        dbgs() << "Entry EMVals " << FuncName << " - " << *Inst << "\n";
       });
     }
   }
@@ -1919,16 +1918,16 @@ void GenXSimdCFConformance::ensureConformance() {
     // been identified in the early pass, unless passes in between have
     // transformed the code in an unexpected way that has made the simd CF
     // non-conformant. Give an error here if this has happened.
-    if (!GotosToLower.empty()) {
-      dbgs() << "Not empty GotosToLower:";
-      for (auto *Dump : GotosToLower)
-        Dump->dump();
-    }
-    if (!JoinsToLower.empty()) {
-      dbgs() << "Not empty JoinsToLower:";
-      for (auto *Dump : JoinsToLower)
-        Dump->dump();
-    }
+    LLVM_DEBUG(
+        if (!GotosToLower.empty()) {
+          dbgs() << "Not empty GotosToLower:";
+          for (auto *Dump : GotosToLower)
+            dbgs() << *Dump;
+        } if (!JoinsToLower.empty()) {
+          dbgs() << "Not empty JoinsToLower:";
+          for (auto *Dump : JoinsToLower)
+            dbgs() << *Dump;
+        });
     IGC_ASSERT_EXIT_MESSAGE(
         GotosToLower.empty(),
         "unexpected non-conformant SIMD CF in late SIMD CF conformance pass");
@@ -2460,9 +2459,7 @@ static bool checkAllUsesAreSelectOrWrRegion(Value *V) {
     auto User2 = cast<Instruction>(ui2->getUser());
     unsigned OpNum = ui2->getOperandNo();
     ++ui2;
-    LLVM_DEBUG(dbgs() << "checkAllUsesAreSelectOrWrRegion: for user ";
-               User2->dump());
-
+    LLVM_DEBUG(dbgs() << "checkAllUsesAreSelectOrWrRegion: for user " << *User2 << "\n");
     if (isa<SelectInst>(User2))
       continue;
 
@@ -2997,7 +2994,7 @@ bool GenXSimdCFConformance::getConnectedVals(
 
   if (LowerBadUsers) {
     SetVector<Value *> ToRemove;
-    for (auto BadUser : UsersToLower) {
+    for (auto &BadUser : UsersToLower) {
       replaceUseWithLoweredEM(dyn_cast<Instruction>(BadUser.getValue()),
                               BadUser.getIndex(), ToRemove);
     }
@@ -3010,7 +3007,7 @@ bool GenXSimdCFConformance::getConnectedVals(
                  for (auto &BadUser
                       : UsersToLower) {
                    dbgs() << "    ";
-                   BadUser.dump();
+                   BadUser.print(dbgs());
                  });
       return false;
     }
@@ -3086,7 +3083,7 @@ void GenXSimdCFConformance::canonicalizeEM() {
 void GenXSimdCFConformance::handleEVs() {
   // Collect gotos/joins
   gatherGotoJoinEMVals(false);
-  for (auto val : EMVals) {
+  for (auto &val : EMVals) {
     Value *GotoJoin = val.getValue();
     IGC_ASSERT(testIsGotoJoin(GotoJoin));
     GotoJoinEVsMap[GotoJoin] = GotoJoinEVs(GotoJoin);
@@ -3178,7 +3175,7 @@ void GenXSimdCFConformance::resolveBitCastChains() {
   gatherEMVals();
 
   std::set<Value *> DeadInst;
-  for (auto Val : EMVals) {
+  for (auto &Val : EMVals) {
     if (auto PN = dyn_cast<PHINode>(Val.getValue())) {
       LLVM_DEBUG(dbgs() << "resolveBitCastChains: Found phi:\n" << *PN << "\n");
     } else if (auto BCI = dyn_cast<BitCastInst>(Val.getValue())) {
@@ -4125,11 +4122,12 @@ void GenXLateSimdCFConformance::hoistExtractEMInstructions() {
       else {
         ToRemove.push_back(V);
         V->replaceAllUsesWith(It->second);
-        V->eraseFromParent();
       }
     }
-  for (auto &&V : ToRemove)
+  for (auto &&V : ToRemove) {
     removeFromEMRMVals(V);
+    V->eraseFromParent();
+  }
 }
 
 /***********************************************************************
@@ -4144,7 +4142,7 @@ void GenXLateSimdCFConformance::hoistExtractEMInstructions() {
  * linearized. Maybe this function should be updated in future.
  */
 void GenXSimdCFConformance::optimizeRestoredSIMDCF() {
-  for (auto Data : BlocksToOptimize) {
+  for (auto &Data : BlocksToOptimize) {
     // Skip blocks with lowered EM values
     if (!EMVals.count(SimpleValue(Data.second.getRealEM(), 0))) {
       LLVM_DEBUG(dbgs() << "optimizeRestoredSIMDCF: skipping "
@@ -4393,7 +4391,7 @@ void GenXSimdCFConformance::replaceGetEMUse(Instruction *Inst,
     } else {
       // Replace with lowered EM
       auto it = LoweredEMValsMap.find(JPData.getRealEM());
-      IGC_ASSERT_MESSAGE(it != LoweredEMValsMap.end(),
+      IGC_ASSERT_EXIT_MESSAGE(it != LoweredEMValsMap.end(),
                          "Should be checked earlier");
       Instruction *LoweredEM = cast<Instruction>(it->second);
       Inst->setOperand(i, LoweredEM);
@@ -4706,9 +4704,9 @@ void GenXSimdCFConformance::GotoJoinEVs::CollectEVs() {
     auto EV = dyn_cast<ExtractValueInst>(ui->getUser());
     ++ui;
 
-    IGC_ASSERT_MESSAGE(EV, "Bad user of goto/join!");
-    IGC_ASSERT_MESSAGE(EV->getNumIndices() == 1,
-                       "Expected 1 index in Extract Value for goto/join!");
+    IGC_ASSERT_EXIT_MESSAGE(EV, "Bad user of goto/join!");
+    IGC_ASSERT_EXIT_MESSAGE(EV->getNumIndices() == 1,
+                            "Expected 1 index in Extract Value for goto/join!");
 
     const unsigned idx = EV->getIndices()[0];
     IGC_ASSERT(testPosCorrectness(idx));

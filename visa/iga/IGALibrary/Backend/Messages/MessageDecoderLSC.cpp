@@ -50,7 +50,10 @@ enum LscOp : uint32_t {
   LSC_FENCE = 0x1F,
   //
   LSC_STORE_UNCOMPRESSED_QUAD = 0x20,
-//
+  //
+  LSC_ATOMIC_APNDADD = 0x28,
+  LSC_ATOMIC_APNDSUB = 0x29,
+  LSC_ATOMIC_APNDSTORE = 0x2A,
   //
   LSC_INVALID = 0xFFFFFFFF,
 };
@@ -81,11 +84,6 @@ static const uint32_t LSC_V16 = 0x5;
 static const uint32_t LSC_V32 = 0x6;
 static const uint32_t LSC_V64 = 0x7;
 
-const static uint32_t LSC_SCALE_NONE = 0x0;
-const static uint32_t LSC_SCALE_1X = 0x1;
-const static uint32_t LSC_SCALE_2X = 0x2;
-const static uint32_t LSC_SCALE_4X = 0x3;
-
 ///////////////////////////////////////////////////////
 // Cache Opt
 // Value for bits[19:17]
@@ -115,28 +113,13 @@ static const uint32_t LSC_UC_CC = 0x5;
 static const uint32_t LSC_CA_CC = 0x9;
 static const uint32_t LSC_RI_RI = 0xE;
 
-#if 0
-struct LscMessageFormat {
-    const char *mnemonic;
-    const char *description;
-    uint32_t    mask;
-    uint32_t    op;
-//
-//    std::pair<Platform,const char *> docs[2];
-};
-
-//
-static LscMessageFormat OPS[32] {
-};
-#endif
-
 // This handles LSC messages only
 struct MessageDecoderLSC : MessageDecoder {
   MessageDecoderLSC(Platform _platform, SFID _sfid, ExecSize _execSize,
-                    SendDesc _exDesc, SendDesc _desc, DecodeResult &_result)
-      : MessageDecoder(_platform, _sfid, _execSize,
-                       _exDesc, _desc, _result) {
-  }
+                    uint32_t exImmOffDesc, SendDesc _exDesc, SendDesc _desc,
+                    DecodeResult &_result)
+      : MessageDecoder(_platform, _sfid, _execSize, exImmOffDesc, _exDesc,
+                       _desc, _result) {}
 
   // used by decodeLscMessage and subchildren
   std::string dataTypePrefixSyntax; // e.g. d32 or d16 or d32
@@ -214,6 +197,10 @@ struct MessageDecoderLSC : MessageDecoder {
         sym << "wb";
         descs << " writeback";
         break;
+      case CacheOpt::CONSTCACHED:
+        sym << "cc";
+        descs << " constant-cached";
+        break;
       default:
         sym << "?";
         descs << " invalid";
@@ -227,8 +214,50 @@ struct MessageDecoderLSC : MessageDecoder {
     descs << "";
   }
 
+  // Descriptor Bits[19:16]: 4 bits of cache control
+  bool decodeLscCacheControlBits16_19(SendOp sop, CacheOpt &l1, CacheOpt &l3) {
+    // check if it's the 3 cases added for 4-bits Cache Control at [19:16]:
+    // L1UC_L3CC, L1CA_L3CC, L1RI_L3RI
+    std::stringstream sym, descs;
+    l1 = l3 = CacheOpt::DEFAULT;
+    bool isLoad = lookupSendOp(sop).isLoad();
+    auto ccBits = getDescBits(16, 4);
+    auto setCacheOptsWrapper = [&](CacheOpt _l1, CacheOpt _l3) {
+      return setCacheOpts(sym, descs, l1, l3, _l1, _l3);
+    };
+
+    switch (ccBits) {
+    case LSC_UC_CC:
+      if (isLoad) {
+        setCacheOptsWrapper(CacheOpt::UNCACHED, CacheOpt::CONSTCACHED);
+        break;
+      }
+    case LSC_CA_CC:
+      if (isLoad) {
+        setCacheOptsWrapper(CacheOpt::CACHED, CacheOpt::CONSTCACHED);
+        break;
+      }
+    case LSC_RI_RI:
+      if (isLoad) {
+        setCacheOptsWrapper(CacheOpt::READINVALIDATE, CacheOpt::READINVALIDATE);
+        break;
+      }
+    default:
+      return decodeLscCacheControlBits17_19(sop, l1, l3);
+    }
+    //
+    cacheControlSyntax = sym.str();
+    //
+    addField("Caching", 16, 4, ccBits, descs.str());
+    return true;
+  }
 
   void decodeCacheControl(SendOp sop, CacheOpt &l1, CacheOpt &l3) {
+    if (platform() >= Platform::XE2) {
+      if (!decodeLscCacheControlBits16_19(sop, l1, l3))
+        error(16, 4, "invalid cache options");
+      return;
+    }
 
     if (!decodeLscCacheControlBits17_19(sop, l1, l3))
       error(17, 3, "invalid cache options");
@@ -296,6 +325,101 @@ struct MessageDecoderLSC : MessageDecoder {
   }
 
   void decodeLscImmOff(uint32_t atBits) {
+    bool exDescHasImmOff = platform() >= Platform::XE2;
+    if (!exDescHasImmOff)
+      return;
+      bool isBlock2d =
+          op == SendOp::LOAD_BLOCK2D || op == SendOp::STORE_BLOCK2D;
+    // immediate offset bits go in SendDesc if ExDesc is imm
+    // if ExDesc is Reg then they go in dedicated exImmOffDesc
+    uint32_t baseOffBits = exDesc.isReg() ? exImmOffDesc : exDesc.imm;
+    if (atBits == LSC_AT_FLAT) {
+      // [31:12] are all S20
+      if (isBlock2d) {
+        addDoc(DocRef::EXDESC, "DP_EXT_DESC_2D", "67780");
+        // ExDescImm[31:22] = XOff (S10)
+        // ExDescImm[21:12] = YOff (S10)
+        result.info.immediateOffsetBlock2dX =
+            (int)getSignedBits((int)baseOffBits, 12, 10);
+        result.info.immediateOffsetBlock2dY =
+            (int)getSignedBits((int)baseOffBits, 22, 10);
+        addField("ImmediateOffsetBlock2dX", 22 + 32, 10,
+                 (uint32_t)result.info.immediateOffsetBlock2dX,
+                 fmtHexSigned(result.info.immediateOffsetBlock2dX));
+        addField("ImmediateOffsetBlock2dY", 12 + 32, 10,
+                 (uint32_t)result.info.immediateOffsetBlock2dY,
+                 fmtHexSigned(result.info.immediateOffsetBlock2dY));
+        if (result.info.immediateOffsetBlock2dX != 0 ||
+            result.info.immediateOffsetBlock2dY != 0) {
+          result.syntax.immOffset =
+              std::string("+(") +
+              fmtHexSigned(result.info.immediateOffsetBlock2dX) + "," +
+              fmtHexSigned(result.info.immediateOffsetBlock2dY) + ")";
+        }
+      } else {
+        addDoc(DocRef::EXDESC, "EXDESC_FLAT", "64012");
+        result.info.immediateOffset = getSignedBits((int)baseOffBits, 12, 20);
+        if (result.info.immediateOffset > 0) {
+          result.syntax.immOffset =
+              "+" + fmtHexSigned(result.info.immediateOffset);
+        } else if (result.info.immediateOffset < 0) {
+          result.syntax.immOffset = fmtHexSigned(result.info.immediateOffset);
+        }
+        addField("ImmediateOffset", 32 + 12, 20,
+                 (uint32_t)result.info.immediateOffset,
+                 result.syntax.immOffset);
+      }
+
+    } else if ((atBits == LSC_AT_BSS || atBits == LSC_AT_SS) &&
+               exDesc.isReg() && sfid == SFID::TGM) {
+      addDoc(DocRef::EXDESC, "EXDESC_SURFACE", "64017");
+    } else if ((atBits == LSC_AT_BSS || atBits == LSC_AT_SS) &&
+               exDesc.isReg() && sfid == SFID::UGM) {
+      addDoc(DocRef::EXDESC, "EXDESCIMM_BSSO_SSO", "70586");
+      // SS/BSS 16b or 17b (UGM)
+      // ExDescImm[31:19] are Offset[16:4]
+      // ExDescImm[18:16] are unmapped (addr reg)
+      // ExDescImm[15:12] are Offset[3:0]
+      if (sfid != SFID::UGM && baseOffBits != 0) {
+        error(32, 32, "bss/ss: immediate offset forbidden for non-ugm");
+      }
+      uint32_t packed = ((getBits(baseOffBits, 19, 31 - 19 + 1) << 4) |
+                         getBits(baseOffBits, 12, 3 - 0 + 1));
+      result.info.immediateOffset = getSignedBits(packed, 0, 17);
+      if (result.info.immediateOffset > 0) {
+        result.syntax.immOffset =
+            "+" + fmtHexSigned(result.info.immediateOffset);
+      } else if (result.info.immediateOffset < 0) {
+        result.syntax.immOffset = fmtHexSigned(result.info.immediateOffset);
+      }
+      addField("ImmediateOffset[16:4]", 32 + 19, 16 - 4 + 1,
+               getBits(packed, 4, 16 - 4 + 1), result.syntax.immOffset);
+      addField("ImmediateOffset[3:0]", 32 + 12, 3 - 0 + 1,
+               getBits(packed, 0, 3 - 0 + 1), result.syntax.immOffset);
+      addField("Reserved", 32 + 16, 3, getBits(baseOffBits, 16, 3),
+               "a0.subreg");
+      if (getBits(baseOffBits, 16, 3)) {
+        error(32 + 16, 3, "ExDesc[19:16] must be zeros");
+      }
+    } else if (atBits == LSC_AT_BSS || atBits == LSC_AT_SS) { // bss/ss imm
+      addDoc(DocRef::EXDESC, "EXDESC_SURFACE", "64017");
+    } else if (atBits == LSC_AT_BTI && exDesc.isReg()) {
+      if (exImmOffDesc != 0)
+        error(32 + 12, 12, "immediate offset forbidden for BTI reg");
+    } else if (atBits == LSC_AT_BTI) {
+      addDoc(DocRef::EXDESC, "EXDESC_BTI", "63997");
+      // ExDesc[23:12] is immm off
+      result.info.immediateOffset =
+          getSignedBits((int32_t)baseOffBits, 12, 23 - 12 + 1);
+      if (result.info.immediateOffset > 0) {
+        result.syntax.immOffset =
+            "+" + fmtHexSigned(result.info.immediateOffset);
+      } else if (result.info.immediateOffset < 0) {
+        result.syntax.immOffset = fmtHexSigned(result.info.immediateOffset);
+      }
+      addField("ImmediateOffset[11:0]", 32 + 12, 23 - 12 + 1,
+               result.info.immediateOffset, result.syntax.immOffset);
+    }  // else: BSS/SS with imm ex desc
   }
 
   static const int ADDRTYPE_LOC = 29;
@@ -438,6 +562,8 @@ struct MessageDecoderLSC : MessageDecoder {
       dsym << "d8u32";
       meaning = "load 8b into the low 8b of 32b register elements "
                 "(upper bits are undefined)";
+      if (platform() >= Platform::XE2)
+        meaning = "load 8b and zero-extend to 32b per data element";
       break;
     case LSC_D16U32:
       dataSizeRegBits = 32;
@@ -445,6 +571,8 @@ struct MessageDecoderLSC : MessageDecoder {
       dsym << "d16u32";
       meaning = "load 16b into the low 16b of 32b register elements "
                 "(upper bits are undefined)";
+      if (platform() >= Platform::XE2)
+        meaning = "load 16b and zero-extend to 32b per data element";
       break;
     case LSC_D16U32H:
       dataSizeRegBits = 32;
@@ -567,13 +695,15 @@ struct MessageDecoderLSC : MessageDecoder {
   }
 
   ///////////////////////////////////////////////////////////////////////////
-  void decodeLscMessage(const char *doc, std::string msgDesc, SendOp lscOp) {
+  void decodeLscMessage(std::string msgDesc, SendOp lscOp) {
     const std::string symbol = ToSyntax(lscOp);
     op = lscOp;
 
     const SendOpDefinition &opInfo = lookupSendOp(lscOp);
     bool opSupportsUvr = lscOp == SendOp::LOAD_QUAD ||
                          lscOp == SendOp::STORE_QUAD ||
+                         lscOp == SendOp::LOAD_BLOCK2D ||
+                         lscOp == SendOp::STORE_BLOCK2D ||
                          lscOp == SendOp::STORE_UNCOMPRESSED_QUAD ||
                          opInfo.isAtomic();
     if (sfid == SFID::TGM && opSupportsUvr) {
@@ -582,8 +712,6 @@ struct MessageDecoderLSC : MessageDecoder {
 
     addField("Opcode", 0, 6, getDescBits(0, 6), symbol);
 
-    setDoc(doc);
-    //
     if (exDesc.isImm() && (exDesc.imm & 0x7FF)) {
       // bit 11 may or may not be available
       error(0, 12, "ExDesc[11:0] must be 0 on this platform");
@@ -595,6 +723,10 @@ struct MessageDecoderLSC : MessageDecoder {
     if (op == SendOp::LOAD_BLOCK2D || op == SendOp::STORE_BLOCK2D) {
       addrSizeBits = 64;
       addrSizeSyntax = "a64";
+    } else if (op == SendOp::ATOMIC_ACADD || op == SendOp::ATOMIC_ACSUB ||
+               op == SendOp::ATOMIC_ACSTORE) {
+      addrSizeBits = 32;
+      addrSizeSyntax = "a32";
     } else {
       decodeLscAddrSize();
     }
@@ -641,147 +773,316 @@ struct MessageDecoderLSC : MessageDecoder {
     }
   }
 
+  void decodeLscMessageTypeBlock2D(std::string msgDesc, SendOp lscOp) {
+    const std::string symbol = ToSyntax(lscOp);
+    op = lscOp;
+    extraAttrs |= MessageInfo::Attr::HAS_UVRLOD;
+    expectedExecSize = 1;
+    addField("Opcode", 0, 6, getDescBits(0, 6), symbol);
 
-  void setLscAtomicMessage(const char *doc, std::string msgDesc, SendOp atOp) {
+    SendDesc surfaceId(0x0);
+    AddrType addrType = decodeLscAddrType(surfaceId);
+    if (addrType != AddrType::BSS && addrType != AddrType::BTI) {
+      error(ADDRTYPE_LOC, 2, "addr surface type must be BSS or BTI");
+    }
+
+    addrSizeBits = 32;
+    addrSizeSyntax = format("a", addrSizeBits);
+
+    dataSizeRegBits = dataSizeMemBits = 32; // ?
+    dataTypePrefixSyntax = format("d", dataSizeMemBits);
+
+    CacheOpt l1 = CacheOpt::DEFAULT, l3 = CacheOpt::DEFAULT;
+    decodeCacheControl(op, l1, l3);
+
+    result.syntax.mnemonic = symbol;
+    result.syntax.controls += '.';
+    result.syntax.controls += dataTypePrefixSyntax;
+    result.syntax.controls += '.';
+    result.syntax.controls += addrSizeSyntax;
+    if (!cacheControlSyntax.empty()) {
+      result.syntax.controls += cacheControlSyntax;
+    }
+    setScatterGatherOpX(symbolFromSyntax(), msgDesc, op, addrType, surfaceId,
+                        l1, l3, addrSizeBits, dataSizeRegBits, dataSizeMemBits,
+                        vectorSize, expectedExecSize, extraAttrs);
+  }
+
+  void decodeLscAtomicMessage(std::string msgDesc, SendOp atOp) {
     extraAttrs |= getDescBits(20, 5) != 0 ? MessageInfo::Attr::ATOMIC_RETURNS
                                           : MessageInfo::Attr::NONE;
     if (sfid == SFID::TGM)
       extraAttrs |= MessageInfo::Attr::HAS_UVRLOD;
-    decodeLscMessage(doc, msgDesc, atOp);
+    decodeLscMessage(msgDesc, atOp);
+    addDocRefsVecCmask();
   }
 
+  // similar to decodeLscAtomicMessage, but we disable syntax since
+  // we don't wish to support it yet
+  void decodeLscAtomicAppendMessage(const char *msgDesc, SendOp atOp) {
+    decodeLscAtomicMessage(msgDesc, atOp);
+    result.syntax.layout = MessageSyntax::Layout::INVALID;
+  }
+
+  // load/store/atomic etc... (non-cmask)
+  void decodeLscVectorCmask(const char *name, SendOp op) {
+    decodeLscMessage(name, op);
+    addDocRefsVecCmask();
+  }
+  void addDocRefsVecCmask() {
+    if (!result.errors.empty()) {
+      return;
+    }
+    ///// data payloads
+    auto addDataPayload = [&](DocRef::Kind kind) {
+      const auto nullaryAtomic = result.info.op == SendOp::ATOMIC_LOAD ||
+                                 result.info.op == SendOp::ATOMIC_IINC ||
+                                 result.info.op == SendOp::ATOMIC_IDEC;
+      if (nullaryAtomic && kind == DocRef::SRC1)
+        return; // no payload
+
+      const auto binaryAtomicSrc =
+          kind == DocRef::SRC1 && (result.info.op == SendOp::ATOMIC_ICAS ||
+                                   result.info.op == SendOp::ATOMIC_FCAS);
+
+      if (result.info.elemSizeBitsRegFile == 32) {
+        if (binaryAtomicSrc) {
+          if (result.info.execWidth <= 8 && platform() <= Platform::XE_HPG) {
+            addDocXe(kind, "D32_2SRC_ATM_PAYLOAD_SIMT8", "55499", nullptr);
+          } else if (result.info.execWidth <= 16) {
+            addDocXe(kind, "D32_2SRC_ATM_PAYLOAD_SIMT16", "54696", "64003");
+          } else if (result.info.execWidth <= 32) {
+            addDocXe(kind, "D32_2SRC_ATM_PAYLOAD", "54693", "64002");
+          }
+        } else if (result.info.execWidth <= 8 &&
+                   platform() <= Platform::XE_HPG) {
+          addDocXe(kind, "D32_2SRC_ATM_PAYLOAD_SIMT8", "55499", nullptr);
+        } else if (result.info.execWidth <= 8 &&
+                   platform() <= Platform::XE_HPG) {
+          addDocXe(kind, "D32_PAYLOAD_SIMT8", "55497", nullptr);
+        } else if (result.info.execWidth <= 16) {
+          addDocXe(kind, "D32_PAYLOAD_SIMT16", "54146", "64000");
+        } else {
+          addDocXe(kind, "D32_PAYLOAD", "53574", "63999");
+        }
+      } else if (result.info.elemSizeBitsRegFile == 64) {
+        if (binaryAtomicSrc) {
+          if (result.info.execWidth <= 8 && platform() <= Platform::XE_HPG) {
+            addDocXe(kind, "D64_2SRC_ATM_PAYLOAD_SIMT8", "55498", nullptr);
+          } else if (result.info.execWidth <= 16) {
+            addDocXe(kind, "D64_2SRC_ATM_PAYLOAD_SIMT16", "54695", "64008");
+          } else if (result.info.execWidth <= 32) {
+            addDocXe(kind, "D64_2SRC_ATM_PAYLOAD", "54692", "64007");
+          }
+        } else if (result.info.execWidth <= 8 &&
+                   platform() <= Platform::XE_HPG) {
+          addDocXe(kind, "D64_PAYLOAD_SIMT8", "75252", nullptr);
+        } else if (result.info.execWidth <= 16) {
+          addDocXe(kind, "D64_PAYLOAD_SIMT16", "54147", "64006");
+        } else {
+          addDocXe(kind, "D64_PAYLOAD", "53575", "64005");
+        }
+      }
+    };
+
+    if (result.info.isLoad() || result.info.isAtomic()) {
+      addDataPayload(DocRef::DST);
+    }
+
+    ///// address payloads
+    if (op == SendOp::LOAD_STRIDED || op == SendOp::STORE_STRIDED) {
+      addDocXe(DocRef::SRC0, "ABLOCK_PAYLOAD", "53571", "63996");
+    } else if (result.info.isTransposed()) {
+      addDocXe(DocRef::SRC0, "A64_PAYLOAD_SIMT1", "55190", "63994");
+    } else if (result.info.addrSizeBits == 32) {
+      if (result.info.execWidth <= 16 && platform() <= Platform::XE_HPG) {
+        addDocXe(DocRef::SRC0, "A32_PAYLOAD_SIMT8", "55496", nullptr);
+      } else if (result.info.execWidth <= 16) {
+        addDocXe(DocRef::SRC0, "A32_PAYLOAD_SIMT16", "54148", "63991");
+      } else {
+        addDocXe(DocRef::SRC0, "A32_PAYLOAD", "53569", "63990");
+      }
+    } else if (result.info.addrSizeBits == 64) {
+      if (result.info.execWidth <= 16 && platform() <= Platform::XE_HPG) {
+        // pending an update
+        addDocXe(DocRef::SRC0, "A64_PAYLOAD_SIMT8", "75251", nullptr);
+      } else if (result.info.execWidth <= 16) {
+        addDocXe(DocRef::SRC0, "A64_PAYLOAD_SIMT16", "54149", "63995");
+      } else {
+        addDocXe(DocRef::SRC0, "A64_PAYLOAD", "53570", "63993");
+      }
+    }
+
+    // src1
+    if (result.info.isAtomic() || result.info.isStore()) {
+      addDataPayload(DocRef::SRC1);
+    }
+  } // addDocRefsVecCmask
 
   void tryDecodeLsc() {
     int lscOp = getDescBits(0, 6); // Opcode[5:0]
     switch (lscOp) {
     case LSC_LOAD:
-      decodeLscMessage(chooseDoc(nullptr, "53523", "63970"), "gathering load",
-                       SendOp::LOAD);
+      addDocRefDESC("DP_LOAD", "53523", "63970");
+      decodeLscVectorCmask("gathering load", SendOp::LOAD);
       break;
     case LSC_STORE:
-      decodeLscMessage(chooseDoc(nullptr, "53523", "63980"), "scattering store",
-                       SendOp::STORE);
+      addDocRefDESC("DP_STORE", "53524", "63980");
+      decodeLscVectorCmask("scattering store", SendOp::STORE);
       break;
     case LSC_STORE_UNCOMPRESSED:
-      decodeLscMessage(chooseDoc(nullptr, "53532", "63984"),
-                       "scattering store uncompressed",
+      addDocRefDESC("DP_STORE_UNCOMPRESSED", "53532", "63984");
+      decodeLscMessage("scattering store uncompressed",
                        SendOp::STORE_UNCOMPRESSED);
       break;
     case LSC_STORE_UNCOMPRESSED_QUAD:
-      decodeLscMessage(chooseDoc(nullptr, "55224", "63985"),
-                       "store quad uncompressed",
-                       SendOp::STORE_UNCOMPRESSED_QUAD);
+      addDocRefDESC("DP_STORE_UC_CMASK", "55224", "63985");
+      decodeLscVectorCmask("store quad uncompressed",
+                           SendOp::STORE_UNCOMPRESSED_QUAD);
       break;
     case LSC_LOAD_QUAD:
-      decodeLscMessage(chooseDoc(nullptr, "53527", "63977"),
-                       "quad load (a.k.a. load_cmask)", SendOp::LOAD_QUAD);
+      addDocRefDESC("DP_LOAD_CMASK", "53527", "63977");
+      decodeLscVectorCmask("quad load (a.k.a. load_cmask)", SendOp::LOAD_QUAD);
       break;
     case LSC_STORE_QUAD:
-      decodeLscMessage(chooseDoc(nullptr, "53527", "63983"),
-                       "quad store (a.k.a. store_cmask)", SendOp::STORE_QUAD);
+      addDocRefDESC("DP_STORE_CMASK", "53527", "63983");
+      decodeLscVectorCmask("quad store (a.k.a. store_cmask)",
+                           SendOp::STORE_QUAD);
       break;
     case LSC_LOAD_STRIDED:
-      decodeLscMessage(chooseDoc(nullptr, "53525", "63976"),
-                       "strided load (a.k.a load_block)", SendOp::LOAD_STRIDED);
+      addDocRefDESC("DP_LOAD_BLOCK", "53525", "63976");
+      decodeLscVectorCmask("strided load (a.k.a load_block)",
+                           SendOp::LOAD_STRIDED);
       break;
     case LSC_STORE_STRIDED:
-      decodeLscMessage(chooseDoc(nullptr, "53526", "63982"),
-                       "strided store (a.k.a store_block)",
-                       SendOp::STORE_STRIDED);
+      addDocRefDESC("DP_STORE_BLOCK", "53526", "63982");
+      decodeLscVectorCmask("strided store (a.k.a store_block)",
+                           SendOp::STORE_STRIDED);
       break;
     case LSC_LOAD_BLOCK2D:
-      decodeLscMessage(chooseDoc(nullptr, "53680", "63972"), "block2d load",
-                       SendOp::LOAD_BLOCK2D);
+      if (sfid == SFID::TGM) {
+        addDocRefDESCXE2("DP_LOAD_TYPED_2DBLOCK", "65280");
+        addDocXe(DocRef::SRC0, "Typed_2DBlock_Payload", nullptr, "65282");
+        decodeLscMessageTypeBlock2D("block2d load", SendOp::LOAD_BLOCK2D);
+      } else {
+        addDocRefDESC("DP_LOAD_2DBLOCK_ARRAY", "53680", "63972");
+        addDocXe(DocRef::SRC0, "A2DBLOCK_PAYLOAD", "53567", "63986");
+        decodeLscMessage("block2d load", SendOp::LOAD_BLOCK2D);
+      }
       break;
     case LSC_STORE_BLOCK2D:
-      decodeLscMessage(chooseDoc(nullptr, "53530", "63981"), "block2d store",
-                       SendOp::STORE_BLOCK2D);
+      if (sfid == SFID::TGM) {
+        addDocRefDESCXE2("DP_STORE_TYPED_2DBLOCK", "65281");
+        decodeLscMessageTypeBlock2D("block2d store", SendOp::STORE_BLOCK2D);
+        break;
+      } else {
+        addDocRefDESC("DP_STORE_2DBLOCK", "53530", "63981");
+        decodeLscMessage("block2d store", SendOp::STORE_BLOCK2D);
+      }
       break;
     case LSC_ATOMIC_IINC:
-      setLscAtomicMessage(chooseDoc(nullptr, "53538", "63955"),
-                          "atomic integer increment", SendOp::ATOMIC_IINC);
+      addDocRefDESC("DP_ATOMIC_INC", "53538", "63955");
+      decodeLscAtomicMessage("atomic integer increment", SendOp::ATOMIC_IINC);
       break;
     case LSC_ATOMIC_IDEC:
-      setLscAtomicMessage(chooseDoc(nullptr, "53539", "63949"),
-                          "atomic integer decrement", SendOp::ATOMIC_IDEC);
+      addDocRefDESC("DP_ATOMIC_DEC", "53539", "63949");
+      decodeLscAtomicMessage("atomic integer decrement", SendOp::ATOMIC_IDEC);
       break;
     case LSC_ATOMIC_LOAD:
-      setLscAtomicMessage(chooseDoc(nullptr, "53540", "63956"), "atomic load",
-                          SendOp::ATOMIC_LOAD);
+      addDocRefDESC("DP_ATOMIC_LOAD", "53540", "63956");
+      decodeLscAtomicMessage("atomic load", SendOp::ATOMIC_LOAD);
       break;
     case LSC_ATOMIC_STORE:
-      setLscAtomicMessage(chooseDoc(nullptr, "53541", "63960"), "atomic store",
-                          SendOp::ATOMIC_STORE);
+      addDocRefDESC("DP_ATOMIC_STORE", "53541", "63960");
+      decodeLscAtomicMessage("atomic store", SendOp::ATOMIC_STORE);
       break;
     case LSC_ATOMIC_IADD:
-      setLscAtomicMessage(chooseDoc(nullptr, "53542", "63946"),
-                          "atomic integer add", SendOp::ATOMIC_IADD);
+      addDocRefDESC("DP_ATOMIC_ADD", "53542", "63946");
+      decodeLscAtomicMessage("atomic integer add", SendOp::ATOMIC_IADD);
       break;
     case LSC_ATOMIC_ISUB:
-      setLscAtomicMessage(chooseDoc(nullptr, "53543", "63961"),
-                          "atomic integer subtract", SendOp::ATOMIC_ISUB);
+      addDocRefDESC("DP_ATOMIC_SUB", "53543", "63961");
+      decodeLscAtomicMessage("atomic integer subtract", SendOp::ATOMIC_ISUB);
       break;
     case LSC_ATOMIC_SMIN:
-      setLscAtomicMessage(chooseDoc(nullptr, "53544", "63958"),
-                          "atomic signed-integer minimum", SendOp::ATOMIC_SMIN);
+      addDocRefDESC("DP_ATOMIC_MIN", "53544", "63958");
+      decodeLscAtomicMessage("atomic signed-integer minimum", SendOp::ATOMIC_SMIN);
       break;
     case LSC_ATOMIC_SMAX:
-      setLscAtomicMessage(chooseDoc(nullptr, "53545", "63957"),
-                          "atomic signed-integer maximum", SendOp::ATOMIC_SMAX);
+      addDocRefDESC("DP_ATOMIC_MAX", "53545", "63957");
+      decodeLscAtomicMessage("atomic signed-integer maximum", SendOp::ATOMIC_SMAX);
       break;
     case LSC_ATOMIC_UMIN:
-      setLscAtomicMessage(chooseDoc(nullptr, "53546", "63963"),
-                          "atomic unsigned-integer minimum",
+      addDocRefDESC("DP_ATOMIC_UMIN", "53546", "63963");
+      decodeLscAtomicMessage("atomic unsigned-integer minimum",
                           SendOp::ATOMIC_UMIN);
       break;
     case LSC_ATOMIC_UMAX:
-      setLscAtomicMessage(chooseDoc(nullptr, "53547", "63962"),
-                          "atomic unsigned-integer maximum",
+      addDocRefDESC("DP_ATOMIC_UMAX", "53547", "63962");
+      decodeLscAtomicMessage("atomic unsigned-integer maximum",
                           SendOp::ATOMIC_UMAX);
       break;
     case LSC_ATOMIC_ICAS:
-      setLscAtomicMessage(chooseDoc(nullptr, "53555", "63948"),
-                          "atomic integer compare and swap",
+      addDocRefDESC("DP_ATOMIC_CMPXCHG", "53555", "63948");
+      decodeLscAtomicMessage("atomic integer compare and swap",
                           SendOp::ATOMIC_ICAS);
       break;
     case LSC_ATOMIC_FADD:
-      setLscAtomicMessage(chooseDoc(nullptr, "53548", "63950"),
-                          "atomic float add", SendOp::ATOMIC_FADD);
+      addDocRefDESC("DP_ATOMIC_FADD", "53548", "63950");
+      decodeLscAtomicMessage("atomic float add", SendOp::ATOMIC_FADD);
       break;
     case LSC_ATOMIC_FSUB:
-      setLscAtomicMessage(chooseDoc(nullptr, "53549", "63954"),
-                          "atomic float subtract", SendOp::ATOMIC_FSUB);
+      addDocRefDESC("DP_ATOMIC_FSUB", "53549", "63954");
+      decodeLscAtomicMessage("atomic float subtract", SendOp::ATOMIC_FSUB);
       break;
     case LSC_ATOMIC_FMIN:
-      setLscAtomicMessage(chooseDoc(nullptr, "53550", "63953"),
-                          "atomic float minimum", SendOp::ATOMIC_FMIN);
+      addDocRefDESC("DP_ATOMIC_FMIN", "53550", "63953");
+      decodeLscAtomicMessage("atomic float minimum", SendOp::ATOMIC_FMIN);
       break;
     case LSC_ATOMIC_FMAX:
-      setLscAtomicMessage(chooseDoc(nullptr, "53551", "63952"),
-                          "atomic float maximum", SendOp::ATOMIC_FMAX);
+      addDocRefDESC("DP_ATOMIC_FMAX", "53551", "63952");
+      decodeLscAtomicMessage("atomic float maximum", SendOp::ATOMIC_FMAX);
       break;
     case LSC_ATOMIC_FCAS:
-      setLscAtomicMessage(chooseDoc(nullptr, "53556", "63951"),
-                          "atomic float compare and swap", SendOp::ATOMIC_FCAS);
+      addDocRefDESC("DP_ATOMIC_FCMPXCHG", "DP_XXX", "63951");
+      decodeLscAtomicMessage("atomic float compare and swap", SendOp::ATOMIC_FCAS);
       break;
     case LSC_ATOMIC_AND:
-      setLscAtomicMessage(chooseDoc(nullptr, "53552", "63947"),
-                          "atomic logical and", SendOp::ATOMIC_AND);
+      addDocRefDESC("DP_ATOMIC_AND", "53552", "63947");
+      decodeLscAtomicMessage("atomic logical and", SendOp::ATOMIC_AND);
       break;
     case LSC_ATOMIC_OR:
-      setLscAtomicMessage(chooseDoc(nullptr, "53553", "63959"),
-                          "atomic logical or", SendOp::ATOMIC_OR);
+      addDocRefDESC("DP_ATOMIC_OR", "53553", "63959");
+      decodeLscAtomicMessage("atomic logical or", SendOp::ATOMIC_OR);
       break;
     case LSC_ATOMIC_XOR:
-      setLscAtomicMessage(chooseDoc(nullptr, "53554", "63964"),
-                          "atomic logical xor", SendOp::ATOMIC_XOR);
+      addDocRefDESC("DP_ATOMIC_XOR", "53554", "63964");
+      decodeLscAtomicMessage("atomic logical xor", SendOp::ATOMIC_XOR);
+      break;
+    case LSC_ATOMIC_APNDADD:
+      addDocRefDESCXE2("DP_APPENDCTR_ATOMIC_ADD", "68353");
+      decodeLscAtomicAppendMessage("atomic counter append add",
+                                   SendOp::ATOMIC_ACADD);
+      break;
+    case LSC_ATOMIC_APNDSUB:
+      addDocRefDESCXE2("DP_APPENDCTR_ATOMIC_SUB", "68353");
+      decodeLscAtomicAppendMessage("atomic counter append sub",
+                                   SendOp::ATOMIC_ACSUB);
+      break;
+    case LSC_ATOMIC_APNDSTORE:
+      addDocRefDESCXE2("DP_APPENDCTR_ATOMIC_ST", "68354");
+      decodeLscAtomicAppendMessage("atomic counter append store",
+                                   SendOp::ATOMIC_ACSTORE);
       break;
     case LSC_CCS:
       decodeLscCcs();
       break;
     case LSC_RSI: {
+      addDocRefDESC("DP_RSI", "54000", "63979");
+      addDocXe(DocRef::DST, "DP_STATE_INFO_PAYLOAD", "54152", "64015");
+      addDocXe(DocRef::SRC0, "DP_ASTATE_INFO_PAYLOAD", "55018",  "64014");
+
       addField("Opcode", 0, 6, getDescBits(0, 6), "read_state");
-      setDoc(nullptr, "54000", "63979");
       //
       std::stringstream descs;
       descs << "read state information";
@@ -804,17 +1105,19 @@ struct MessageDecoderLSC : MessageDecoder {
       break;
     }
     case LSC_FENCE:
+      addDocRefDESC("DP_FENCE", "53533", "63969");
       decodeLscFence();
       break;
     case LSC_LOAD_STATUS:
+      addDocRefDESC("DP_LOAD_STATUS", "53531", "63978");
+      addDocXe(DocRef::DST, "DP_STATUS_PAYLOAD", "55018", "64016");
       if (getDescBit(15)) {
         error(15, 1, "transpose forbidden on load_status");
       }
       if (getDescBits(20, 5) != 1) {
         error(20, 5, "load_status must have rlen (Desc[24:20] == 1)");
       }
-      decodeLscMessage(chooseDoc(nullptr, "53531", "63978"), "load status",
-                       SendOp::LOAD_STATUS);
+      decodeLscMessage("load status", SendOp::LOAD_STATUS);
       break;
     default:
       addField("Opcode", 0, 6, getDescBits(0, 6), "invalid message opcode");
@@ -838,26 +1141,26 @@ struct MessageDecoderLSC : MessageDecoder {
       sop = SendOp::CCS_PC;
       result.syntax.mnemonic += "_pc";
       opDesc = " page clear (64k)";
-      setDoc(nullptr, "53536", "63965");
+      addDocRefDESC("DP_CCS_PAGE_CLEAR", "53536", "63965");
       break;
     case 1:
       sop = SendOp::CCS_SC;
       result.syntax.mnemonic += "_sc";
       opDesc = " sector clear (2-cachelines)";
-      setDoc(nullptr, "53534", "63967");
+      addDocRefDESC("DP_CCS_SEC_CLEAR", "53534", "63967");
       result.syntax.controls += vectorSuffixSyntax;
       break;
     case 2:
       sop = SendOp::CCS_PU;
       result.syntax.mnemonic += "_pu";
       opDesc = " page uncompress (64k)";
-      setDoc(nullptr, "53537", "63966");
+      addDocRefDESC("DP_CCS_PAGE_UNCOMPRESS", "53537", "63966");
       break;
     case 3:
       sop = SendOp::CCS_SU;
       result.syntax.mnemonic += "_su";
       opDesc = " sector uncompress (2-cachelines)";
-      setDoc(nullptr, "53535", "63968");
+      addDocRefDESC("DP_CCS_SEC_UNCOMPRESS", "53535", "63968");
       result.syntax.controls += vectorSuffixSyntax;
       break;
     default: {
@@ -911,7 +1214,6 @@ struct MessageDecoderLSC : MessageDecoder {
 
   void decodeLscFence() {
     addField("Opcode", 0, 6, getDescBits(0, 6), "fence");
-    setDoc(nullptr, "53533", "63969");
     //
     std::stringstream descs;
     result.syntax.mnemonic = "fence";
@@ -930,10 +1232,10 @@ struct MessageDecoderLSC : MessageDecoder {
 }; // MessageDecoderLSC
 
 void iga::decodeDescriptorsLSC(Platform platform, SFID sfid, ExecSize execSize,
-                               SendDesc exDesc, SendDesc desc,
-                               DecodeResult &result) {
-  MessageDecoderLSC md(platform, sfid, execSize,
-                       exDesc, desc, result);
+                               uint32_t exImmOffDesc, SendDesc exDesc,
+                               SendDesc desc, DecodeResult &result) {
+  MessageDecoderLSC md(platform, sfid, execSize, exImmOffDesc, exDesc, desc,
+                       result);
   md.tryDecodeLsc();
 }
 
@@ -981,14 +1283,127 @@ static bool encLdStVecCachingBits17_19(SendOp op, CacheOpt cachingL1,
   return matched;
 }
 
+// encLdStVecCachingBits17_19 - Encode 4-bits cache opt at descriptor[19:16]
+// Cache opt on XE2+ is 4 bits field comparing to 3 bits on pre-XE2
+// XE2 is [19:16] and preXE2 is [19:17]
+static bool encLdStVecCachingBits16_19(SendOp op, CacheOpt cachingL1,
+                                       CacheOpt cachingL3, SendDesc &desc) {
+  // special handle L1RI_L3CA which is not allowed in 4-bits-cache-opt mode
+  if (cachingL1 == CacheOpt::READINVALIDATE &&
+      cachingL3 == CacheOpt::CONSTCACHED)
+    return false;
+
+  // bits in [19:17] are the same as encLdStVecCachingBits17_19
+  if (encLdStVecCachingBits17_19(op, cachingL1, cachingL3, desc))
+    return true;
+
+  // otherwise, check the new combination (all for load only)
+  // L1UC_L3CC, L1CA_L3CC, L1RI_L3RI
+  const auto &opInfo = lookupSendOp(op);
+  bool isLd = opInfo.isLoad();
+  auto ccMatches = [&](CacheOpt l1, CacheOpt l3, uint32_t enc) {
+    if (l1 == cachingL1 && l3 == cachingL3) {
+      desc.imm |= enc << 16;
+      return true;
+    }
+    return false;
+  };
+  bool matched =
+      (isLd &&
+       ccMatches(CacheOpt::UNCACHED, CacheOpt::CONSTCACHED, LSC_UC_CC)) ||
+      (isLd && ccMatches(CacheOpt::CACHED, CacheOpt::CONSTCACHED, LSC_CA_CC)) ||
+      (isLd && ccMatches(CacheOpt::READINVALIDATE, CacheOpt::READINVALIDATE,
+                         LSC_RI_RI));
+  return matched;
+}
+
+static bool encLdStVecImmOffset(Platform p, const VectorMessageArgs &vma,
+                                uint32_t &exImmOffDesc, SendDesc &exDesc,
+                                std::string &err) {
+  const bool isBlock2d =
+      vma.op == SendOp::LOAD_BLOCK2D || vma.op == SendOp::STORE_BLOCK2D;
+  auto fitsInBitSize = [](int bits, int offset) {
+    return offset >= -(1 << (bits - 1)) && offset <= (1 << (bits - 1)) - 1;
+  };
+  uint32_t encodedOffset = 0;
+  if (isBlock2d && vma.addrOffsetX * vma.dataSizeMem % 32 != 0) {
+    err = "address offset-y must be 32b aligned";
+    return false;
+  } else if (isBlock2d && vma.addrOffsetY * vma.dataSizeMem % 32 != 0) {
+    err = "address offset-x must be 32b aligned";
+    return false;
+  } else if (!isBlock2d && vma.addrOffset % 4 != 0) {
+    err = "address offset must be 32b aligned";
+    return false;
+  } else if (vma.addrType == AddrType::FLAT) {
+    if (isBlock2d) {
+      if (vma.sfid != SFID::UGM) {
+        err = "address offset only defined for flat ugm";
+        return false;
+      } else if (!fitsInBitSize(10, vma.addrOffsetX)) {
+        err = "address offset-x only exceeds 10b";
+        return false;
+      } else if (!fitsInBitSize(10, vma.addrOffsetY)) {
+        err = "address offset-y only exceeds 10b";
+        return false;
+      }
+      // ExDescImm[31:22] = Y-offset
+      // ExDescImm[21:12] = X-offset
+      encodedOffset |= ((uint32_t)vma.addrOffsetY & 0x3FF) << 22;
+      encodedOffset |= ((uint32_t)vma.addrOffsetX & 0x3FF) << 12;
+    } else if (!fitsInBitSize(20, vma.addrOffset)) {
+      err = "address offset exceeds 20b";
+      return false;
+    } else {
+      // ExDescImm[31:12] = base offset
+      encodedOffset = (uint32_t)vma.addrOffset << 12;
+    }
+  } else if (isBlock2d) {
+    err = "block2d immediate offset only valid for flat";
+    return false;
+  } else if (vma.addrType == AddrType::BTI && !vma.addrSurface.isReg()) {
+    if (!fitsInBitSize(12, vma.addrOffset)) {
+      err = "bti address offset exceeds 12b";
+      return false;
+    }
+    encodedOffset = ((uint32_t)(vma.addrOffset & 0x00FFF) << 12);
+  } else if (vma.addrSurface.isReg()) {
+    if (vma.sfid != SFID::UGM) {
+      err = "unsupported SFID for ExDescReg + BaseOff";
+      return false;
+    } else if (!fitsInBitSize(17, vma.addrOffset)) {
+      err = "address offset of ss/bss (.ugm) exceeds 17b";
+      return false;
+    }
+    //
+    // ExDesc[31:19] = BaseOffset[16:4]
+    // ExDesc[15:12] = BaseOffset[3:0]
+    encodedOffset |= getBits((uint32_t)vma.addrOffset, 4, 13) << 19;
+    encodedOffset |= getBits((uint32_t)vma.addrOffset, 0, 4) << 12;
+  } else {
+    // BSS/SS with imm offset
+    err = "address offset forbidden bti/ss/bss with imm ExDesc surface";
+    return false;
+  }
+  // needs to write to exImmOffDesc only if ExDesc.IsReg
+  if (vma.addrSurface.isReg()) {
+    exImmOffDesc = encodedOffset;
+  } else {
+    exDesc = encodedOffset;
+  }
+  return true;
+}
 
 static bool encLdStVecCaching(const Platform &p, SendOp op, CacheOpt cachingL1,
                               CacheOpt cachingL3, SendDesc &desc) {
+  if (p >= Platform::XE2)
+    return encLdStVecCachingBits16_19(op, cachingL1, cachingL3, desc);
 
   return encLdStVecCachingBits17_19(op, cachingL1, cachingL3, desc);
 }
 
 static bool encLdStVec(Platform p, const VectorMessageArgs &vma,
+                       uint32_t &exImmOffDesc,
                        SendDesc &exDesc, SendDesc &desc, std::string &err) {
   desc = 0x0;
   exDesc = 0x0;
@@ -1087,6 +1502,15 @@ static bool encLdStVec(Platform p, const VectorMessageArgs &vma,
   case SendOp::ATOMIC_XOR:
     desc.imm |= LSC_ATOMIC_XOR;
     break;
+  case SendOp::ATOMIC_ACADD:
+    desc.imm |= LSC_ATOMIC_APNDADD;
+    break;
+  case SendOp::ATOMIC_ACSUB:
+    desc.imm |= LSC_ATOMIC_APNDSUB;
+    break;
+  case SendOp::ATOMIC_ACSTORE:
+    desc.imm |= LSC_ATOMIC_APNDSTORE;
+    break;
   default:
     err = "unsupported op";
     return false;
@@ -1096,6 +1520,10 @@ static bool encLdStVec(Platform p, const VectorMessageArgs &vma,
   bool isBlock2dTyped = isBlock2d && vma.sfid == SFID::TGM;
   bool isBlock2dUntyped = isBlock2d && vma.sfid != SFID::TGM;
   bool hasAddrSizeField = !isBlock2d;
+  bool isAtomicAddCounter = vma.op == SendOp::ATOMIC_ACADD ||
+                            vma.op == SendOp::ATOMIC_ACSUB ||
+                            vma.op == SendOp::ATOMIC_ACSTORE;
+  hasAddrSizeField &= !isAtomicAddCounter;
 
   //
   ////////////////////////////////////////
@@ -1292,34 +1720,6 @@ static bool encLdStVec(Platform p, const VectorMessageArgs &vma,
     err = "SLM requires flat address type";
     return false;
   }
-  ////////////////////////////////////////
-  // address scale factor
-  if (vma.addrScale != 1) {
-    if (true) { // disable if address scaling is ever added
-      err = "address scaling not supported on this platform";
-      return false;
-    }
-    int vlen = vma.elementsPerAddress();
-    int bytesPerElem = vma.dataSizeMem * vlen / 8;
-    uint32_t addrScEnc = LSC_SCALE_NONE;
-    if (vma.addrScale > 32) {
-      err = "scale value is too large";
-      return false;
-    } else if (vma.addrScale == bytesPerElem) {
-      addrScEnc = LSC_SCALE_1X;
-    } else if (vma.addrScale == 2 * bytesPerElem) {
-      addrScEnc = LSC_SCALE_2X;
-    } else if (vma.addrScale == 4 * bytesPerElem) {
-      addrScEnc = LSC_SCALE_4X;
-    } else {
-      std::stringstream ss;
-      ss << "invalid scaling factor (must be " << 1 * bytesPerElem << ", "
-         << 2 * bytesPerElem << ", or " << 4 * bytesPerElem << ")";
-      err = ss.str();
-      return false;
-    }
-    desc.imm |= addrScEnc << 22;
-  }
   //
   ////////////////////////////////////////
   // address immediate offset
@@ -1327,13 +1727,14 @@ static bool encLdStVec(Platform p, const VectorMessageArgs &vma,
   hasAddrImmOffset |= vma.addrOffsetX != 0;
   hasAddrImmOffset |= vma.addrOffsetY != 0;
   if (hasAddrImmOffset) {
-    bool platformSupportsAddrOff = false;
-    if (platformSupportsAddrOff) {
+    if (p < Platform::XE2) {
       err = "address immediate offset not supported on this platform";
       return false;
     }
 
-  }    // else: addrOffset == 0
+    if (!encLdStVecImmOffset(p, vma, exImmOffDesc, exDesc, err))
+      return false;
+  }  // else: addrOffset == 0
 
   ////////////////////////////////////////
   // set the surface object
@@ -1356,6 +1757,10 @@ static bool encLdStVec(Platform p, const VectorMessageArgs &vma,
   } else if (vma.addrType != AddrType::FLAT) {
     uint32_t ZERO_MASK = 0xFFF;
     std::string highBit = "11";
+    if (p >= Platform::XE2) {
+      ZERO_MASK = 0x7FF;
+      highBit = "10";
+    }
 
     // if BTI reg or BSS/SS reg/imm with just copy
     // BSS/SS with imm, value is already aligned
@@ -1373,12 +1778,11 @@ static bool encLdStVec(Platform p, const VectorMessageArgs &vma,
 }
 
 bool iga::encodeDescriptorsLSC(Platform p, const VectorMessageArgs &vma,
-                               SendDesc &exDesc, SendDesc &desc,
-                               std::string &err) {
+                               uint32_t &exImmOffDesc, SendDesc &exDesc,
+                               SendDesc &desc, std::string &err) {
   if (!sendOpSupportsSyntax(p, vma.op, vma.sfid)) {
     err = "unsupported message for SFID";
     return false;
   }
-  return encLdStVec(p, vma,
-                    exDesc, desc, err);
+  return encLdStVec(p, vma, exImmOffDesc, exDesc, desc, err);
 }

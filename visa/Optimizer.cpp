@@ -338,6 +338,12 @@ void Optimizer::addSWSBInfo() {
   return;
 }
 
+// Common pass for HW debug functions
+void Optimizer::HWDebug() {
+  if (builder.getOption(vISA_InsertHashMovs))
+    insertHashMovs();
+}
+
 void Optimizer::insertHashMovs() {
   // As per request from IGC team, we want to conditionally insert
   // two mov instructions like following:
@@ -671,7 +677,7 @@ void Optimizer::initOptimizations() {
   OPT_INITIALIZE_PASS(localSchedule, vISA_LocalScheduling, TimerID::SCHEDULING);
   OPT_INITIALIZE_PASS(HWWorkaround, vISA_EnableAlways, TimerID::MISC_OPTS);
   OPT_INITIALIZE_PASS(fixEndIfWhileLabels, vISA_EnableAlways, TimerID::NUM_TIMERS);
-  OPT_INITIALIZE_PASS(insertHashMovs, vISA_InsertHashMovs, TimerID::NUM_TIMERS);
+  OPT_INITIALIZE_PASS(HWDebug, vISA_EnableAlways, TimerID::NUM_TIMERS);
   OPT_INITIALIZE_PASS(insertDummyMovForHWRSWA, vISA_InsertDummyMovForHWRSWA,
                   TimerID::NUM_TIMERS);
   OPT_INITIALIZE_PASS(insertDummyCompactInst, vISA_InsertDummyCompactInst,
@@ -686,6 +692,8 @@ void Optimizer::initOptimizations() {
   OPT_INITIALIZE_PASS(createR0Copy, vISA_EnableAlways, TimerID::MISC_OPTS);
   OPT_INITIALIZE_PASS(initializePayload, vISA_InitPayload, TimerID::NUM_TIMERS);
   OPT_INITIALIZE_PASS(cleanupBindless, vISA_enableCleanupBindless,
+                  TimerID::OPTIMIZER);
+  OPT_INITIALIZE_PASS(cleanupA0Movs, vISA_enableCleanupA0Movs,
                   TimerID::OPTIMIZER);
   OPT_INITIALIZE_PASS(countGRFUsage, vISA_PrintRegUsage, TimerID::MISC_OPTS);
   OPT_INITIALIZE_PASS(changeMoveType, vISA_ChangeMoveType, TimerID::MISC_OPTS);
@@ -705,8 +713,7 @@ void Optimizer::initOptimizations() {
   OPT_INITIALIZE_PASS(mapOrphans, vISA_EnableAlways, TimerID::MISC_OPTS);
   OPT_INITIALIZE_PASS(legalizeType, vISA_EnableAlways, TimerID::MISC_OPTS);
   OPT_INITIALIZE_PASS(analyzeMove, vISA_analyzeMove, TimerID::MISC_OPTS);
-  OPT_INITIALIZE_PASS(removeInstrinsics, vISA_removeInstrinsics,
-                  TimerID::MISC_OPTS);
+  OPT_INITIALIZE_PASS(removeIntrinsics, vISA_EnableAlways, TimerID::MISC_OPTS);
   OPT_INITIALIZE_PASS(expandMulPostSchedule, vISA_expandMulPostSchedule,
                   TimerID::MISC_OPTS);
   OPT_INITIALIZE_PASS(zeroSomeARF, vISA_zeroSomeARF, TimerID::MISC_OPTS);
@@ -867,6 +874,8 @@ int Optimizer::optimization() {
 
   runPass(PI_removePartialMovs);
 
+  runPass(PI_cleanupA0Movs);
+
   // remove redundant movs and fold some other patterns
   runPass(PI_localCopyPropagation);
 
@@ -990,7 +999,7 @@ int Optimizer::optimization() {
   // the CFG assumption
   runPass(PI_fixEndIfWhileLabels);
 
-  runPass(PI_insertHashMovs);
+  runPass(PI_HWDebug);
 
   runPass(PI_insertDummyMovForHWRSWA);
 
@@ -1016,7 +1025,7 @@ int Optimizer::optimization() {
 
   runPass(PI_analyzeMove);
 
-  runPass(PI_removeInstrinsics);
+  runPass(PI_removeIntrinsics);
 
   runPass(PI_zeroSomeARF);
 
@@ -1234,7 +1243,8 @@ void Optimizer::reverseOffsetProp(AddrSubReg_Node addrRegInfo[8], int subReg,
 
 
 void Optimizer::FoldAddrImmediate() {
-  AddrSubReg_Node *addrRegInfo = new AddrSubReg_Node[getNumAddrRegisters()];
+  AddrSubReg_Node *addrRegInfo =
+      new AddrSubReg_Node[builder.getNumAddrRegisters()];
   int dst_subReg = 0, src0_subReg = 0;
   G4_DstRegRegion *dst;
   G4_Operand *src0, *src1;
@@ -1243,7 +1253,7 @@ void Optimizer::FoldAddrImmediate() {
   for (G4_BB *bb : fg) {
     INST_LIST_ITER ii, iend(bb->end());
     // reset address offset info
-    for (unsigned i = 0; i < getNumAddrRegisters(); i++) {
+    for (unsigned i = 0; i < builder.getNumAddrRegisters(); i++) {
       addrRegInfo[i].subReg = 0;
       addrRegInfo[i].immAddrOff = 0;
       addrRegInfo[i].iter = iend;
@@ -1426,7 +1436,7 @@ void Optimizer::FoldAddrImmediate() {
     }
 
     // if a def lives out of this BB, we can not delete the defining inst
-    for (unsigned i = 0; i < getNumAddrRegisters(); i++) {
+    for (unsigned i = 0; i < builder.getNumAddrRegisters(); i++) {
       // reverse immed offset propagation
       reverseOffsetProp(addrRegInfo, i, 0, iend, iend);
     }
@@ -2164,7 +2174,10 @@ static bool propagateType(IR_Builder &Builder, G4_BB *BB, G4_INST *Mov,
   if (PT == Type_UNDEF)
     return false;
   // Create a new destination of MOV of the propagation type.
-  unsigned NumElt = Mov->getExecSize();
+  // Consider both execution size and the dst horizontal stride to calculate
+  // the number of elements needed, so that we have the enough var size when
+  // creating the temp var.
+  unsigned NumElt = Mov->getExecSize() * Dst->getHorzStride();
   auto NewDcl = Builder.createTempVar(NumElt, PT, Any);
   auto NewDst = Builder.createDstRegRegion(NewDcl, Dst->getHorzStride());
   Mov->setDest(NewDst);
@@ -2712,10 +2725,6 @@ void Optimizer::localCopyPropagation() {
                     src->asSrcRegRegion()->getAddrImm());
               }
             }
-          } else if (inst->hasOneUse()) {
-            new_src_opnd = src;
-            new_src_opnd->asSrcRegRegion()->setModifier(new_mod);
-            new_src_opnd->asSrcRegRegion()->setType(builder, propType);
           } else {
             new_src_opnd = builder.duplicateOperand(src);
             new_src_opnd->asSrcRegRegion()->setModifier(new_mod);
@@ -3359,7 +3368,7 @@ bool Optimizer::foldCmpToCondMod(G4_BB *bb, INST_LIST_ITER &iter) {
         return false;
       if (!checkLifetime(inst, *it))
         return false;
-      if (inst->isAccSrcInst() && builder.hasMacl() &&
+      if (inst->isAccSrcInst() && builder.hasMacMacl() &&
           (*it)->opcode() == G4_mul && IS_DTYPE((*it)->getSrc(0)->getType()) &&
           IS_DTYPE((*it)->getSrc(1)->getType())) {
         // Do not sink instructions with explicit ACC src over mul
@@ -3785,84 +3794,7 @@ void Optimizer::optimizeLogicOperation() {
       // case 1
       if (ii != bb->begin() && op == G4_sel && inst->getPredicate() &&
           !inst->getCondMod()) {
-        if (!foldCmpSel(bb, inst, ii)) {
-          // Compare two operands with special simple checking on
-          // indirect access. That checking could be simplified as
-          // only dst/src of the same instruction are checked.
-          auto compareOperand = [](G4_DstRegRegion *A, G4_Operand *B,
-                                   unsigned ExecSize,
-                                   const IR_Builder &IRB) -> G4_CmpRelation {
-            G4_CmpRelation Res = A->compareOperand(B, IRB);
-            if (Res != Rel_interfere)
-              return Res;
-            if (!A->isIndirect() || !B->isIndirect())
-              return Res;
-            if (A->getHorzStride() != 1)
-              return Res;
-            // Extra check if both are indirect register accesses.
-            G4_VarBase *BaseA = A->getBase();
-            G4_VarBase *BaseB = B->getBase();
-            if (!BaseA || !BaseB || BaseA != BaseB || !BaseA->isRegVar())
-              return Res;
-            if (!B->isSrcRegRegion())
-              return Res;
-            G4_SrcRegRegion *S = B->asSrcRegRegion();
-            if (!S->getRegion()->isContiguous(ExecSize))
-              return Res;
-            if (A->getRegOff() != S->getRegOff() ||
-                A->getSubRegOff() != S->getSubRegOff())
-              return Res;
-            if (A->getAddrImm() != S->getAddrImm())
-              return Res;
-            return Rel_eq;
-          };
-
-          unsigned ExSz = inst->getExecSize();
-          G4_DstRegRegion *Dst = inst->getDst();
-          G4_Operand *Src0 = inst->getSrc(0);
-          G4_Operand *Src1 = inst->getSrc(1);
-          int OpndIdx = -1;
-          if (compareOperand(Dst, Src0, ExSz, builder) == Rel_eq &&
-              Src0->isSrcRegRegion() &&
-              Src0->asSrcRegRegion()->getModifier() == Mod_src_undef)
-            OpndIdx = 0;
-          else if (compareOperand(Dst, Src1, ExSz, builder) == Rel_eq &&
-                   Src1->isSrcRegRegion() &&
-                   Src1->asSrcRegRegion()->getModifier() == Mod_src_undef)
-            OpndIdx = 1;
-          if (OpndIdx >= 2) {
-            // If dst is equal to one of operands of 'sel', that
-            // 'sel' could be transformed into a predicated 'mov',
-            // i.e.,
-            //
-            // transforms
-            //
-            //  (+p) sel dst, src0, src1
-            //
-            // into
-            //
-            //  (+p) mov dst, src0   if dst == src1
-            //
-            // or
-            //
-            //  (-p) mov dst, src1   if dst == src0
-            //
-            if (OpndIdx == 0) {
-              // Inverse predicate.
-              G4_Predicate *Pred = inst->getPredicate();
-              G4_PredState State = Pred->getState();
-              State =
-                  (State == PredState_Plus) ? PredState_Minus : PredState_Plus;
-              Pred->setState(State);
-              // Swap source operands.
-              inst->swapSrc(0, 1);
-              inst->swapDefUse();
-            }
-            inst->setOpcode(G4_mov);
-            inst->setSrc(nullptr, 1);
-            inst->removeDefUse(Opnd_src1);
-          }
-        }
+        foldCmpSel(bb, inst, ii);
       } else if (builder.hasSmov() && inst->opcode() == G4_mov &&
                  inst->getPredicate() == NULL && inst->getCondMod() == NULL &&
                  inst->getExecSize() == g4::SIMD1 && inst->getSrc(0)->isImm() &&
@@ -4579,6 +4511,77 @@ G4_Operand *Optimizer::updateSendsHeaderReuse(
   return nullptr;
 }
 
+void Optimizer::cleanupA0Movs() {
+  for (auto bb : fg) {
+    InstValues values(4);
+    for (auto iter = bb->begin(), iterEnd = bb->end(); iter != iterEnd;) {
+      G4_INST *inst = *iter;
+
+      auto isDstExtDesc = [](G4_INST *inst) {
+        G4_DstRegRegion *dst = inst->getDst();
+        if (dst && dst->getTopDcl() && dst->getTopDcl()->isMsgDesc()) {
+          // check that its single use is at src3 of split send
+          if (inst->use_size() != 1) {
+            return false;
+          }
+          auto use = inst->use_front();
+          G4_INST *useInst = use.first;
+          if (useInst->isSend()) {
+            return true;
+          }
+        }
+        return false;
+      };
+
+      if (isDstExtDesc(inst)) {
+        G4_INST *valInst = values.findValue(inst);
+        if (valInst != nullptr) {
+          VISA_DEBUG_VERBOSE({
+            std::cout << "can replace \n";
+            inst->emit(std::cout);
+            std::cout << "\n with \n";
+            valInst->emit(std::cout);
+            std::cout << "\n";
+          });
+          for (auto I = inst->use_begin(), E = inst->use_end(); I != E; ++I) {
+            // each use is in the form of A0(0,0)<0;1,0>:ud in a send
+            G4_INST *useInst = I->first;
+            Gen4_Operand_Number num = I->second;
+            vISA_ASSERT(useInst->isSend(), "use inst must be a send");
+            G4_SrcRegRegion *newExDesc =
+                builder.createSrc(valInst->getDst()->getBase(), 0, 0,
+                                  builder.getRegionScalar(), Type_UD);
+            useInst->setSrc(newExDesc, useInst->getSrcNum(num));
+          }
+          (*iter)->removeAllDefs();
+          (*iter)->transferUse(valInst);
+          iter = bb->erase(iter);
+          continue;
+        } else {
+          VISA_DEBUG_VERBOSE({
+            std::cout << "add new value:\n";
+            inst->emit(std::cout);
+            std::cout << "\n";
+          });
+          // this is necessary since for msg desc we always the physical a0.0,
+          // so a new inst will invalidate the previous one
+          values.deleteValue(inst);
+          values.addValue(inst);
+        }
+      } else {
+        G4_DstRegRegion *dst = inst->getDst();
+        if (dst && dst->isDirectAddress()) {
+          // If the address register is used for none extdesc
+          values.clear();
+        } else {
+          values.deleteValue(inst);
+        }
+      }
+      ++iter;
+    }
+  }
+}
+
 //
 // Perform value numbering on writes to the extended msg descriptor for bindless
 // access of the form op (1) a0.2<1>:ud src0 src1 src2 {NoMask} and remove
@@ -4648,15 +4651,14 @@ void Optimizer::cleanupBindless() {
       auto isDstExtDesc = [](G4_INST *inst) {
         G4_DstRegRegion *dst = inst->getDst();
         if (dst && dst->getTopDcl() && dst->getTopDcl()->isMsgDesc()) {
-          // check that its single use is at src3 of split send
-          if (inst->use_size() != 1) {
-            return false;
+          // if a use is something other than a send, do not perform the
+          // optimization
+          for (auto use = inst->use_begin(); use != inst->use_end(); use++) {
+            G4_INST* useInst = use->first;
+            if (!useInst->isSend())
+              return false;
           }
-          auto use = inst->use_front();
-          G4_INST *useInst = use.first;
-          if (useInst->isSend()) {
-            return true;
-          }
+          return true;
         }
         return false;
       };
@@ -4664,13 +4666,13 @@ void Optimizer::cleanupBindless() {
       if (isDstExtDesc(inst)) {
         G4_INST *valInst = values.findValue(inst);
         if (valInst != nullptr) {
-#if 0
-                        std::cout << "can replace \n";
-                        inst->emit(std::cout);
-                        std::cout << "\n with \n";
-                        valInst->emit(std::cout);
-                        std::cout << "\n";
-#endif
+          VISA_DEBUG_VERBOSE({
+            std::cout << "can replace \n";
+            inst->emit(std::cout);
+            std::cout << "\n with \n";
+            valInst->emit(std::cout);
+            std::cout << "\n";
+          });
           for (auto I = inst->use_begin(), E = inst->use_end(); I != E; ++I) {
             // each use is in the form of A0(0,0)<0;1,0>:ud in a send
             G4_INST *useInst = I->first;
@@ -7397,7 +7399,7 @@ void Optimizer::lowerMadSequence() {
   if (kernel.getInt32KernelAttr(Attributes::ATTR_Target) != VISA_CM)
     return;
 
-  if (!builder.hasMacl())
+  if (!builder.hasMacMacl())
     return;
 
   for (G4_BB *bb : fg) {
@@ -7671,7 +7673,7 @@ void Optimizer::split4GRFVars() {
     }
   }
 
-  for (auto DI : DclMap) {
+  for (const auto &DI : DclMap) {
     delete DI.second;
   }
 }
@@ -7838,46 +7840,62 @@ void Optimizer::staticProfiling() {
   // missed.
   StaticProfiling s(builder, kernel);
   s.run();
+
+  // Do static cycle profiling only for platforms have 3 or more ALU pipelines.
+  // Do static cycle profling only when shader dump is enabled.
+  if (builder.hasThreeALUPipes() &&
+      builder.getOptions()->getOption(vISA_outputToFile) &&
+      builder.getOptions()->getOption(vISA_staticBBProfiling)) {
+    StaticCycleProfiling sc(kernel);
+    sc.run();
+  }
+}
+
+static void markBreakpoint(G4_BB *bb, INST_LIST_ITER it, IR_Builder *builder) {
+  G4_INST *inst = *it;
+  vISA_ASSERT(inst->isIntrinsic() &&
+                  inst->asIntrinsicInst()->getIntrinsicId() ==
+                      Intrinsic::Breakpoint,
+              "expect breakpoint intrinsic");
+  auto nextIt = ++it;
+  // if we encounter a breakpoint, mark the instruction after the
+  // breakpoint intrinsic with breakpoint instruction option
+  if (nextIt != bb->end()) {
+    // intrinsic is not at the end of bb
+    G4_INST *nextInst = *(nextIt);
+    nextInst->setOptionOn(InstOpt_BreakPoint);
+  } else {
+    // intrinsic is at the end of bb
+    // create a dummy mov with breakpoint option set
+    auto nullDst = builder->createNullDst(Type_UD);
+    auto nullSrc = builder->createNullSrc(Type_UD);
+
+    G4_INST *dummyMov = builder->createMov(g4::SIMD1, nullDst, nullSrc,
+                                           InstOpt_BreakPoint, false);
+    bb->push_back(dummyMov);
+  }
 }
 
 //
 // remove Intrinsics
 //
-void Optimizer::removeInstrinsics() {
-  markBreakpoint();
+void Optimizer::removeIntrinsics() {
   for (auto bb : kernel.fg) {
-      std::vector<Intrinsic> intrinIdVec =
-        {Intrinsic::MemFence, Intrinsic::FlagSpill, Intrinsic::Breakpoint};
-      bb->removeIntrinsics(intrinIdVec);
-  }
-}
-
-void Optimizer::markBreakpoint() {
-  for (auto bb : kernel.fg) {
-    for (auto I = bb->begin(); I != bb->end(); /*empty*/) {
+    for (auto I = bb->begin(); I != bb->end(); ++I) {
       G4_INST *inst = *I;
-      auto nextI = ++I;
-      if (inst->isIntrinsic() &&
-        inst->asIntrinsicInst()->getIntrinsicId() == Intrinsic::Breakpoint) {
-        // if we encounter a breakpoint, mark the instruction after the
-        // breakpoint intrinsic with breakpoint instruction option
-        if (nextI != bb->end()) {
-          // intrinsic is not at the end of bb
-          G4_INST *nextInst = *(nextI);
-          nextInst->setOptionOn(InstOpt_BreakPoint);
-        }
-        else {
-          // intrinsic is at the end of bb
-          // create a dummy mov with breakpoint option set
-          auto nullDst = fg.builder->createNullDst(Type_UD);
-          auto nullSrc = fg.builder->createNullSrc(Type_UD);
-
-          G4_INST* dummyMov = fg.builder->createMov(g4::SIMD1, nullDst, nullSrc,
-              InstOpt_BreakPoint, false);
-          bb->push_back(dummyMov);
-        }
+      if (!inst->isIntrinsic())
+        continue;
+      if (inst->asIntrinsicInst()->getIntrinsicId() == Intrinsic::Breakpoint) {
+        markBreakpoint(bb, I, fg.builder);
       }
     }
+
+    std::vector<Intrinsic> intrinIdVec = {
+      Intrinsic::MemFence,
+      Intrinsic::FlagSpill,
+      Intrinsic::Breakpoint
+    };
+    bb->removeIntrinsics(intrinIdVec);
   }
 }
 

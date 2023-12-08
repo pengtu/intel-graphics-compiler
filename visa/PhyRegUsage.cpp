@@ -113,7 +113,7 @@ void PhyRegUsage::freeRegs(LiveRange *varBasis) {
     vISA_ASSERT(varBasis->getPhyReg()->isAreg(), ERROR_UNKNOWN);
     freeContiguous(FPR.availableAddrs, varBasis->getPhyRegOff(),
                    numAllocUnit(decl->getNumElems(), decl->getElemType()),
-                   getNumAddrRegisters());
+                   builder.getNumAddrRegisters());
   } else if (kind == G4_FLAG) {
     vISA_ASSERT(varBasis->getPhyReg()->isFlag(), ERROR_UNKNOWN);
     freeContiguous(FPR.availableFlags, varBasis->getPhyRegOff(),
@@ -414,7 +414,9 @@ bool PhyRegUsage::findContiguousNoWrapGRF(
          align ==
              BankAlign::Even) || // i is odd but intv needs to be even aligned
         ((i & 0x1) == 0 &&
-         align == BankAlign::Odd)) // i is even but intv needs to be odd aligned
+         align == BankAlign::Odd) || // i is even but intv needs to be odd aligned
+        ((i % 4) != 0 &&
+         align == BankAlign::QuadGRF)) // check for 4GRF alignment
     {
       i++;
     } else {
@@ -645,7 +647,7 @@ PhyRegUsage::findGRFSubRegFromBanks(G4_Declare *dcl, const BitSet *forbidden,
   unsigned nwords = numAllocUnit(dcl->getNumElems(), dcl->getElemType());
   auto dclBC = gra.getBankConflict(dcl);
   bool gotoSecondBank = dclBC == BANK_CONFLICT_SECOND_HALF_EVEN ||
-                        dclBC == BANK_CONFLICT_SECOND_HALF_EVEN;
+                        dclBC == BANK_CONFLICT_SECOND_HALF_ODD;
 
   if (gotoSecondBank && oneGRFBankDivision) {
     startReg = (maxGRFCanBeUsed - 1);
@@ -995,7 +997,7 @@ bool PhyRegUsage::assignRegs(bool highInternalConflict, LiveRange *varBasis,
     //
     unsigned regNeeded = numAllocUnit(decl->getNumElems(), decl->getElemType());
     if (findContiguousAddrFlag(FPR.availableAddrs, forbidden, subAlign,
-                               regNeeded, getNumAddrRegisters(), AS.startARFReg,
+                               regNeeded, builder.getNumAddrRegisters(), AS.startARFReg,
                                i)) {
       // subregoffset should consider the declare data type
       varBasis->setPhyReg(regPool.getAddrReg(),

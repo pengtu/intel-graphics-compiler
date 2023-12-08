@@ -39,9 +39,6 @@ defm buffer_offset_arg_required : CommonFlag<"buffer-offset-arg-required">;
 // -cl-intel-has-positive-pointer-offset, -ze-opt-has-positive-pointer-offset
 defm has_positive_pointer_offset : CommonFlag<"has-positive-pointer-offset">;
 
-// -cl-intel-has-subDW-aligned-ptr-arg, -ze-opt-has-subDW-aligned-ptr-arg
-defm has_subdw_aligned_ptr_arg : CommonFlag<"has-subDW-aligned-ptr-arg">;
-
 // -cl-intel-disable-a64WA
 defm disable_a64wa : CommonFlag<"disable-a64WA">;
 
@@ -64,6 +61,10 @@ defm 128_grf_per_thread : CommonFlag<"128-GRF-per-thread">;
 
 // -cl-intel-256-GRF-per-thread
 defm 256_grf_per_thread : CommonFlag<"256-GRF-per-thread">;
+
+// -cl-intel-enable-auto-large-GRF-mode, -ze-opt-enable-auto-large-GRF-mode
+defm enable_auto_large_GRF_mode : CommonFlag<"enable-auto-large-GRF-mode">,
+  HelpText<"Use compiler heuristics to determine number of GRF">;
 
 // -cl-intel-force-global-mem-allocation, -cl-force-global-mem-allocation, -ze-force-global-mem-allocation
 defm force_global_mem_allocation : CommonFlag<"force-global-mem-allocation">;
@@ -149,6 +150,16 @@ defm enable_divergent_barrier_handling : CommonFlag<"enable-divergent-barrier-ha
 
 // -cl-intel-high-accuracy-nolut-math
 defm high_accuracy_nolut_math : CommonFlag<"high-accuracy-nolut-math">;
+
+// -[cl-intel|ze-opt]-ldstcombine=[0|1]
+// -[cl-intel|ze-opt]-ldstcombine-max-storebytes=[4|8|16|32]
+// -[cl-intel|ze-opt]-ldstcombine-max-loadbytes=[4|8|16|32]
+defm ldstcombine : CommonSeparate<"ldstcombine">;
+defm : CommonJoined<"ldstcombine=">, Alias<ldstcombine_common>;
+defm ldstcombine_max_storebytes : CommonSeparate<"ldstcombine_max_storebytes">;
+defm : CommonJoined<"ldstcombine-max-storebytes=">, Alias<ldstcombine_max_storebytes_common>;
+defm ldstcombine_max_loadbytes : CommonSeparate<"ldstcombine_max-loadbytes">;
+defm : CommonJoined<"ldstcombine-max-loadbytes=">, Alias<ldstcombine_max_loadbytes_common>;
 
 // }} Backend internal options
 

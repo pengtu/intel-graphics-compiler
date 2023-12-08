@@ -378,6 +378,9 @@ void GenXLiveness::rebuildLiveRangeForValue(LiveRange *LR, SimpleValue SV)
   // Process each use.
   for (Value::use_iterator i = V->use_begin(), e = V->use_end();
       i != e; ++i) {
+    auto& U = *i;
+    if (LiveElements->getLiveElements(&U).isAllDead())
+      continue;
     BasicBlock *BB = nullptr;
     Instruction *user = cast<Instruction>(i->getUser());
     unsigned Num;
@@ -604,7 +607,7 @@ void GenXLiveness::replaceValue(SimpleValue OldVal, SimpleValue NewVal)
   LLVM_DEBUG(dbgs() << "Replace SimpleValues: from " << OldVal << " to "
                     << NewVal << "\n");
   LiveRangeMap_t::iterator i = LiveRangeMap.find(OldVal);
-  IGC_ASSERT(i != end());
+  IGC_ASSERT_EXIT(i != end());
   LiveRange *LR = i->second;
   LiveRangeMap.erase(i);
   LiveRangeMap[NewVal] = LR;
@@ -779,7 +782,7 @@ Value *GenXLiveness::getUnifiedRetIfExist(Function *F) const {
  */
 Value *GenXLiveness::createUnifiedRet(Function *F) {
   IGC_ASSERT_MESSAGE(!F->isDeclaration(), "must be a function definition");
-  IGC_ASSERT_MESSAGE(UnifiedRets.find(F) == UnifiedRets.end(),
+  IGC_ASSERT_EXIT_MESSAGE(UnifiedRets.find(F) == UnifiedRets.end(),
     "Unified ret must not have been already created");
   Type *Ty = F->getReturnType();
   IGC_ASSERT(!Ty->isVoidTy());
@@ -1319,6 +1322,7 @@ Instruction *GenXLiveness::insertCopy(Value *InputVal, LiveRange *LR,
         unsigned NumElts = std::min(MaxElt, R.NumElements - Offset);
         // Round NumElts down to power of 2. That is how many elements we
         // are copying this time round the loop.
+        IGC_ASSERT_EXIT(NumElts > 0);
         NumElts = 1 << genx::log2(NumElts);
         Frag.push_back(std::make_pair(Base + Offset, NumElts));
         Offset += NumElts;
@@ -1506,7 +1510,7 @@ Value *GenXLiveness::getAddressBase(Value *Addr)
   // The above scheme does not work for an address conversion added by
   // GenXArgIndirection. Instead we have AddressBaseMap to provide the mapping.
   auto i = ArgAddressBaseMap.find(Addr);
-  IGC_ASSERT_MESSAGE(i != ArgAddressBaseMap.end(),
+  IGC_ASSERT_EXIT_MESSAGE(i != ArgAddressBaseMap.end(),
     "base register not found for address");
   Value *BaseV = i->second;
   LiveRange *LR = getLiveRange(BaseV);
@@ -1767,7 +1771,7 @@ void LiveRange::sortAndMerge() {
     else
       OpenedSegments.erase(*ES++);
   }
-  Segments = NewSegments;
+  Segments = std::move(NewSegments);
 }
 
 /***********************************************************************

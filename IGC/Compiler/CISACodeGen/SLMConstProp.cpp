@@ -14,6 +14,7 @@ SPDX-License-Identifier: MIT
 #include "common/LLVMWarningsPush.hpp"
 #include <llvm/Analysis/LoopInfo.h>
 #include <llvm/Analysis/ScalarEvolution.h>
+#include <llvm/Analysis/ValueTracking.h>
 #include <llvm/IR/DataLayout.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/BasicBlock.h>
@@ -143,17 +144,25 @@ void SymbolicEvaluation::dump_symbols()
         Vals[VSI->ID] = V;
     }
 
-    dbgs() << "\nSymbols used\n";
+    dbgs() << "\nSymbols used\n\n";
     for (int i = 0; i < m_nextValueID; ++i) {
         const Value* V = Vals[i];
-        // V should not be nullptr, but check it
-        // for safety.
+        // V should not be nullptr, but check it for safety.
         IGC_ASSERT(nullptr != V);
         if (V) {
-            dbgs() << "\n    V"
-                << i
-                << ":    "
-                << *V;
+            ValueSymInfo* VSI = getSymInfo(V);
+            SymCastInfo SCI = (SymCastInfo)VSI->CastInfo;
+            dbgs() << "  V" << i;
+            switch (SCI) {
+            case SYMCAST_ZEXT:
+                dbgs() << " [zext] :    " << *V << "\n";
+                break;
+            case SYMCAST_SEXT:
+                dbgs() << " [sext] :    " << *V << "\n";
+                break;
+            default:
+                dbgs() << " :    " << *V << "\n";
+            }
         }
     }
     dbgs() << "\n\n";
@@ -372,9 +381,23 @@ void SymbolicEvaluation::getSymExprOrConstant(const Value* V, SymExpr*& S, int64
 
     if (const ConstantInt * CI = dyn_cast<const ConstantInt>(V))
     {
+        // symExpr handles symbols with the same bit size, thus sext/zext/trunc
+        // are not handled. With this, a result from either signed or unsigned
+        // integer operations will end up with the same bit pattern. Here, we
+        // choose to use sext on constants.
         C = CI->getSExtValue();
         return;
     }
+
+    // Used for nomalizing shift amount.
+    //   For example, i64, its type mask is 03F(63 = 64 - 1).
+    auto getTypeMask = [](const Type* Ty) -> uint32_t {
+        // For simplicity, only handle type whose size is power of 2.
+        uint32_t nbits = Ty->getScalarSizeInBits();
+        if (nbits > 0 && isPowerOf2_32(nbits))
+            return (nbits - 1);
+        return 0;
+    };
 
     // Instructions/Operators handled for now:
     //   GEP
@@ -383,7 +406,15 @@ void SymbolicEvaluation::getSymExprOrConstant(const Value* V, SymExpr*& S, int64
     SymExpr* S0;
     SymExpr* S1;
     int64_t  C0, C1;
-    if (const Operator* Op = dyn_cast<Operator>(V))
+
+    auto BinOp = dyn_cast<OverflowingBinaryOperator>(V);
+    const Operator* Op = dyn_cast<Operator>(V);
+    const bool canOverflow = (considerOverflow() && BinOp &&
+        !(BinOp->hasNoSignedWrap() || BinOp->hasNoUnsignedWrap()));
+    // Skip if Op can overflow.
+    //   Hope we don't need to handle cases if considerOverflow() is true;
+    //   otherwise, the code needs more tuning.
+    if (Op && !canOverflow && !exceedMaxValues())
     {
         unsigned opc = Op->getOpcode();
         switch (opc) {
@@ -515,6 +546,32 @@ void SymbolicEvaluation::getSymExprOrConstant(const Value* V, SymExpr*& S, int64
             }
             break;
         }
+        case Instruction::Or:
+        {
+            // Check if it is actually an add.
+            //
+            //   %mul = shl nuw nsw i64 %v, 1
+            //   %add = or i64 %mul, 1
+            //     -->  %add = add %mul, 1
+            const Value* V0 = Op->getOperand(0);
+            const Value* V1 = Op->getOperand(1);
+            getSymExprOrConstant(V0, S0, C0);
+            getSymExprOrConstant(V1, S1, C1);
+            if (!S0 && !S1) {
+                C = C0 | C1;
+                return;
+            }
+
+            // Case: 'or V0  Const' or 'or const  V1'
+            if ((S0 && !S1) || (!S0 && S1)) {
+                const Value* tV = (S0 ? V0 : V1);
+                const uint64_t tC = (uint64_t)(S0 ? C1 : C0);
+                uint32_t bits = (uint32_t)tV->getType()->getPrimitiveSizeInBits();
+                if (bits != 0 && MaskedValueIsZero(tV, APInt(bits, tC), *m_DL))
+                    S = add(S0 ? S0 : S1, tC);
+            }
+            break;
+        }
         case Instruction::Mul:
         {
             const Value* V0 = Op->getOperand(0);
@@ -538,7 +595,34 @@ void SymbolicEvaluation::getSymExprOrConstant(const Value* V, SymExpr*& S, int64
 
             break;
         }
+        case Instruction::Shl:
+        {
+            // shl is a mul
+            //     shl a,  b, 2
+            //  -> mul a, b, (1 << 2)
+            const Value* V0 = Op->getOperand(0);
+            const Value* V1 = Op->getOperand(1);
+            getSymExprOrConstant(V0, S0, C0);
+            getSymExprOrConstant(V1, S1, C1);
 
+            uint32_t shtAmtMask = getTypeMask(V->getType());
+            if (shtAmtMask == 0) // sanity
+                break;
+
+            if (!S1) {
+                C1 = (C1 & shtAmtMask);
+            }
+
+            if (!S0 && !S1) {
+                C = (C0 << C1);
+                return;
+            }
+            if (!S1) {
+                uint64_t tC = (1ull << C1);
+                S = mul(S0, tC);
+            }
+            break;
+        }
         case Instruction::BitCast:
         case Instruction::IntToPtr:
         case Instruction::PtrToInt:
@@ -551,6 +635,8 @@ void SymbolicEvaluation::getSymExprOrConstant(const Value* V, SymExpr*& S, int64
             }
             break;
         }
+        default:
+            break;
         }
     }
 

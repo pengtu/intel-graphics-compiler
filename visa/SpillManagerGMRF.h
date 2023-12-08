@@ -263,8 +263,6 @@ public:
 
   bool spillLiveRanges(G4_Kernel *kernel);
 
-  unsigned getNumGRFSpill() const { return numGRFSpill; }
-  unsigned getNumGRFFill() const { return numGRFFill; }
   // return the next cumulative logical offset. This does not non-spilled stuff
   // like private variables placed by IGC (marked by spill_mem_offset) this
   // should only be called after insertSpillFillCode()
@@ -625,12 +623,6 @@ private:
 
   const Interference *spillIntf_;
 
-  // The number of GRF spill.
-  unsigned numGRFSpill = 0;
-
-  // The number of GRF fill.
-  unsigned numGRFFill = 0;
-
   // CISA instruction id of current instruction
   G4_INST *curInst;
 
@@ -640,8 +632,8 @@ private:
   bool avoidDstSrcOverlap_;
   // spilled declares that represent a scalar immediate (created due to encoding
   // restrictions) We rematerialize the immediate value instead of spill/fill
-  // them
-  std::unordered_map<G4_Declare *, G4_Imm *> scalarImmSpill;
+  // them. Map stores type used on dst that defined the immediate.
+  std::unordered_map<G4_Declare *, std::pair<G4_Type, G4_Imm *>> scalarImmSpill;
   // distance to reuse filled scalar imm
   const unsigned int scalarImmReuseDistance = 10;
   // use cache to reuse filled scalar immediates for nearby uses
@@ -723,11 +715,10 @@ static inline bool isPartialRegion(REGION_TYPE *region, unsigned execSize) {
 // Return true if inst is a simple mov with exec size == 1 and imm as src0.
 // Def of such instructions are trivially fillable.
 static bool immFillCandidate(G4_INST *inst) {
+  auto src0 = inst->getSrc(0);
   return inst->opcode() == G4_mov && inst->getExecSize() == g4::SIMD1 &&
-         inst->getSrc(0)->isImm() && inst->isWriteEnableInst() &&
-         inst->getDst()->getType() == inst->getSrc(0)->getType() &&
-         !inst->getPredicate() && !inst->getCondMod() && !inst->getSaturate() &&
-         !inst->getSrc(0)->isRelocImm();
+         src0->isImm() && inst->isWriteEnableInst() && !inst->getPredicate() &&
+         !inst->getCondMod() && !inst->getSaturate() && !src0->isRelocImm();
 }
 
 G4_SrcRegRegion *getSpillFillHeader(IR_Builder &builder, G4_Declare *decl);
@@ -737,6 +728,8 @@ class SpillAnalysis {
 public:
   SpillAnalysis() = default;
   ~SpillAnalysis();
+  SpillAnalysis(const SpillAnalysis&) = delete;
+  SpillAnalysis& operator=(const SpillAnalysis&) = delete;
 
   void Dump(std::ostream &OS = std::cerr);
   void DumpHistogram(std::ostream &OS = std::cerr);

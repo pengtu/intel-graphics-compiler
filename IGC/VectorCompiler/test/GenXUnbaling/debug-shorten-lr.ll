@@ -6,7 +6,7 @@
 ;
 ;============================ end_copyright_notice =============================
 ;
-; RUN: opt %use_old_pass_manager% -GenXModule -GenXLiveRangesWrapper -GenXUnbalingWrapper -march=genx64 -mtriple=spir64-unknown-unknown  -mcpu=Gen9 -S < %s | FileCheck %s
+; RUN: %opt %use_old_pass_manager% -GenXModule -GenXLiveRangesWrapper -GenXUnbalingWrapper -march=genx64 -mtriple=spir64-unknown-unknown  -mcpu=Gen9 -S < %s | FileCheck %s
 ; ------------------------------------------------
 ; GenXUnbaling
 ; ------------------------------------------------
@@ -38,7 +38,10 @@ entry:
   call void @llvm.dbg.value(metadata <16 x i32> %rdregioni, metadata !12, metadata !DIExpression()), !dbg !18
   %wrregioni = call <16 x i32> @llvm.genx.wrregioni.v16i32.v16i32.v16i32.i32.i1(<16 x i32> %rdregioni, <16 x i32> %load, i32 1, i32 1, i32 0, i16 4, i32 0, i1 true), !dbg !19
   call void @llvm.dbg.value(metadata <16 x i32> %wrregioni, metadata !13, metadata !DIExpression()), !dbg !19
-  %wrregioni2 = call <16 x i32> @llvm.genx.wrregioni.v16i32.v16i32.v16i32.i32.i1(<16 x i32> %wrregioni, <16 x i32> %load, i32 1, i32 1, i32 0, i16 6, i32 0, i1 true), !dbg !20
+  br label %body
+
+body:
+  %wrregioni2 = call <16 x i32> @llvm.genx.wrregioni.v16i32.v16i32.v16i32.i32.i1(<16 x i32> %wrregioni, <16 x i32> %load, i32 1, i32 1, i32 0, i16 8, i32 0, i1 true), !dbg !20
   call void @llvm.dbg.value(metadata <16 x i32> %wrregioni2, metadata !14, metadata !DIExpression()), !dbg !20
   %rdregioni3 = call <16 x i32> @llvm.genx.rdregioni.v16i32.v16i32.i16(<16 x i32> %wrregioni, i32 1, i32 1, i32 0, i16 0, i32 0), !dbg !21
   call void @llvm.dbg.value(metadata <16 x i32> %rdregioni3, metadata !15, metadata !DIExpression()), !dbg !21

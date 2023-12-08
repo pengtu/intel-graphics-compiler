@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2017-2022 Intel Corporation
+Copyright (C) 2017-2023 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -302,7 +302,7 @@ StatusPrivArr2Reg LowerGEPForPrivMem::CheckIfAllocaPromotable(llvm::AllocaInst* 
         SubGroupSizeMetaDataHandle subGroupSize = funcInfoMD->getSubGroupSize();
         if (subGroupSize->hasValue())
         {
-            SIMDSize = std::max((uint32_t)subGroupSize->getSIMD_size(), SIMDSize);
+            SIMDSize = std::max((uint32_t)subGroupSize->getSIMDSize(), SIMDSize);
         }
 
         allowedAllocaSizeInBytes = (allowedAllocaSizeInBytes * 8) / SIMDSize;
@@ -522,20 +522,7 @@ void LowerGEPForPrivMem::MarkNotPromtedAllocas(llvm::AllocaInst& I, IGC::StatusP
         I.getContext(),
         MDString::get(I.getContext(), reason));
 
-
-    auto allocationSize = I.getAllocationSizeInBits(m_ctx->getModule()->getDataLayout());
-
-    if (allocationSize)
-    {
-        auto scratchUsage_i = m_ctx->m_ScratchSpaceUsage.find(I.getFunction());
-        if (scratchUsage_i == m_ctx->m_ScratchSpaceUsage.end())
-        {
-            m_ctx->m_ScratchSpaceUsage.insert({ I.getFunction(), 0 });
-        }
-        m_ctx->m_ScratchSpaceUsage[I.getFunction()] += allocationSize.getValue() / 8;
-    }
-
-    UserAddrSpaceMD& userASMD = m_ctx->m_UserAddrSpaceMD;
+    UserAddrSpaceMD& userASMD = m_ctx->getUserAddrSpaceMD();
     std::function<void(Instruction*, MDNode*)> markAS_PRIV;
     markAS_PRIV = [&markAS_PRIV, &userASMD](Instruction* instr, MDNode* node) -> void
     {

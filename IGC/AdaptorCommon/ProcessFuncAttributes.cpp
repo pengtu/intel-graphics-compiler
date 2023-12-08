@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2017-2021 Intel Corporation
+Copyright (C) 2017-2023 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -425,16 +425,6 @@ bool ProcessFuncAttributes::runOnModule(Module& M)
             F->addFnAttr("no-signed-zeros-fp-math", "true");
         }
 
-        // Add Optnone to user functions but not on builtins. This allows to run
-        // optimizations on builtins.
-        if (isOptDisable)
-        {
-            if (!F->hasFnAttribute("OclBuiltin"))
-            {
-                F->addFnAttr(llvm::Attribute::OptimizeNone);
-            }
-        }
-
         // set hasVLA function attribute
         {
             bool isSet = false;
@@ -450,6 +440,16 @@ bool ProcessFuncAttributes::runOnModule(Module& M)
                 }
                 if (isSet)
                     break;
+            }
+        }
+
+        // Add Optnone to user functions but not on builtins. This allows to run optimizations on builtins.
+        if (isOptDisable)
+        {
+            if (!F->hasFnAttribute("OclBuiltin") &&
+                !F->hasFnAttribute(llvm::Attribute::AlwaysInline))
+            {
+                F->addFnAttr(llvm::Attribute::OptimizeNone);
             }
         }
 
@@ -606,6 +606,14 @@ bool ProcessFuncAttributes::runOnModule(Module& M)
                 mustAlwaysInline = true;
             }
         }
+
+        // Respect user defined alwaysinline attribute
+        if (FCtrl == FLAG_FCALL_DEFAULT &&
+            F->hasFnAttribute(llvm::Attribute::AlwaysInline))
+        {
+            mustAlwaysInline = true;
+        }
+
         if (mustAlwaysInline)
         {
             SetAlwaysInline(F);
@@ -854,29 +862,6 @@ bool ProcessFuncAttributes::runOnModule(Module& M)
                 SetNoInline(F);
             }
         }
-
-        bool HasStackCallsOrVLA =
-            std::any_of(M.getFunctionList().begin(), M.getFunctionList().end(),
-                        [](auto &F) {
-                          return F.hasFnAttribute("visaStackCall") ||
-                                 F.hasFnAttribute("hasVLA");
-                        });
-        if (!HasStackCallsOrVLA) {
-            for (auto FuncName : DetectionFunctions) {
-                if (auto F = M.getFunction(FuncName)) {
-                    std::vector<CallInst *> CallersToDelete;
-                    for (auto User : F->users()) {
-                        if (auto I = dyn_cast<CallInst>(User)) {
-                            CallersToDelete.push_back(I);
-                        }
-                    }
-                    std::for_each(
-                        CallersToDelete.begin(), CallersToDelete.end(),
-                        [](auto CallInst) { CallInst->eraseFromParent(); });
-                    F->eraseFromParent();
-                }
-            }
-        }
     }
 
     return true;
@@ -972,7 +957,7 @@ bool ProcessBuiltinMetaData::runOnModule(Module& M)
 
 void ProcessBuiltinMetaData::updateBuiltinFunctionMetaData(llvm::Function* pFunc)
 {
-    IGCMD::FunctionInfoMetaDataHandle fHandle = IGCMD::FunctionInfoMetaDataHandle(IGCMD::FunctionInfoMetaData::get());
+    IGCMD::FunctionInfoMetaDataHandle fHandle = IGCMD::FunctionInfoMetaDataHandle(new IGCMD::FunctionInfoMetaData());
     IGC::ModuleMetaData* modMD = getAnalysis<CodeGenContextWrapper>().getCodeGenContext()->getModuleMetaData();
     FunctionMetaData *funcMD = &modMD->FuncMD[pFunc]; //okay to insert if not present
     funcMD->functionType = IGC::FunctionTypeMD::UserFunction;
@@ -1084,37 +1069,10 @@ bool InsertDummyKernelForSymbolTable::runOnModule(Module& M)
 
         // Set spirv calling convention and kernel metadata
         pNewFunc->setCallingConv(llvm::CallingConv::SPIR_KERNEL);
-        IGCMD::FunctionInfoMetaDataHandle fHandle = IGCMD::FunctionInfoMetaDataHandle(IGCMD::FunctionInfoMetaData::get());
+        IGCMD::FunctionInfoMetaDataHandle fHandle = IGCMD::FunctionInfoMetaDataHandle(new IGCMD::FunctionInfoMetaData());
         FunctionMetaData* funcMD = &modMD->FuncMD[pNewFunc];
         funcMD->functionType = IGC::FunctionTypeMD::KernelFunction;
         fHandle->setType(FunctionTypeMD::KernelFunction);
-
-        // If intel_reqd_sub_group_size is set for any kernels, we match the dummy kernel's subgroup size to the lowest one
-        // found, just so IGC can correctly compile the dummy kernel if it's needed only for global variables.
-        // Later in GenXFunctionGroupAnalysis, when more information about the CG is available, we will revisit this field to determine
-        // if we need to change the subgroup size, or generate variant SIMDs for the dummy kernel if more than one subgroup size is required.
-        int lowest_simd = 0;
-        for (auto I = M.begin(), E = M.end(); I != E; ++I)
-        {
-            Function* F = &(*I);
-            if (isEntryFunc(pMdUtils, F))
-            {
-                auto funcInfoMD = pMdUtils->getFunctionsInfoItem(F);
-                int sz = funcInfoMD->getSubGroupSize()->getSIMD_size();
-                if (sz != 0)
-                {
-                    IGC_ASSERT(sz == 8 || sz == 16 || sz == 32);
-                    if (lowest_simd == 0)
-                        lowest_simd = sz;
-                    else
-                        lowest_simd = std::min(sz, lowest_simd);
-                }
-            }
-        }
-        if (lowest_simd != 0)
-        {
-            fHandle->getSubGroupSize()->setSIMD_size(lowest_simd);
-        }
 
         pMdUtils->setFunctionsInfoItem(pNewFunc, fHandle);
         pMdUtils->save(M.getContext());

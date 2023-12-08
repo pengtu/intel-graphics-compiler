@@ -1508,17 +1508,20 @@ printInstructionSampler(const print_format_provider_t *header,
 
     sstr << printOperand(header, inst, i++, opt);
        // sampler
+      {
       sstr << " S" << printOperand(header, inst, i++, opt);
+      i++; // skip reserved
+      }
        // surface
     {
       uint8_t surface = getPrimitiveOperand<uint8_t>(inst, i++);
       sstr << " " << printSurfaceName(surface);
+      i++; // skip reserved
     }
 
     // dst
     sstr << printOperand(header, inst, i++, opt);
-
-       // skip the param count
+    // skip the param count
     i++;
 
     while (i < inst->opnd_num) {
@@ -1556,11 +1559,11 @@ printInstructionSampler(const print_format_provider_t *header,
       // surface
       uint8_t surface = getPrimitiveOperand<uint8_t>(inst, i++);
       sstr << " " << printSurfaceName(surface);
+      i++; // skip reserved
     }
 
     // dst
     sstr << printOperand(header, inst, i++, opt);
-
        // skip the param count
     i++;
 
@@ -1608,7 +1611,6 @@ printInstructionSampler(const print_format_provider_t *header,
 
     // dst
     sstr << printOperand(header, inst, i++, opt);
-
        // skip the param count
     i++;
 
@@ -2362,10 +2364,11 @@ printInstructionDataport(const print_format_provider_t *header,
     }
 
     sstr << " " << printExecutionSize(inst->opcode, inst->execsize);
-
-    // surface
-    surface = getPrimitiveOperand<uint8_t>(inst, i++);
-    sstr << " " << printSurfaceName(surface);
+    {
+      // surface
+      surface = getPrimitiveOperand<uint8_t>(inst, i++);
+      sstr << " " << printSurfaceName(surface);
+    }
 
     while (i < inst->opnd_num) {
       sstr << printOperand(header, inst, i++, opt);
@@ -2446,7 +2449,6 @@ printInstructionDataport(const print_format_provider_t *header,
     sstr << printOperand(header, inst, i++, opt);
     break;
   }
-
   default: {
     vISA_ASSERT_UNREACHABLE("Unimplemented or Illegal DataPort Opcode.");
   }
@@ -2821,6 +2823,9 @@ private:
     case LSC_CACHING_READINVALIDATE:
       ss << ".ri";
       break;
+    case LSC_CACHING_CONSTCACHED:
+      ss << ".cc";
+      break;
     default:
       formatBadEnum(val);
       break;
@@ -3014,7 +3019,6 @@ private:
 
     auto sfid = getNextEnumU8<LSC_SFID>();
     formatSfid(sfid);
-
     formatCachingOpts();
 
     // execution size and offset
@@ -3090,6 +3094,10 @@ private:
   void formatUntyped() {
     if (subOp == LSC_LOAD_BLOCK2D || subOp == LSC_STORE_BLOCK2D) {
       formatUntypedBlock2D();
+    } else if (subOp == LSC_APNDCTR_ATOMIC_ADD ||
+               subOp == LSC_APNDCTR_ATOMIC_SUB ||
+               subOp == LSC_APNDCTR_ATOMIC_STORE) {
+      formatUntypedAppendCounterAtomic();
     } else {
       formatUntypedSimple();
     }
@@ -3205,6 +3213,103 @@ private:
     ss << "]";
   }
 
+  void formatDataShapeTyped2D(LSC_DATA_SHAPE_TYPED_BLOCK2D dataShape2D) {
+    ss << ":";
+    ss << std::dec << dataShape2D.width << 'x' << dataShape2D.height;
+  }
+
+  void formatTypedBlock2D() {
+    ss << opInfo.mnemonic;
+
+    formatSfid(LSC_TGM);
+    formatCachingOpts();
+
+    auto addrType = getNextEnumU8<LSC_ADDR_TYPE>();
+    LSC_DATA_SHAPE_TYPED_BLOCK2D dataShape{};
+    dataShape.width = (int)getNext<uint16_t>();
+    dataShape.height = (int)getNext<uint16_t>();
+
+    ///////////////////////////////////////////////////////
+    // The rest of the operands are arranged as follows.
+    //   0 - Surface Base
+    //   1 - Surface Index
+    //   2 - Dst (data loaded)
+    //   3 - BlockStartOffsetX
+    //   4 - BlockImmX
+    //   5 - BlockStartOffsetY
+    //   6 - BlockImmY
+    //   7 - Src1 (data sent)
+
+    auto formatDataOperand = [&](int absOpIx) {
+      formatRawOperand(absOpIx);
+      formatDataShapeTyped2D(dataShape);
+    };
+
+    auto fmtAddrOperand = [&]() {
+      formatAddrType(addrType, currOpIx);
+      ss << "[";
+      formatVectorOperand(currOpIx + 3);
+      if ((int)getPrimitive<int16_t>(currOpIx + 4) != 0) {
+        if ((int)getPrimitive<int16_t>(currOpIx + 4) > 0) {
+          ss << "+";
+        }
+        ss << (int)getPrimitive<int16_t>(currOpIx + 4);
+      }
+      ss << ",";
+      formatVectorOperand(currOpIx + 5);
+      if ((int)getPrimitive<int16_t>(currOpIx + 6) != 0) {
+        if ((int)getPrimitive<int16_t>(currOpIx + 6) > 0) {
+          ss << "+";
+        }
+        ss << (int)getPrimitive<int16_t>(currOpIx + 6);
+      }
+      ss << "]";
+    };
+
+    ss << "  ";
+
+    if (opInfo.isLoad()) {
+      formatDataOperand(currOpIx + 2);
+      ss << "  ";
+      fmtAddrOperand();
+    } else {
+      fmtAddrOperand();
+      ss << "  ";
+      formatDataOperand(currOpIx + 7);
+    }
+  } // formatTypedBlock2D
+
+  void formatUntypedAppendCounterAtomic() {
+    ss << opInfo.mnemonic;
+
+    // sfid (e.g. .ugm, .ugml, or .slm)
+    auto sfid = getNextEnumU8<LSC_SFID>();
+    formatSfid(sfid);
+
+    // caching
+    formatCachingOpts();
+
+    // execution size and offset
+    ss << " " << printExecutionSize(inst->opcode, inst->execsize, subOp);
+
+    // address type
+    auto addrType = getNextEnumU8<LSC_ADDR_TYPE>();
+
+    // data shape
+    auto dataShape = getNextDataShape();
+    ss << "  ";
+
+    formatDataOperand(dataShape, currOpIx + 2); // dst
+    ss << "  ";
+
+    formatAddrType(addrType, currOpIx); // surface
+    ss << "  ";
+
+    formatDataOperand(dataShape, currOpIx + 4); // src1 holds data; src0 is null
+                                                // as append counter atomic does
+                                                // not have per lane address
+                                                // offsets
+  }    // formatUntypedAppendCounterAtomic
 public:
   // the only public entry point (except the constructor)
   std::string format() {
@@ -3217,6 +3322,9 @@ public:
     } else if (opcode == ISA_LSC_TYPED) {
       if (opInfo.op == LSC_READ_STATE_INFO) {
         formatTypedRSI();
+      } else if (opInfo.op == LSC_LOAD_BLOCK2D ||
+                 opInfo.op == LSC_STORE_BLOCK2D) {
+        formatTypedBlock2D();
       } else {
         formatTyped();
       }

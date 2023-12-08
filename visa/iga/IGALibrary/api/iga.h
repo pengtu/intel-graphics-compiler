@@ -102,6 +102,8 @@ typedef enum {
   IGA_XE_HP = XE_VER(1, 1),
   IGA_XE_HPG = XE_VER(1, 2),
   IGA_XE_HPC = XE_VER(1, 4)
+  ,
+  IGA_XE2 = XE_VER(2, 0)
 
   // DEPRECATED
   // Preserve the old values to maintain the binary compatibility
@@ -183,8 +185,6 @@ typedef struct {
   size_t cb; /* set to sizeof(iga_context_options_t) */
   iga_gen_t gen;
 } iga_context_options_t;
-/* this is an ugly wart, cb should have been uint32_t *
- * TODO: change this in IGA 2.0 and break binary compatibility there*/
 
 /*
  * This macro initializes options to the context.

@@ -311,8 +311,11 @@ void vISAVerifier::verifyAddressDecl(unsigned declID) {
                 header->getAddr(declID)->name_index < header->getStringCount(),
                 "A%d's name index(%d) is not valid: %s", declID,
                 header->getAddr(declID)->name_index, declError.c_str());
-  REPORT_HEADER(options, header->getAddr(declID)->num_elements <= 16,
-                "Max possible address registers are 16 on BDW+: %s",
+  REPORT_HEADER(options,
+                header->getAddr(declID)->num_elements <=
+                    irBuilder->getNumAddrRegisters(),
+                "Max possible address registers are %d: %s",
+                irBuilder->getNumAddrRegisters(),
                 declError.c_str());
 
 /// TODO: Fix/Reenable this verification check.
@@ -631,7 +634,7 @@ void vISAVerifier::verifyRegion(const CISA_INST *inst, unsigned i) {
   } else if (dstIndex != i) {
     // check for out-of-bound addresses for VxH operand
     int numAddr = exec_sz / width_val;
-    REPORT_INSTRUCTION(options, numAddr <= 16,
+    REPORT_INSTRUCTION(options, numAddr <= (int)irBuilder->getNumAddrRegisters(),
                        "Number of Address for indirect operand exceeds 16");
   }
 
@@ -1905,7 +1908,7 @@ void vISAVerifier::verifyInstructionArith(const CISA_INST *inst) {
   // check for IEEE macros support
   // !hasMadm() check
   bool noMadm = platform == GENX_ICLLP || platform == GENX_TGLLP ||
-                platform == Xe_DG2 || platform == Xe_MTL;
+                platform == Xe_DG2 || platform == Xe_MTL || platform == Xe_ARL;
   if (noMadm) {
     bool fOpcodeIEEE = (opcode == ISA_DIVM) || (opcode == ISA_SQRTM);
     bool dfOpcodeIEEE = fOpcodeIEEE || (opcode == ISA_INV) ||
@@ -2228,7 +2231,11 @@ void vISAVerifier::verifyInstructionSampler(const CISA_INST *inst) {
       bool isSupportedOp = subOp == VISA_3D_SAMPLE ||
                            subOp == VISA_3D_SAMPLE_B ||
                            subOp == VISA_3D_SAMPLE_C ||
-                           subOp == VISA_3D_SAMPLE_B_C || subOp == VISA_3D_LOD;
+                           subOp == VISA_3D_SAMPLE_B_C ||
+                           subOp == VISA_3D_LOD ||
+                           subOp == VISA_3D_SAMPLE_PO ||
+                           subOp == VISA_3D_SAMPLE_PO_B ||
+                           subOp == VISA_3D_SAMPLE_PO_C;
 
       REPORT_INSTRUCTION(options, isSupportedOp,
                          "CPS LOD Compensation Enable is only supported for"
@@ -3398,6 +3405,17 @@ void vISAVerifier::verifyBFMixedMode(const CISA_INST *inst) {
   case ISA_SEL:
   case ISA_CMP:
     break;
+  case ISA_COS:
+  case ISA_DIV:
+  case ISA_EXP:
+  case ISA_INV:
+  case ISA_LOG:
+  case ISA_POW:
+  case ISA_RSQRT:
+  case ISA_SIN:
+  case ISA_SQRT:
+    if (irBuilder->supportPureBF())
+      break;
   default:
     REPORT_INSTRUCTION(options, false,
                        "BF opnd is not allowed on this instruction");
@@ -3416,6 +3434,10 @@ void vISAVerifier::verifyBFMixedMode(const CISA_INST *inst) {
       REPORT_INSTRUCTION(options,
                          (dstType == ISA_TYPE_F || dstType == ISA_TYPE_BF),
                          "Dst opnd in BF mixed mode should be either BF or F");
+      if (irBuilder->supportPureBF() && inst->isMath())
+        REPORT_INSTRUCTION(
+            options, (dstType == ISA_TYPE_BF),
+            "Math instructions must be pure BF mode");
     }
   } else {
     // cmp's 1st opnd is cmp relop
@@ -3426,6 +3448,9 @@ void vISAVerifier::verifyBFMixedMode(const CISA_INST *inst) {
     REPORT_INSTRUCTION(options,
                        (srcType == ISA_TYPE_F || srcType == ISA_TYPE_BF),
                        "Src opnd in BF mixed mode should be either BF or F");
+    if (irBuilder->supportPureBF() && inst->isMath())
+      REPORT_INSTRUCTION(options, (srcType == ISA_TYPE_BF),
+                         "Math instructions must be pure BF mode");
   }
   return;
 }
@@ -3681,6 +3706,22 @@ struct LscInstVerifier {
         verify(sfid != LSC_SLM || dataShape.size != LSC_DATA_SIZE_64b ||
                    opInfo.op == LSC_ATOMIC_ICAS,
                "LSC SLM D64 atomics only support icas");
+        if (builder.getPlatform() >= Xe2) {
+          verify(
+              (opInfo.op != LSC_ATOMIC_FADD && opInfo.op != LSC_ATOMIC_FSUB) ||
+                  (sfid == LSC_UGM || sfid == LSC_UGML || sfid == LSC_TGM),
+              "LSC atomic fadd/fsub only support UGM, UGML and TGM");
+
+          verify((opInfo.op != LSC_APNDCTR_ATOMIC_ADD &&
+                  opInfo.op != LSC_APNDCTR_ATOMIC_SUB) ||
+                     sfid == LSC_UGM,
+                 "LSC append counter atomic add/sub only support UGM");
+
+          verify((opInfo.op != LSC_APNDCTR_ATOMIC_ADD &&
+                  opInfo.op != LSC_APNDCTR_ATOMIC_SUB) ||
+                     dataShape.size == LSC_DATA_SIZE_32b,
+                 "LSC append counter atomic add/sub only support D32");
+        } else
         {
           verify(
               (opInfo.op != LSC_ATOMIC_FADD && opInfo.op != LSC_ATOMIC_FSUB) ||
@@ -3746,6 +3787,7 @@ struct LscInstVerifier {
   void verifyCachingOpts() {
     auto l1 = getNextEnumU8<LSC_CACHE_OPT>();
     auto l3 = getNextEnumU8<LSC_CACHE_OPT>();
+    if (builder.getPlatform() < Xe2)
     {
       if (sfid == LSC_TGM || sfid == LSC_UGML) {
         verify(l1 == LSC_CACHING_DEFAULT && l3 == LSC_CACHING_DEFAULT,
@@ -3986,16 +4028,15 @@ struct LscInstVerifier {
 
     bool transpose = dataShape2D.order == LSC_DATA_ORDER_TRANSPOSE;
     bool transform = dataShape2D.vnni;
+    unsigned totalBytes = dataShape2D.width * dataShape2D.blocks * dataSizeBytes;
     if (subOp == LSC_LOAD_BLOCK2D) {
-      valid &= verify(dataShape2D.width * dataShape2D.blocks * dataSizeBytes <= 64,
-          dataShape2D.width * dataShape2D.blocks * dataSizeBytes,
-         ": block2d width * data size must be <= 64Bytes for 2D loads");
+      valid &= verify(totalBytes <= 64,
+          totalBytes, ": block2d width * data size must be <= 64Bytes for 2D loads");
     }
     else {
       // subOp is LSC_STORE_BLOCK2D
-      valid &= verify(dataShape2D.width * dataShape2D.blocks * dataSizeBytes <= 512,
-          dataShape2D.width * dataShape2D.blocks * dataSizeBytes,
-         ": block2d width * data size must be <= 512Bytes for 2D stores");
+      valid &= verify(totalBytes <= 512,
+          totalBytes, ": block2d width * data size must be <= 512Bytes for 2D stores");
     }
 
     int rows = !transpose ? dataShape2D.height : dataShape2D.width;
@@ -4164,6 +4205,57 @@ struct LscInstVerifier {
     verifyDataOperands(dstOpIx, src1OpIx);
   }
 
+  LSC_DATA_SHAPE_TYPED_BLOCK2D getNextDataShapeTyped2D() {
+    LSC_DATA_SHAPE_TYPED_BLOCK2D dataShape2D{};
+    dataShape2D.width = (int)getNext<uint16_t>();
+    dataShape2D.height = (int)getNext<uint16_t>();
+    return dataShape2D;
+  }
+
+  void verifyTypedBlock2D() {
+    verifyCachingOpts();
+
+    auto addrType = getNextEnumU8<LSC_ADDR_TYPE>();
+    const auto dataShape2D = getNextDataShapeTyped2D();
+    verify(dataShape2D.height > 0 && dataShape2D.width <= 64,
+           "blocks2d height must (0, 64]");
+    verify(dataShape2D.width > 0 && dataShape2D.width <= 64,
+           "blocks2d width must be (0, 64]");
+    verify(dataShape2D.width * dataShape2D.height <= 256,
+           "blocks2d size can not exceed 256");
+
+    verifyAddressType(addrType, currOpIx);
+    //
+    /////////////////////////////////////////
+    // now we're at the register operands
+    //   0 - Surface Base
+    //   1 - Surface Index
+    //   2 - Dst
+    //   3 - BlockStartOffsetX
+    //   4 - ImmOffX
+    //   5 - BlockStartOffsetY
+    //   6 - ImmOffY
+    //   7 - Src1(data sent)
+    //
+    verifyVectorOperandNotNull("OffsetX", currOpIx + 3);
+    verifyVectorOperandNotNull("OffsetY", currOpIx + 5);
+    //
+    verifyDataOperands(currOpIx + 2, currOpIx + 7);
+  }
+
+  void verifyUntypedAppendCounterAtomic() {
+    verifyCachingOpts();
+
+    auto addrType = getNextEnumU8<LSC_ADDR_TYPE>();
+
+    auto dataShape = getNextDataShape();
+    verifyDataShape(dataShape);
+
+    // now we are at the registers
+    verifyAddressType(addrType, currOpIx);         // surface
+    verifyRawOperandNull("Src0Addr", currOpIx + 3); // src0 address is null
+    verifyRawOperandNonNull("Src1Data", currOpIx + 4); // src1 data
+  }
   void verify() {
       verifyLSC();
   }
@@ -4177,10 +4269,17 @@ struct LscInstVerifier {
     } else if (inst->opcode == ISA_LSC_UNTYPED) {
       if (subOp == LSC_LOAD_BLOCK2D || subOp == LSC_STORE_BLOCK2D) {
         verifyUntypedBlock2D();
+      } else if (subOp == LSC_APNDCTR_ATOMIC_ADD ||
+                 subOp == LSC_APNDCTR_ATOMIC_SUB ||
+                 subOp == LSC_APNDCTR_ATOMIC_STORE) {
+        verifyUntypedAppendCounterAtomic();
       } else {
         verifyUntypedBasic();
       }
     } else if (inst->opcode == ISA_LSC_TYPED) {
+      if (subOp == LSC_LOAD_BLOCK2D || subOp == LSC_STORE_BLOCK2D) {
+        return verifyTypedBlock2D();
+      }
       verifyTyped();
     } else {
       badEnum("invalid LSC op code", inst->opcode);
@@ -4430,7 +4529,7 @@ void vISAVerifier::verifyKernelHeader() {
 }
 
 void vISAVerifier::finalize() {
-  for (auto iter : labelDefs) {
+  for (const auto &iter : labelDefs) {
     if (!(iter.second)) {
       const label_info_t *lblInfo = header->getLabel(iter.first);
       if (lblInfo->kind != LABEL_FC) {

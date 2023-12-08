@@ -304,8 +304,8 @@ void SWSBAnalyzer::calculateDependence(DepSet &currDep,
 
         // Send with different SFID could write to different pipes
         bool sendInDiffPipe = false;
-        if (dep->getInstruction()->getOpSpec().isSendFormat() &&
-            currDep.getInstruction()->getOpSpec().isSendFormat()) {
+        if (dep->getInstruction()->getOpSpec().isAnySendFormat() &&
+            currDep.getInstruction()->getOpSpec().isAnySendFormat()) {
           sendInDiffPipe = (dep->getInstruction()->getSendFc() !=
                             currDep.getInstruction()->getSendFc());
           // for send in unknown pipe, always treated as different pipe
@@ -547,7 +547,7 @@ void SWSBAnalyzer::clearSBIDDependence(InstList::iterator insertPoint,
 
   // if last instruction in basic block is EOT no need to generate flushes
   // hardware will take care of it
-  if (lastInst && lastInst->getOpSpec().isSendFormat() &&
+  if (lastInst && lastInst->getOpSpec().isAnySendFormat() &&
       lastInst->hasInstOpt(InstOpt::EOT)) {
     sbidInUse = false;
   }
@@ -628,7 +628,7 @@ void SWSBAnalyzer::processActiveSBID(SWSB &swsb,
                                      std::vector<SBID> &activeSBID) {
   // If instruction depends on one or more SBIDS, first one goes in to SWSB
   // field for rest we generate wait instructions.
-  for (auto aSBID : activeSBID) {
+  for (const auto &aSBID : activeSBID) {
     // Could be we had operation depending on the write
     /*
      *   This case also gets triggered when we have send in BB and dependence in
@@ -881,7 +881,7 @@ void SWSBAnalyzer::postProcess() {
       for (auto inst_it = instList.begin(); inst_it != instList.end();
            ++inst_it) {
         auto isWriteCombinedCandidate = [&](Instruction &inst) {
-          return inst.is(Op::MOV) &&
+          return (inst.is(Op::MOV) || inst.is(Op::SRND)) &&
                  inst.getDestination().getKind() == Operand::Kind::DIRECT &&
                  inst.getDestination().getDirRegName() == RegName::GRF_R &&
                  TypeSizeInBitsWithDefault(inst.getDestination().getType(),
@@ -1303,7 +1303,7 @@ void SWSBAnalyzer::run() {
        *           ...
        *           ret (16|M0)                          r8.0
        */
-      if (!(inst->getOpSpec().isSendFormat() &&
+      if (!(inst->getOpSpec().isAnySendFormat() &&
             inst->hasInstOpt(InstOpt::EOT))) {
         // adding dependencies to buckets
         for (auto bucketID : input->getBuckets()) {
@@ -1387,9 +1387,9 @@ void SWSBAnalyzer::forceSyncLastInst(const Instruction &lastInst,
   // this code is for FC composite
   // if last instruction is not EOT we will insert flush instructions
   // and stall the pipeline since we do not do global analysis
-  if ((lastInst.getOpSpec().isSendFormat() &&
+  if ((lastInst.getOpSpec().isAnySendFormat() &&
        !lastInst.getInstOpts().contains(InstOpt::EOT)) ||
-      !lastInst.getOpSpec().isSendFormat()) {
+      !lastInst.getOpSpec().isAnySendFormat()) {
     SWSB swsb;
     if (getNumOfDistPipe() == 1)
       swsb.distType = SWSB::DistType::REG_DIST;

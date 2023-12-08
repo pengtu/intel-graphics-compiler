@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2017-2021 Intel Corporation
+Copyright (C) 2017-2023 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -443,7 +443,7 @@ bool WIAnalysisRunner::needToBeUniform(const Value* val)
 {
     for (auto UI = val->user_begin(), E = val->user_end(); UI != E; ++UI)
     {
-        if (const RTWritIntrinsic * use = dyn_cast<RTWritIntrinsic>(*UI))
+        if (const RTWriteIntrinsic * use = dyn_cast<RTWriteIntrinsic>(*UI))
         {
             if (use->getSampleIndex() == val || use->getBlendStateIndex() == val)
             {
@@ -847,6 +847,17 @@ void WIAnalysisRunner::calculate_dep(const Value* val)
         // Spec enforces subgroup broadcast to use thread-uniform local ID.
         if (isWaveBroadcastIndex(inst))
         {
+#ifdef _DEBUG
+            // Print warning exactly once per kernel.
+            static SmallPtrSet<Function*, 8> detectedKernels;
+            if (dep > WIAnalysis::UNIFORM_THREAD && !detectedKernels.count(m_func))
+            {
+                detectedKernels.insert(m_func);
+                std::string msg = "Detected llvm.genx.GenISA.WaveBroadcast with potentially non-uniform LocalID in kernel " + m_func->getName().str()
+                    + "; such operation doesn't meet specification of OpGroupBroadcast and can lead to unexpected results.";
+                m_CGCtx->EmitWarning(msg.c_str());
+            }
+#endif // DEBUG
             dep = WIAnalysis::UNIFORM_THREAD;
         }
 
@@ -1529,8 +1540,7 @@ WIAnalysis::WIDependancy WIAnalysisRunner::calculate_dep(const CallInst* inst)
             case VIEWPORT_INDEX: // viewport index from PS payload
             {
                 IGC_ASSERT(m_CGCtx->type == ShaderType::PIXEL_SHADER);
-                const bool hasMultipolyDispatch =
-                    m_CGCtx->platform.supportDualSimd8PS();
+                const bool hasMultipolyDispatch = m_CGCtx->platform.hasDualKSPPS() || m_CGCtx->platform.supportDualSimd8PS();
                 return hasMultipolyDispatch ? WIAnalysis::RANDOM : WIAnalysis::UNIFORM_THREAD;
             }
             case POSITION_X: // position from VUE header in GS or pixel position X in PS
@@ -2082,7 +2092,7 @@ void WIAnalysisRunner::checkLocalIdUniform(
     SubGroupSizeMetaDataHandle subGroupSize = funcInfoMD->getSubGroupSize();
     if (subGroupSize->hasValue())
     {
-        simdSize = (uint32_t)subGroupSize->getSIMD_size();
+        simdSize = (uint32_t)subGroupSize->getSIMDSize();
     }
     simdSize = simdSize >= 8 ? simdSize : 32;
 

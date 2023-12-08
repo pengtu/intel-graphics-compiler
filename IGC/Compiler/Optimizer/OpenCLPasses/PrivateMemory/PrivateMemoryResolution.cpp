@@ -77,6 +77,7 @@ namespace IGC {
             unsigned int operandIndex;
         };
 
+        void expandPrivateMemoryForVla(uint32_t &maxPrivateMem);
         static bool testTransposedMemory(const Type* pTmpType, const Type* const pTypeOfAccessedObject, uint64_t tmpAllocaSize, const uint64_t bufferSizeLimit);
 
         /// @brief  The module level alloca information
@@ -119,6 +120,23 @@ void PrivateMemoryResolution::getAnalysisUsage(llvm::AnalysisUsage& AU) const
     AU.addRequired<CodeGenContextWrapper>();
     AU.addRequired<llvm::CallGraphWrapperPass>();
     AU.addRequired<ModuleAllocaAnalysis>();
+}
+
+void PrivateMemoryResolution::expandPrivateMemoryForVla(uint32_t &maxPrivateMem)
+{
+    // Add another 4KB if there are VLAs
+    maxPrivateMem += 4096;
+    std::string maxPrivateMemValue = std::to_string(maxPrivateMem);
+    std::string fullWarningMessage = "VLA has been detected, the private memory size is set to " + maxPrivateMemValue + "B. "
+        "You can change the size by setting environmental variable IGC_ForcePerThreadPrivateMemorySize to a value from [1024:20480]. "
+        "Greater values can affect performance, and lower ones may lead to incorrect results of your program.\n"
+        "To make sure your program runs correctly you can set environmental variable IGC_StackOverflowDetection to 1. "
+        "This flag will print \"Stack overflow detected!\" if insufficient memory value has lead to stack overflow. "
+        "It should be used for debugging only as it affects performance.\n"
+        "The documentation for setting flags through environmental variables as well as available flags can be found at "
+        "https://github.com/intel/intel-graphics-compiler/blob/master/documentation/configuration_flags.md";
+
+    getAnalysis<CodeGenContextWrapper>().getCodeGenContext()->EmitWarning(fullWarningMessage.c_str());
 }
 
 bool PrivateMemoryResolution::runOnModule(llvm::Module& M)
@@ -193,13 +211,8 @@ bool PrivateMemoryResolution::runOnModule(llvm::Module& M)
                 if (!FGA && hasVLA)
                 {
                     uint32_t maxPrivateMem = funcMD->second.privateMemoryPerWI;
-                    // Add another 4KB if there are VLAs
-                    maxPrivateMem += 4096;
-                    std::string maxPrivateMemValue = std::to_string(maxPrivateMem);
-                    std::string fullWarningMessage = "VLA has been detected, the private memory size is set to " + maxPrivateMemValue + "B. You can change the size by setting flag ForcePerThreadPrivateMemorySize to a value from [1024:20480]. Greater values can affect performance, and lower ones may lead to incorrect results of your program";
+                    expandPrivateMemoryForVla(maxPrivateMem);
 
-                    // Now, you can pass the concatenated warning message (const char*) to the EmitWarning function
-                    getAnalysis<CodeGenContextWrapper>().getCodeGenContext()->EmitWarning(fullWarningMessage.c_str());
                     maxPrivateMem = std::max(maxPrivateMem, Ctx.getPrivateMemoryMinimalSizePerThread());
                     maxPrivateMem = std::max(maxPrivateMem, (uint32_t)(IGC_GET_FLAG_VALUE(ForcePerThreadPrivateMemorySize)));
                     modMD.PrivateMemoryPerFG[m_currFunction] = maxPrivateMem;
@@ -316,13 +329,7 @@ bool PrivateMemoryResolution::runOnModule(llvm::Module& M)
             }
             if (FG->hasVariableLengthAlloca())
             {
-                // Add another 4KB if there are VLAs
-                maxPrivateMem += 4096;
-                std::string maxPrivateMemValue = std::to_string(maxPrivateMem);
-                std::string fullWarningMessage = "VLA has been detected, the private memory size is set to " + maxPrivateMemValue + "B. You can change the size by setting flag ForcePerThreadPrivateMemorySize to a value from [1024:20480]. Greater values can affect performance, and lower ones may lead to incorrect results of your program";
-
-                // Now, you can pass the concatenated warning message (const char*) to the EmitWarning function
-                getAnalysis<CodeGenContextWrapper>().getCodeGenContext()->EmitWarning(fullWarningMessage.c_str());
+                expandPrivateMemoryForVla(maxPrivateMem);
             }
             maxPrivateMem = std::max(maxPrivateMem, Ctx.getPrivateMemoryMinimalSizePerThread());
             maxPrivateMem = std::max(maxPrivateMem, (uint32_t)(IGC_GET_FLAG_VALUE(ForcePerThreadPrivateMemorySize)));
@@ -725,6 +732,21 @@ bool PrivateMemoryResolution::resolveAllocaInstructions(bool privateOnStack)
         return false;
     }
 
+    for (AllocaInst* aInst : allocaInsts)
+    {
+        auto allocationSize = aInst->getAllocationSizeInBits(m_currFunction->getParent()->getDataLayout());
+
+        if (allocationSize)
+        {
+            auto scratchUsage_i = Ctx.m_ScratchSpaceUsage.find(m_currFunction);
+            if (scratchUsage_i == Ctx.m_ScratchSpaceUsage.end())
+            {
+                Ctx.m_ScratchSpaceUsage.insert({ m_currFunction, 0 });
+            }
+            Ctx.m_ScratchSpaceUsage[m_currFunction] += allocationSize.getValue() / 8;
+        }
+    }
+
     if (Ctx.m_instrTypes.numAllocaInsts > IGC_GET_FLAG_VALUE(AllocaRAPressureThreshold))
     {
         sinkAllocaSingleUse(allocaInsts);
@@ -852,11 +874,8 @@ bool PrivateMemoryResolution::resolveAllocaInstructions(bool privateOnStack)
                         // Attach metadata to instruction containing offset of storage
                         auto OffsetMD = MDNode::get(builder.getContext(), ConstantAsMetadata::get(builder.getInt32(scalarBufferOffset)));
                         DbgDcl->setMetadata("StorageOffset", OffsetMD);
-                        if (IGC_IS_FLAG_ENABLED(UseOffsetInLocation))
-                        {
-                            auto SizeMD = MDNode::get(builder.getContext(), ConstantAsMetadata::get(builder.getInt32(bufferSize)));
-                            DbgDcl->setMetadata("StorageSize", SizeMD);
-                        }
+                        auto SizeMD = MDNode::get(builder.getContext(), ConstantAsMetadata::get(builder.getInt32(bufferSize)));
+                        DbgDcl->setMetadata("StorageSize", SizeMD);
                     }
                 }
             }
@@ -1102,19 +1121,13 @@ bool PrivateMemoryResolution::resolveAllocaInstructions(bool privateOnStack)
 
     Value* perThreadOffset = entryBuilder.CreateMul(threadId, totalPrivateMemPerThread, VALUE_NAME("perThreadOffset"));
     auto perThreadOffsetInst = dyn_cast_or_null<Instruction>(perThreadOffset);
-
-    if (IGC_IS_FLAG_ENABLED(UseOffsetInLocation) &&
-        (privateOnStack == false) &&
-        (IGC::ForceAlwaysInline(&Ctx)))
+    IGC_ASSERT_MESSAGE(perThreadOffsetInst, "perThreadOffset will not be marked as Output");
+    if (perThreadOffsetInst)
     {
-        IGC_ASSERT_MESSAGE(perThreadOffsetInst, "perThreadOffset will not be marked as Output");
-        if (perThreadOffsetInst)
-        {
-            // Note: for debugging purposes privateMemArg, as well as privateMemArg (aka ImplicitArg::PRIVATE_BASE)
-            // will be marked as Output to keep its liveness all time
-            auto perThreadOffsetMD = MDNode::get(entryBuilder.getContext(), nullptr); // ConstantAsMetadata::get(entryBuilder.getInt32(1)));
-            perThreadOffsetInst->setMetadata("perThreadOffset", perThreadOffsetMD);
-        }
+        // We add "perThreadOffset" metadata, so emitter will mark it as output to
+        // extend it's living time to the end of the function. PrivateBase will be marked too.
+        auto perThreadOffsetMD = MDNode::get(entryBuilder.getContext(), nullptr); // ConstantAsMetadata::get(entryBuilder.getInt32(1)));
+        perThreadOffsetInst->setMetadata("perThreadOffset", perThreadOffsetMD);
     }
 
     for (auto pAI : allocaInsts)

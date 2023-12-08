@@ -148,7 +148,8 @@ public:
     return iter != configs.end();
   }
 
-  unsigned findModeByRegPressure(unsigned maxRP, unsigned largestInputReg);
+  unsigned setModeByRegPressure(unsigned maxRP, unsigned largestInputReg);
+  bool hasLargerGRFSameThreads() const;
 
   unsigned getNumGRF() const { return configs[currentMode].numGRF; }
   unsigned getDefaultGRF() const { return configs[defaultMode].numGRF; }
@@ -169,20 +170,21 @@ public:
 
   unsigned getNumAcc() const { return configs[currentMode].numAcc; }
 
-  // ----- helper functions for regSharingHeuristics (VRT) ----- //
-  unsigned getVRTMinGRF() const {
+  // ----- helper functions for autoGRFSelection (VRT) ----- //
+  unsigned getMinGRF() const {
     auto found = std::find_if(configs.begin(), configs.end(),
                               [](const Config &c) { return c.VRTEnable; });
     return found->numGRF;
   }
 
-  unsigned getVRTMaxGRF() const {
+  unsigned getMaxGRF() const {
     auto found = std::find_if(configs.rbegin(), configs.rend(),
                               [](const Config &c) { return c.VRTEnable; });
     return found->numGRF;
   }
 
-  unsigned getVRTLargerGRF() const {
+  // Get the next larger GRF available
+  unsigned getLargerGRF() const {
     // find the first larger mode that's available for VRT
     for (auto i = currentMode + 1; i < configs.size(); ++i) {
       if (configs[i].VRTEnable)
@@ -191,10 +193,33 @@ public:
     return configs[currentMode].numGRF;
   }
 
-  unsigned getVRTSmallerGRF() const {
-    for (auto i = currentMode - 1; i >= 0 ; --i) {
+  // Get the next smaller GRF available
+  unsigned getSmallerGRF() const {
+    for (auto i = static_cast<int>(currentMode) - 1; i >= 0 ; --i) {
       if (configs[i].VRTEnable)
         return configs[i].numGRF;
+    }
+    return configs[currentMode].numGRF;
+  }
+
+  // Move GRF mode to the larger GRF available and return the number
+  unsigned moveToLargerGRF() {
+    for (auto i = currentMode + 1; i < configs.size(); ++i) {
+      if (configs[i].VRTEnable) {
+        currentMode = i;
+        break;
+      }
+    }
+    return configs[currentMode].numGRF;
+  }
+
+  // Move GRF mode to the smaller GRF available and return the number
+  unsigned moveToSmallerGRF() {
+    for (auto i = currentMode - 1; i >= 0; --i) {
+      if (configs[i].VRTEnable) {
+        currentMode = i;
+        break;
+      }
     }
     return configs[currentMode].numGRF;
   }
@@ -212,7 +237,7 @@ private:
     unsigned numThreads;
     unsigned numSWSB;
     unsigned numAcc;
-    // if the config can be used by regSharingHeuristics
+    // if the config can be used by autoGRFSelection
     bool     VRTEnable;
   };
   // Vector configs maintains all the GRF modes available for the platform
@@ -475,7 +500,7 @@ private:
   G4_ExecSize simdSize{0u}; // must start as 0
   bool channelSliced = true;
   bool hasAddrTaken;
-  bool regSharingHeuristics = false;
+  bool autoGRFSelection = false;
   bool needDPASWA = false;
   Options *m_options;
   const Attributes *m_kernelAttrs;
@@ -596,9 +621,9 @@ public:
 
   void setBuilder(IR_Builder *pBuilder) { fg.setBuilder(pBuilder); }
 
-  bool useRegSharingHeuristics() const {
+  bool useAutoGRFSelection() const {
     // Register sharing not enabled in presence of stack calls
-    return regSharingHeuristics && !m_hasIndirectCall &&
+    return autoGRFSelection && !m_hasIndirectCall &&
            !fg.getIsStackCallFunc() && !fg.getHasStackCalls();
   }
 

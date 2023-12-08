@@ -190,7 +190,7 @@ struct ISA_Inst_Info {
   uint8_t n_dsts;
 };
 
-#define MAX_OPNDS_PER_INST 24
+#define MAX_OPNDS_PER_INST 35
 
 typedef struct OpndDesc {
   unsigned opnd_type; // Common_ISA_Opnd_Desc_Type OR #defines like
@@ -269,6 +269,9 @@ struct LscOpInfo {
   }
   bool isBlock2D() const {
     return op == LSC_LOAD_BLOCK2D || op == LSC_STORE_BLOCK2D;
+  }
+  bool isApndCtrAtomic() const {
+    return op == LSC_APNDCTR_ATOMIC_ADD || op == LSC_APNDCTR_ATOMIC_SUB || op == LSC_APNDCTR_ATOMIC_STORE;
   }
 };
 

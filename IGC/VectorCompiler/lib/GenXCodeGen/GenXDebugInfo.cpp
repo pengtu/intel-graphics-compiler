@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2020-2021 Intel Corporation
+Copyright (C) 2020-2023 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -388,7 +388,7 @@ public:
   VISAKernel *getSpawnedVISAFunction(const Function *F) const {
     IGC_ASSERT(!isSubroutine(F));
     auto SpawnedInfoIt = VisaSpawnerInfo.find(F);
-    IGC_ASSERT(SpawnedInfoIt != VisaSpawnerInfo.end());
+    IGC_ASSERT_EXIT(SpawnedInfoIt != VisaSpawnerInfo.end());
     return SpawnedInfoIt->second;
   }
   // Return a VISA object representing true *VISAKernel* that was spawned by a
@@ -403,7 +403,7 @@ public:
   const Function *getSubroutineOwner(const Function *F) const {
     IGC_ASSERT(isSubroutine(F));
     auto SubInfoIt = SubroutineOwnersInfo.find(F);
-    IGC_ASSERT(SubInfoIt != SubroutineOwnersInfo.end());
+    IGC_ASSERT_EXIT(SubInfoIt != SubroutineOwnersInfo.end());
     return SubInfoIt->second;
   }
   // PrimaryEmitter is the function spawning gen object, that
@@ -524,7 +524,7 @@ ModuleToVisaTransformInfo::getPrimaryEmittersForVisa(const Function *F,
                                                      bool Strict) const {
   if (isSubroutine(F)) {
     auto SubrInfoIt = SubroutineOwnersInfo.find(F);
-    IGC_ASSERT(SubrInfoIt != SubroutineOwnersInfo.end());
+    IGC_ASSERT_EXIT(SubrInfoIt != SubroutineOwnersInfo.end());
     const Function *SubrOwner = SubrInfoIt->second;
     IGC_ASSERT(SubrOwner);
     IGC_ASSERT(!isSubroutine(SubrOwner));
@@ -683,6 +683,8 @@ public:
 
   GenObjectWrapper(VISAKernel &VK, const Function &F);
   ~GenObjectWrapper() { releaseDebugInfoResources(); }
+  GenObjectWrapper(const GenObjectWrapper &) = delete;
+  GenObjectWrapper &operator=(const GenObjectWrapper &) = delete;
 
   bool hasErrors() const { return !ErrMsg.empty(); }
 
@@ -857,6 +859,8 @@ public:
   ~GenXFunction() {
     LLVM_DEBUG(dbgs() << "~GenXFunction() called for " << F.getName() << "\n");
   }
+  GenXFunction(const GenXFunction &) = delete;
+  GenXFunction &operator=(const GenXFunction &) = delete;
 
   llvm::StringRef GetVISAFuncName() const override {
     // TODO: this is not quite correct since VISA names is defined by VISA label

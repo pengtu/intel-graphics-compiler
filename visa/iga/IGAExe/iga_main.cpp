@@ -271,12 +271,13 @@ extern "C" int iga_main(int argc, const char **argv) {
       "  <XE:     -Xdsd      ExecSize? ExDesc Desc\n"
       "  >=XE:    -Xdsd SFID ExecSize? ExDesc Desc\n"
       "\n"
-      "  SFIDS are: BTD, DC0, DC1, DC2, DCRO, GTWY, RTA, RC, "
-      "SLM, SMPL, TGM, TS, UGML, UGM, URB, VME\n"
-      "  (exact SFID support varies per platform)\n"
+      "  SFIDs are: BTD, DC0, DC1, DC2, DCRO, GTWY, RTA, RC, "
+      "SLM, SMPL, TGM, TS,\n"
+      "             UGML, UGM, URB, VME\n"
+      "             (exact SFID support varies per platform)\n"
       "\n"
-      "   ExecSize is the instruction ExecSize in parentheses "
-      "(e.g. \"(16|M0)\" or \"(16\")\n"
+      "   ExecSize is the instruction's execution size in parentheses\n"
+      "   much like it appears in syntax (e.g. \"(16|M0)\" or \"(16)\"\n"
       "   If ExecSize is absent, then we may guess based on the platform\n"
       "\n"
       "\n"
@@ -292,6 +293,9 @@ extern "C" int iga_main(int argc, const char **argv) {
       "  % iga -p=xehpg  -Xdsd  ugm           0x0   0x30607502\n"
       "  % iga -p=xehpg  -Xdsd  ugm  \"(1)\"    0x0   0x0200D504\n"
       "  % iga -p=xehpc  -Xdsd  ugm           0x0   0x30607502\n"
+      "  % iga -p=xe2    -Xdsd  slm           0xFFFFC000  0x04200500\n"
+      "  % iga -p=xe2    -Xdsd  ugm \"(16)\"    0xFFF8C000:a0.2  0x22003504\n"
+      "  % iga -p=xe2    -Xdsd  ugm \"(32)\"    0xFFF8C000:a0.2  0x24000512\n"
       "",
       opts::OptAttrs::ALLOW_UNSET,
       [](const char *, const opts::ErrorHandler &, Opts &baseOpts) {

@@ -40,6 +40,7 @@ using namespace vISA;
 
 #define GRAPH_COLOR_MEM_SIZE 16 * 1024
 #define SCRATCH_MSG_LIMIT (128 * 1024)
+#define SCRATCH_COMPRESS_THRESHOLD (32 * 1024)
 
 const RAVarInfo GlobalRA::defaultValues;
 const char GlobalRA::StackCallStr[] = "StackCall";
@@ -1304,7 +1305,7 @@ void GlobalRA::reportSpillInfo(const LivenessAnalysis &liveness,
 
 LiveRange::LiveRange(G4_RegVar *v, GlobalRA &g)
     : var(v), dcl(v->getDeclare()), regKind(dcl->getRegFile()), gra(g),
-      numRegNeeded(dcl->getNumRegNeeded()) {
+      numRegNeeded(dcl->getNumRegNeeded()){
   isCandidate = true;
 }
 
@@ -2014,7 +2015,7 @@ void Interference::markInterferenceToAvoidDstSrcOverlap(G4_BB *bb,
             const REGVAR_VECTOR &pointsToSet =
                 liveAnalysis->getPointsToAnalysis().getAllInPointsToOrIndrUse(
                     srcRgn, bb);
-            for (auto pt : pointsToSet) {
+            for (auto &pt : pointsToSet) {
               if (pt.var->isRegAllocPartaker()) {
                 unsigned srcId = pt.var->getId();
                 if (isDstRegAllocPartaker) {
@@ -2111,7 +2112,7 @@ void Interference::buildInterferenceForDst(
     //
     const REGVAR_VECTOR &pointsToSet =
         liveAnalysis->getPointsToAnalysis().getAllInPointsToOrIndrUse(dst, bb);
-    for (auto pt : pointsToSet) {
+    for (auto &pt : pointsToSet) {
       if (pt.var->isRegAllocPartaker()) {
         buildInterferenceWithLive(live, pt.var->getId());
       }
@@ -2221,7 +2222,7 @@ void Interference::buildInterferenceWithinBB(G4_BB *bb, SparseBitVector &live) {
           const REGVAR_VECTOR &pointsToSet =
               liveAnalysis->getPointsToAnalysis().getAllInPointsToOrIndrUse(
                   srcRegion, bb);
-          for (auto pt : pointsToSet) {
+          for (auto &pt : pointsToSet) {
             if (pt.var->isRegAllocPartaker()) {
               updateLiveness(live, pt.var->getId(), true);
             }
@@ -2350,7 +2351,8 @@ void Interference::setupLRs(G4_BB *bb) {
       }
     }
 
-    bool isSend = inst->isSend() || inst->isFillIntrinsic();
+    bool isSend =
+        inst->isSend() || inst->isFillIntrinsic() || inst->isSpillIntrinsic();
     if (isSend && !dst->isNullReg()) {
       // r127 must not be used for return address when there is a src and dest
       // overlap in send instruction. This applies to split-send as well
@@ -2375,6 +2377,7 @@ void Interference::setupLRs(G4_BB *bb) {
       G4_SrcRegRegion *srcRegion = src->asSrcRegRegion();
       if (srcRegion->getBase()->isRegAllocPartaker()) {
         unsigned id = ((G4_RegVar *)(srcRegion)->getBase())->getId();
+
         lrs[id]->setRefCount(lrs[id]->getRefCount() + refCount);
         if (inst->isEOT() && liveAnalysis->livenessClass(G4_GRF)) {
           // mark the liveRange as the EOT source
@@ -2392,7 +2395,7 @@ void Interference::setupLRs(G4_BB *bb) {
         const REGVAR_VECTOR &pointsToSet =
             liveAnalysis->getPointsToAnalysis().getAllInPointsToOrIndrUse(
                 srcRegion, bb);
-        for (auto pt : pointsToSet) {
+        for (auto &pt : pointsToSet) {
           if (!pt.var->isRegAllocPartaker() || !incSpillCostAddrTaken)
             continue;
 
@@ -2647,9 +2650,12 @@ void GlobalRA::updateSubRegAlignment(G4_SubReg_Align subAlign) {
   }
 }
 
-bool GlobalRA::evenAlignNeeded(G4_Declare *dcl) {
+int GlobalRA::getAlignFromAugBucket(G4_Declare *dcl) {
   if (GlobalRA::useGenericAugAlign(builder.getPlatformGeneration())) {
-    // Return true if even alignment is needed
+    // Return 0 if no special alignment is needed
+    // Return 2 if even alignment is needed
+    // Return 4 if quad alignment is needed
+
     // Even align needed if for given SIMD size and elem type,
     // a complete def uses between 1-2 GRFs.
     auto kernelSimdSizeToUse = kernel.getSimdSizeWithSlicing();
@@ -2667,14 +2673,38 @@ bool GlobalRA::evenAlignNeeded(G4_Declare *dcl) {
                topdclAugMask == AugmentationMasks::Default64Bit)
         elemSizeToUse = 8;
 
-      if ( // Even align if size is between 1-2 GRFs, for >2GRF sizes use weak
-           // edges
-          (elemSizeToUse * kernelSimdSizeToUse) >
-              (unsigned)kernel.numEltPerGRF<Type_UB>() &&
-          (elemSizeToUse * kernelSimdSizeToUse) <=
-              (unsigned)(2 * kernel.numEltPerGRF<Type_UB>()) &&
-          !(!builder.canReadR0() && dcl == kernel.fg.builder->getBuiltinR0())) {
-        return true;
+      auto totalByteSize = elemSizeToUse * kernelSimdSizeToUse;
+      auto bucketSpans2GRFs = [&]() {
+        return totalByteSize > (unsigned)kernel.numEltPerGRF<Type_UB>() &&
+               totalByteSize <= (unsigned)(2 * kernel.numEltPerGRF<Type_UB>());
+      };
+
+      if (!(!builder.canReadR0() && dcl == kernel.fg.builder->getBuiltinR0())) {
+        if (use4GRFAlign) {
+          if (topdclAugMask == AugmentationMasks::Default16Bit ||
+              topdclAugMask == AugmentationMasks::Default32Bit) {
+            if (bucketSpans2GRFs())
+              return 2;
+          } else if (topdclAugMask == AugmentationMasks::Default64Bit) {
+            if (bucketSpans2GRFs())
+              // :df SIMD16
+              return 2;
+
+            // :df SIMD32
+            return 4;
+          } else if (topdclAugMask == AugmentationMasks::Undetermined) {
+            // Local RA will take this path as augmentation buckets are set
+            // to Undetermined. Although this is conservative, hybrid RA
+            // will run augmentation and compute buckets to fill in "holes".
+            // For eg, mov (32|M0) V10<2>:f should use 4GRF alignment as
+            // it's Default64Bit variable, although elem size is :f.
+            return 4;
+          }
+        } else {
+          // Even align if size is between 1-2 GRFs, for >2GRF sizes.
+          if (bucketSpans2GRFs())
+            return 2;
+        }
       }
     }
   } else {
@@ -2690,21 +2720,28 @@ bool GlobalRA::evenAlignNeeded(G4_Declare *dcl) {
             topdcl->getByteSize() >= kernel.numEltPerGRF<Type_UB>() &&
             !(!builder.canReadR0() &&
               dcl == kernel.fg.builder->getBuiltinR0())) {
-          return true;
+          return 2;
         }
       }
     }
   }
 
-  return false;
+  return 0;
 }
 
-// This function can be invoked before local RA or after augmentation.
-void GlobalRA::evenAlign() {
-  // Update alignment of all GRF declares to align
+void GlobalRA::augAlign() {
+  // Update alignment of all GRF declares based on
+  // augmentation bucket and platform.
   for (auto dcl : kernel.Declares) {
     if (dcl->getRegFile() & G4_GRF) {
-      if (evenAlignNeeded(dcl)) {
+      unsigned int align = getAlignFromAugBucket(dcl);
+      if (align == 4) {
+        if (!isQuadAligned(dcl)) {
+          incRA.evenAlignUpdate(dcl);
+        }
+        forceQuadAlign(dcl);
+      }
+      else if (align == 2) {
         if (!isEvenAligned(dcl)) {
           incRA.evenAlignUpdate(dcl);
         }
@@ -3095,8 +3132,10 @@ bool Augmentation::isDefaultMaskDcl(G4_Declare *dcl, unsigned simdSize,
 
   unsigned byteSize = getByteSizeFromMask(type);
 
-  // treat simd32 as simd16 as the instruction is always split to 2 simd16
-  if (simdSize == 32) {
+  // treat simd32 as simd16 when the program is split in to 2 simd16.
+  // when a simd32 program is not split in to 2 simd16, but some sends
+  // are broken in to 2 simd16 then treat those simd16 sends as non-default.
+  if (simdSize == 32 && kernel.getChannelSlicing()) {
     simdSize = 16;
   }
   if (mask.size() > 0) {
@@ -3298,7 +3337,7 @@ void Augmentation::markNonDefaultDstRgn(G4_INST *inst, G4_Operand *opnd) {
   }
 
   // Handle dst
-  if (inst->isCall() || inst->isCallerSave()) {
+  if (dst && (inst->isCall() || inst->isCallerSave())) {
     const G4_Declare *dcl = dst->getBase()->asRegVar()->getDeclare();
     if (dcl && liveAnalysis.livenessClass(dcl->getRegFile())) {
       gra.setAugmentationMask(dcl->getRootDeclare(),
@@ -3356,16 +3395,16 @@ void Augmentation::markNonDefaultDstRgn(G4_INST *inst, G4_Operand *opnd) {
         } else if (isDefaultMaskDcl(dcl, kernel.getSimdSize(),
                                     AugmentationMasks::Default64Bit)) {
           bool useNonDefault = false;
-          useNonDefault |=
-              (kernel.getSimdSize() >= g4::SIMD16 && dcl->getTotalElems() > 8);
-          useNonDefault |=
-              (kernel.getSimdSize() == g4::SIMD8 && dcl->getTotalElems() > 4);
-
-          if (useNonDefault) {
-            gra.setAugmentationMask(dcl, AugmentationMasks::NonDefault);
-          } else {
-            gra.setAugmentationMask(dcl, AugmentationMasks::Default64Bit);
+          if (!gra.use4GRFAlign) {
+            useNonDefault |= (kernel.getSimdSize() >= g4::SIMD16 &&
+                              dcl->getTotalElems() > 8);
+            useNonDefault |=
+                (kernel.getSimdSize() == g4::SIMD8 && dcl->getTotalElems() > 4);
           }
+
+          gra.setAugmentationMask(dcl, useNonDefault
+                                           ? AugmentationMasks::NonDefault
+                                           : AugmentationMasks::Default64Bit);
         } else {
           gra.setAugmentationMask(dcl, AugmentationMasks::NonDefault);
           return;
@@ -3466,8 +3505,8 @@ bool Augmentation::markNonDefaultMaskDef() {
 
     bool checkLRAAlign = false;
     if (liveAnalysis.livenessClass(G4_GRF)) {
-      if ((GlobalRA::useGenericAugAlign(kernel.getPlatformGeneration()) &&
-           gra.evenAlignNeeded(dcl)))
+      if (GlobalRA::useGenericAugAlign(kernel.getPlatformGeneration()) &&
+          gra.getAlignFromAugBucket(dcl) > 0)
         checkLRAAlign = true;
       else if (gra.getAugmentationMask(dcl) ==
                    AugmentationMasks::Default32Bit &&
@@ -3480,10 +3519,22 @@ bool Augmentation::markNonDefaultMaskDef() {
       if (dclLR) {
         int s;
         auto phyReg = dclLR->getPhyReg(s);
-        if (phyReg && phyReg->asGreg()->getRegNum() % 2 != 0) {
-          // If LRA assignment is not 2GRF aligned for then
+        unsigned int maxAlign = 2;
+        if (gra.use4GRFAlign && gra.getAugmentationMask(dcl) == AugmentationMasks::Default64Bit) {
+          maxAlign = 4;
+        }
+        if (phyReg && phyReg->asGreg()->getRegNum() % maxAlign != 0) {
+          // If LRA assignment is not aligned as expected then
           // mark it as non-default. GRA candidates cannot fully
           // overlap with such ranges. Partial overlap is illegal.
+
+          // TODO: There's a bug here. This branch should execute only if
+          // dclLR->getAssigned() == true. If this is false, then
+          // dclLR->getPhyReg() is invalid. Once this is fixed, we can
+          // re-enable following assert.
+          //
+          //vISA_ASSERT(!gra.use4GRFAlign,
+          //            "expecting LRA allocation to be aligned");
           gra.setAugmentationMask(dcl, AugmentationMasks::NonDefault);
           nonDefaultMaskDefFound = true;
         }
@@ -3659,10 +3710,12 @@ void Augmentation::buildLiveIntervals() {
         G4_Declare *defdcl = GetTopDclFromRegRegion(dst);
 
         if (dst->getBase()->isRegAllocPartaker()) {
-          if (defdcl && gra.getLocalLR(defdcl)) {
-            updateStartIntervalForLocal(defdcl, inst, dst);
-          } else {
-            updateStartInterval(defdcl, inst);
+          if (defdcl) {
+            if (gra.getLocalLR(defdcl)) {
+              updateStartIntervalForLocal(defdcl, inst, dst);
+            } else {
+              updateStartInterval(defdcl, inst);
+            }
           }
         } else if (liveAnalysis.livenessClass(G4_GRF)) {
           LocalLiveRange *defdclLR;
@@ -3685,7 +3738,7 @@ void Augmentation::buildLiveIntervals() {
         const REGVAR_VECTOR &pointsToSet =
             liveAnalysis.getPointsToAnalysis().getAllInPointsToOrIndrUse(dst,
                                                                          curBB);
-        for (auto pointsToVar : pointsToSet) {
+        for (auto &pointsToVar : pointsToSet) {
           if (pointsToVar.var->isRegAllocPartaker()) {
             updateStartInterval(pointsToVar.var->getDeclare()->getRootDeclare(),
                                 inst);
@@ -3732,7 +3785,7 @@ void Augmentation::buildLiveIntervals() {
           const REGVAR_VECTOR &pointsToSet =
               liveAnalysis.getPointsToAnalysis().getAllInPointsToOrIndrUse(
                   srcRegion, curBB);
-          for (auto pointsToVar : pointsToSet) {
+          for (auto &pointsToVar : pointsToSet) {
             if (pointsToVar.var->isRegAllocPartaker()) {
               updateEndInterval(pointsToVar.var->getDeclare()->getRootDeclare(),
                                 inst);
@@ -4188,6 +4241,8 @@ bool Interference::isStrongEdgeBetween(const G4_Declare *dcl1,
 
 bool Augmentation::weakEdgeNeeded(AugmentationMasks defaultDclMask,
                                   AugmentationMasks newDclMask) {
+  if (gra.use4GRFAlign)
+    return false;
   if (useGenericAugAlign) {
     // Weak edge needed in case #GRF exceeds 2
     if (newDclMask == AugmentationMasks::Default64Bit)
@@ -4739,9 +4794,9 @@ void Augmentation::augmentIntfGraph() {
         // to 2GRF except for NoMask variables
         VISA_DEBUG_VERBOSE(std::cout
                            << "Kernel size is SIMD" << kernel.getSimdSize()
-                           << " so updating all GRFs to be 2GRF aligned"
+                           << " so updating all GRFs to aug align"
                            << "\n");
-        gra.evenAlign();
+        gra.augAlign();
       }
       gra.updateSubRegAlignment(kernel.getGRFAlign());
     }
@@ -4865,7 +4920,7 @@ void Interference::buildInterferenceWithLocalRA(G4_BB *bb) {
         const REGVAR_VECTOR &pointsToSet =
             liveAnalysis->getPointsToAnalysis().getAllInPointsToOrIndrUse(dst,
                                                                           bb);
-        for (auto pt : pointsToSet) {
+        for (auto &pt : pointsToSet) {
           if (pt.var->isRegAllocPartaker()) {
             updateLiveness(live, pt.var->getId(), true);
           }
@@ -4924,7 +4979,7 @@ void Interference::buildInterferenceWithLocalRA(G4_BB *bb) {
           const REGVAR_VECTOR &pointsToSet =
               liveAnalysis->getPointsToAnalysis().getAllInPointsToOrIndrUse(
                   src->asSrcRegRegion(), bb);
-          for (auto pt : pointsToSet) {
+          for (auto &pt : pointsToSet) {
             if (pt.var->isRegAllocPartaker()) {
               if (live.test(pt.var->getId()) == false)
                 update = true;
@@ -4993,7 +5048,7 @@ GraphColor::GraphColor(LivenessAnalysis &live, bool hybrid, bool forceSpill_)
       builder(gra.builder), isHybrid(hybrid), forceSpill(forceSpill_),
       GCMem(GRAPH_COLOR_MEM_SIZE), kernel(gra.kernel), liveAnalysis(live),
       lrs(live.gra.incRA.getLRs()) {
-  spAddrRegSig.resize(getNumAddrRegisters(), 0);
+  spAddrRegSig.resize(builder.getNumAddrRegisters(), 0);
   m_options = builder.getOptions();
 }
 
@@ -5047,6 +5102,7 @@ void GraphColor::computeDegreeForGRF() {
       // consider weak edges in degree computation
       auto *weakEdges = intf.getCompatibleSparseIntf(lrs[i]->getDcl());
       if (weakEdges) {
+        vISA_ASSERT(!gra.use4GRFAlign, "not expecting weak edges");
         for (auto weakNeighbor : *weakEdges) {
           if (!weakNeighbor->getRegVar()->isRegAllocPartaker())
             continue;
@@ -5328,7 +5384,6 @@ void GraphColor::computeSpillCosts(bool useSplitLLRHeuristic, const RPE *rpe) {
       }
 
       lrs[i]->setSpillCost(spillCost);
-
       // Track address sensitive live range.
       if (liveAnalysis.isAddressSensitive(i) && incSpillCostCandidate(lrs[i])) {
         addressSensitiveVars.push_back(lrs[i]);
@@ -5360,12 +5415,23 @@ void GraphColor::computeSpillCosts(bool useSplitLLRHeuristic, const RPE *rpe) {
 void GraphColor::relaxNeighborDegreeGRF(LiveRange *lr) {
   if (!(lr->getIsPseudoNode()) && !(lr->getIsPartialDcl())) {
     unsigned lr_id = lr->getVar()->getId();
+    bool lr2EvenAlign = gra.isEvenAligned(lr->getDcl());
+    unsigned int lr2AugAlign = gra.getAugAlign(lr->getDcl());
+    unsigned lr2_nreg = lr->getNumRegNeeded();
 
     // relax degree between 2 nodes
     auto relaxDegree = [&](LiveRange *lr1) {
       if (lr1->getActive() && !lr1->getIsPseudoNode() &&
           !(lr1->getIsPartialDcl())) {
-        unsigned w = edgeWeightGRF(lr1, lr);
+        unsigned lr1_nreg = lr1->getNumRegNeeded();
+        unsigned w = 0;
+        if (gra.use4GRFAlign) {
+          unsigned int lr1AugAlign = gra.getAugAlign(lr1->getDcl());
+          w = edgeWeightWith4GRF(lr1AugAlign, lr2AugAlign, lr1_nreg, lr2_nreg);
+        } else {
+          bool lr1EvenAlign = gra.isEvenAligned(lr1->getDcl());
+          w = edgeWeightGRF(lr1EvenAlign, lr2EvenAlign, lr1_nreg, lr2_nreg);
+        }
         VISA_DEBUG_VERBOSE({
           std::cout << "\t relax ";
           lr1->dump();
@@ -5466,7 +5532,7 @@ void GraphColor::determineColorOrdering() {
   if (liveAnalysis.livenessClass(G4_GRF))
     numColor = totalGRFRegCount;
   else if (liveAnalysis.livenessClass(G4_ADDRESS))
-    numColor = getNumAddrRegisters();
+    numColor = builder.getNumAddrRegisters();
   else if (liveAnalysis.livenessClass(G4_FLAG))
     numColor = builder.getNumFlagRegisters();
 
@@ -5494,7 +5560,11 @@ void GraphColor::determineColorOrdering() {
   //
   // sort the live range array
   //
-  std::sort(sorted.begin(), sorted.end(), compareSpillCost);
+  if (builder.getOption(vISA_FreqBasedSpillCost))
+    builder.getFreqInfoManager().sortBasedOnFreq(sorted);
+  else
+    std::sort(sorted.begin(), sorted.end(), compareSpillCost);
+
 
   for (unsigned i = 0; i < numUnassignedVar; i++) {
     LiveRange *lr = sorted[i];
@@ -5767,9 +5837,15 @@ bool GraphColor::assignColors(ColorHeuristic colorHeuristicGRF,
       if (!failed_alloc) {
         // When evenAlignNeeded is true, it is binding for correctness
         bool evenAlignNeeded = gra.isEvenAligned(lrVar->getDeclare());
-        BankAlign align = evenAlignNeeded ? BankAlign::Even : BankAlign::Either;
-        if (allocFromBanks) {
+        bool quadAlignNeeded = gra.isQuadAligned(lrVar->getDeclare());
+        BankAlign align = BankAlign::Either;
+        if (quadAlignNeeded)
+          align = BankAlign::QuadGRF;
+        else if (evenAlignNeeded)
+          align = BankAlign::Even;
 
+        if (allocFromBanks) {
+          vISA_ASSERT(align != BankAlign::QuadGRF, "unexpected value");
           if (!isHybrid && oneGRFBankDivision &&
               (!evenAlignNeeded ||
                builder.getPlatformGeneration() == PlatformGen::GEN9)) {
@@ -6328,7 +6404,14 @@ bool GraphColor::regAlloc(bool doBankConflictReduction,
   } else {
     computeDegreeForARF();
   }
-  computeSpillCosts(useSplitLLRHeuristic, rpe);
+
+  if (builder.getOption(vISA_FreqBasedSpillCost))
+  {
+    builder.getFreqInfoManager().computeFreqSpillCosts(gra,liveAnalysis,lrs,numVar);
+  }
+  else {
+    computeSpillCosts(useSplitLLRHeuristic, rpe);
+  }
 
   if (kernel.getOption(vISA_DumpRAIntfGraph))
     intf.dumpInterference();
@@ -6524,7 +6607,7 @@ void GraphColor::pruneActiveSpillAddrLocs(G4_DstRegRegion *dstRegion,
                                           G4_Type exec_type) {
   if (dstRegion->getBase()->asRegVar()->isRegVarAddrSpillLoc()) {
     vISA_ASSERT(((exec_type == Type_UW || exec_type == Type_W) &&
-                 exec_size <= getNumAddrRegisters()) ||
+                 exec_size <= builder.getNumAddrRegisters()) ||
                     (exec_size == 1),
                 "Unexpected ADDR spill loc update format!");
     vISA_ASSERT(dstRegion->getRegAccess() == Direct,
@@ -6536,7 +6619,7 @@ void GraphColor::pruneActiveSpillAddrLocs(G4_DstRegRegion *dstRegion,
     unsigned endId = startId + exec_size * dstRegion->getHorzStride();
 
     for (unsigned i = 0, horzStride = dstRegion->getHorzStride();
-         i < getNumAddrRegisters(); i += horzStride) {
+         i < builder.getNumAddrRegisters(); i += horzStride) {
       if (spAddrRegSig[i] >= startId && spAddrRegSig[i] < endId) {
         spAddrRegSig[i] = 0;
       }
@@ -6547,7 +6630,7 @@ void GraphColor::pruneActiveSpillAddrLocs(G4_DstRegRegion *dstRegion,
                 "Unknown error in ADDR reg spill code cleanup!");
     unsigned startId = addrReg->getPhyRegOff();
     unsigned endId = startId + exec_size * dstRegion->getHorzStride();
-    vISA_ASSERT(endId <= getNumAddrRegisters(),
+    vISA_ASSERT(endId <= builder.getNumAddrRegisters(),
                 "Unknown error in ADDR reg spill code cleanup!");
 
     for (unsigned i = startId; i < endId; i += dstRegion->getHorzStride()) {
@@ -6569,7 +6652,7 @@ void GraphColor::updateActiveSpillAddrLocs(G4_DstRegRegion *tmpDstRegion,
               "Unknown error in ADDR reg spill code cleanup!");
   unsigned startAddrId = addrReg->getPhyRegOff();
   unsigned endAddrId = startAddrId + exec_size * tmpDstRegion->getHorzStride();
-  vISA_ASSERT(endAddrId <= getNumAddrRegisters(),
+  vISA_ASSERT(endAddrId <= builder.getNumAddrRegisters(),
               "Unknown error in ADDR reg spill code cleanup!");
 
   vISA_ASSERT(srcRegion->getBase()->asRegVar()->isRegVarAddrSpillLoc(),
@@ -6598,7 +6681,7 @@ bool GraphColor::redundantAddrFill(G4_DstRegRegion *tmpDstRegion,
               "Unknown error in ADDR reg spill code cleanup!");
   unsigned startAddrId = addrReg->getPhyRegOff();
   unsigned endAddrId = startAddrId + exec_size * tmpDstRegion->getHorzStride();
-  vISA_ASSERT(endAddrId <= getNumAddrRegisters(),
+  vISA_ASSERT(endAddrId <= builder.getNumAddrRegisters(),
               "Unknown error in ADDR reg spill code cleanup!");
 
   vISA_ASSERT(srcRegion->getBase()->asRegVar()->isRegVarAddrSpillLoc(),
@@ -6689,6 +6772,65 @@ G4_Imm *GlobalRA::createMsgDesc(unsigned owordSize, bool writeType,
 void GlobalRA::stackCallProlog() {
   G4_BB *entryBB = builder.kernel.fg.getEntryBB();
 
+  // Used for creating inst to initialize address for immediate offset usage.
+  auto AddrComputeInst = [this](G4_Declare *srcDcl) {
+    auto addSrc0 = builder.createSrc(srcDcl->getRegVar(), 0, 0,
+                                     builder.getRegionScalar(), Type_UD);
+    auto immSrc1 = builder.createImm(SPILL_FILL_IMMOFF_MAX, Type_UD);
+    auto addInst = builder.createBinOp(
+        G4_add, g4::SIMD1,
+        builder.createDstRegRegion(builder.kernel.fg.scratchRegDcl, 1), addSrc0,
+        immSrc1, InstOpt_WriteEnable, false);
+    return addInst;
+  };
+
+  // Initialize address for immediate offset usage for spill/fill messages
+  // except for frame descriptor save message.
+  // This is for common cases which uses %be_fp as address.
+  {
+    // Turn off immediate offset if frame size is 0 or exceeds threshhold
+    if ((kernel.fg.frameSizeInOWord == 0) ||
+        (kernel.fg.frameSizeInOWord * 16 > SPILL_FILL_IMMOFF_MAX * 2))
+      canUseLscImmediateOffsetSpillFill = false;
+
+    if (canUseLscImmediateOffsetSpillFill) {
+      // copy (%be_fp + 0x10000) to r126.0 for immediate offset usage in
+      // stackcall spill/fill
+      //     add(1) r126.0 %be_fp 0x10000
+      auto insertIt = std::find(entryBB->begin(), entryBB->end(),
+                                builder.kernel.getBEFPSetupInst());
+      vISA_ASSERT(insertIt != entryBB->end(), "Can't find BE_FP setup inst");
+      entryBB->insertBefore(++insertIt, AddrComputeInst(builder.getBEFP()));
+
+      // Each stack function has its own r126.0, so need resume r126.0 after
+      // function call as the value has been changed in the callee.
+      // See below example:
+      //     Foo()
+      //         mov r125.3 r125.2
+      //         add r126.0 r125.3 0x10000
+      //         add r125.2 r125.2 frameSizeFoo
+      //         spill [r126.0 offset1-0x10000]
+      //         Bar()
+      //             mov r125.3 r125.2
+      //             add r126.0 r125.3 0x10000
+      //             add r125.2 r125.2 frameSizeBar
+      //             spill [r126.0 offset2-0x10000]
+      //             ...
+      //         add r126.0 r125.3 0x10000
+      //         spill [r126.0 offset3-0x10000]
+      // After Bar() return, we should re-compute r126.0
+      for (auto bb : kernel.fg) {
+        if (bb->isEndWithFCall()) {
+          G4_BB *succ = bb->Succs.front();
+          insertIt =
+              std::find_if(succ->begin(), succ->end(),
+                           [](G4_INST *inst) { return inst->isLabel(); });
+          vISA_ASSERT(insertIt != succ->end(), "Can't find label");
+          succ->insertBefore(++insertIt, AddrComputeInst(builder.getBEFP()));
+        }
+      }
+    }
+  }
 
   // Emit frame descriptor
   if (kernel.fg.getIsStackCallFunc()) {
@@ -6725,6 +6867,16 @@ void GlobalRA::stackCallProlog() {
     }
     addEUFusionCallWAInst(store);
 
+    // Initialize address for immediate offset usage for frame descriptor store
+    // message. This is a special case as it uses %be_sp as address.
+    {
+      if (canUseLscImmediateOffsetSpillFill) {
+        // copy (%be_sp + 0x10000) to r126.0 for immediate offset usage
+        // for frame descriptor save instruction
+        //    add(1) r126.0<1>:ud  %be_sp<1;0,1>:ud  0x10000:ud
+        entryBB->insertBefore(iter, AddrComputeInst(builder.getBESP()));
+      }
+    }
     return;
   }
 
@@ -7468,7 +7620,7 @@ void GlobalRA::addCalleeStackSetupCode() {
 // Add A0 save/restore code for stack calls.
 //
 void GraphColor::addA0SaveRestoreCode() {
-  uint8_t numA0Elements = (uint8_t)getNumAddrRegisters();
+  uint8_t numA0Elements = (uint8_t)builder.getNumAddrRegisters();
 
   int count = 0;
   for (auto bb : builder.kernel.fg) {
@@ -7628,7 +7780,7 @@ unsigned ForbiddenRegs::getForbiddenVectorSize(G4_RegFileKind regKind) const {
   case G4_INPUT:
     return builder.kernel.getNumRegTotal();
   case G4_ADDRESS:
-    return getNumAddrRegisters();
+    return builder.getNumAddrRegisters();
   case G4_FLAG:
     return builder.getNumFlagRegisters();
   default:
@@ -9029,7 +9181,7 @@ void GlobalRA::assignRegForAliasDcl() {
                 actualoffset / CurrentRegVar->getDeclare()->getElemSize());
           }
         } else if (CurrentRegVar->getDeclare()->getRegFile() == G4_ADDRESS) {
-          vISA_ASSERT(tempoffset < getNumAddrRegisters() * 2,
+          vISA_ASSERT(tempoffset < builder.getNumAddrRegisters() * 2,
                       ERROR_REGALLOC); // Must hold tempoffset in one A0 reg
           CurrentRegVar->setPhyReg(
               AliasRegVar->getPhyReg(),
@@ -9231,6 +9383,521 @@ void GlobalRA::createVariablesForHybridRAWithSpill() {
                                                  0);
 }
 
+void GlobalRA::stackCallSaveRestore(bool hasStackCall) {
+  //
+  // If the graph has stack calls, then add the caller-save/callee-save pseudo
+  // declares and code. This currently must be done after flag/addr RA due to
+  // the assumption about the location of the pseudo save/restore instructions
+  //
+  if (hasStackCall) {
+    addCallerSavePseudoCode();
+
+    // Only GENX sub-graphs require callee-save code.
+
+    if (builder.getIsKernel() == false) {
+      addCalleeSavePseudoCode();
+      addStoreRestoreToReturn();
+    }
+
+    if (!kernel.getOption(vISA_PreserveR0InR0)) {
+      // bind builtinR0 to the reserved stack call ABI GRF so that caller and
+      // callee can agree on which GRF to use for r0
+      builder.getBuiltinR0()->getRegVar()->setPhyReg(
+          builder.phyregpool.getGreg(kernel.stackCall.getThreadHeaderGRF()), 0);
+    }
+  }
+}
+
+int GlobalRA::doGlobalLinearScanRA() {
+  copyMissingAlignment();
+  BankConflictPass bc(*this, false);
+  LivenessAnalysis liveAnalysis(*this, G4_GRF | G4_INPUT);
+  liveAnalysis.computeLiveness();
+
+  TIME_SCOPE(LINEARSCAN_RA);
+  LinearScanRA lra(bc, *this, liveAnalysis);
+  int ret = lra.doLinearScanRA();
+  if (ret == VISA_SUCCESS) {
+    expandSpillFillIntrinsics(nextSpillOffset);
+    assignRegForAliasDcl();
+    computePhyReg();
+    if (builder.getOption(vISA_verifyLinearScan)) {
+      resetGlobalRAStates();
+      markGraphBlockLocalVars();
+      LivenessAnalysis live(*this, G4_GRF | G4_INPUT, false, true);
+      live.computeLiveness();
+      GraphColor coloring(live, false, false);
+      coloring.createLiveRanges();
+      Interference intf(&live, *this);
+      intf.init();
+      intf.computeInterference();
+
+      if (kernel.getOption(vISA_DumpRAIntfGraph))
+        intf.dumpInterference();
+      intf.linearScanVerify();
+    }
+    return VISA_SUCCESS;
+  }
+  return ret;
+}
+
+void GlobalRA::incRABookKeeping() {
+  // Reset state of incremental RA here as we move from hybrid RA
+  // to global RA. Note that when moving from flag->address or from
+  // address->GRF RA, we don't need to explicitly reset state because
+  // incremental RA can deduce we're moving to RA for different
+  // variable class. But it cannot deduce so when moving from hybrid
+  // to global RA.
+  incRA.moveFromHybridToGlobalGRF();
+
+  // This part makes incremental RA a non-NFC change. The reason we need
+  // to do this is because variables that spill intrinsics use may end up
+  // getting extended in each RA iteration. Given that those variables
+  // are either r0 or scalars, we mark them as Output here so they're
+  // live-out throughout. To make this an NFC change, we can enable this
+  // block even when incremental RA is not enabled.
+  if (incRA.isEnabled()) {
+    builder.getBuiltinR0()->getRootDeclare()->setLiveOut();
+    builder.getSpillFillHeader();
+
+    bool initSS = builder.hasScratchSurface();
+    if (initSS) {
+      builder.initScratchSurfaceOffset();
+      builder.getOldA0Dot2Temp();
+    }
+  }
+}
+
+std::pair<bool, bool> GlobalRA::remat(bool fastCompile, bool rematDone,
+                                      LivenessAnalysis &liveAnalysis,
+                                      GraphColor &coloring, RPE &rpe) {
+  bool runRemat = kernel.getInt32KernelAttr(Attributes::ATTR_Target) == VISA_CM
+                      ? true
+                      : kernel.getSimdSize() < kernel.numEltPerGRF<Type_UB>();
+  // -noremat takes precedence over -forceremat
+  bool rematOn = !kernel.getOption(vISA_Debug) &&
+                 !kernel.getOption(vISA_NoRemat) &&
+                 !kernel.getOption(vISA_FastSpill) && !fastCompile &&
+                 (kernel.getOption(vISA_ForceRemat) || runRemat);
+
+  if (!rematDone && rematOn) {
+    RA_TRACE(std::cout << "\t--rematerialize\n");
+    Rematerialization remat(kernel, liveAnalysis, coloring, rpe, *this);
+    remat.run();
+
+    // Re-run GRA loop only if remat caused changes to IR
+    return std::make_pair(remat.getChangesMade(), true);
+  }
+  return std::make_pair(false, rematDone);
+}
+
+std::tuple<bool, bool, bool>
+GlobalRA ::alignedScalarSplit(bool fastCompile, bool alignedScalarSplitDone,
+                              GraphColor &coloring) {
+  bool isEarlyExit = false;
+  if (kernel.getOption(vISA_SplitGRFAlignedScalar) && !fastCompile &&
+      !kernel.getOption(vISA_FastSpill) && !alignedScalarSplitDone) {
+    SplitAlignedScalars split(*this, coloring);
+    split.run();
+
+    // Re-run GRA loop if changes were made to IR
+    bool rerunGRA = split.getChangesMade();
+    kernel.dumpToFile("after.Split_Aligned_Scalar." +
+                      std::to_string(getIterNo()));
+#ifndef DLL_MODE
+    if (stopAfter("Split_Aligned_Scalar")) {
+      isEarlyExit = true;
+    }
+#endif // DLL_MODE
+    return std::make_tuple(rerunGRA, true, isEarlyExit);
+  }
+  return std::make_tuple(false, alignedScalarSplitDone, false);
+}
+
+bool GlobalRA::globalSplit(VarSplit& splitPass, GraphColor& coloring) {
+  unsigned int sendAssociatedGRFSpillFillCount = 0;
+  // Calculate the spill caused by send to decide if global splitting is
+  // required or not
+  for (auto spilled : coloring.getSpilledLiveRanges()) {
+    auto spillDcl = spilled->getDcl();
+    if (spillDcl->getIsRefInSendDcl() && spillDcl->getNumRows() > 1) {
+      sendAssociatedGRFSpillFillCount += spilled->getRefCount();
+    }
+  }
+
+  if (getIterNo() ==
+          0 && // Only works when first iteration of Global RA failed.
+      !splitPass.didGlobalSplit && // Do only one time.
+      splitPass.canDoGlobalSplit(builder, kernel,
+                                 sendAssociatedGRFSpillFillCount)) {
+    RA_TRACE(std::cout << "\t--global send split\n");
+    splitPass.globalSplit(builder, kernel);
+    splitPass.didGlobalSplit = true;
+    // TODO: Since global split is rarely enabled, for now we skip
+    // incremental RA whenever it is enabled.
+    incRA.skipIncrementalRANextIter();
+    return true;
+  }
+
+  return false;
+}
+
+void GlobalRA::localSplit(bool fastCompile, VarSplit& splitPass) {
+  // Do variable splitting in each iteration
+  // Don't do when fast compile is required
+  if (builder.getOption(vISA_LocalDeclareSplitInGlobalRA) && !fastCompile) {
+    RA_TRACE(std::cout << "\t--split local send--\n");
+    for (auto bb : kernel.fg) {
+      splitPass.localSplit(builder, bb);
+    }
+  }
+}
+
+std::pair<bool, bool> GlobalRA::bankConflict() {
+  bool doBankConflictReduction = false, highInternalConflict = false;
+  if (builder.getOption(vISA_LocalBankConflictReduction) &&
+      builder.hasBankCollision()) {
+    bool reduceBCInRR = false;
+    bool reduceBCInTAandFF = false;
+    BankConflictPass bc(*this, true);
+
+    reduceBCInRR = bc.setupBankConflictsForKernel(
+        true, reduceBCInTAandFF, SECOND_HALF_BANK_START_GRF * 2,
+        highInternalConflict);
+    doBankConflictReduction = reduceBCInRR && reduceBCInTAandFF;
+  }
+  return std::make_pair(doBankConflictReduction, highInternalConflict);
+}
+
+bool GlobalRA::setupFailSafeIfNeeded(bool fastCompile, bool hasStackCall,
+                                     unsigned int maxRAIterations,
+                                     unsigned int failSafeRAIteration) {
+  bool reserveSpillReg = false;
+  bool allowAddrTaken = builder.getOption(vISA_FastSpill) || fastCompile ||
+                        !kernel.getHasAddrTaken();
+  if (builder.getOption(vISA_FailSafeRA) &&
+      kernel.getInt32KernelAttr(Attributes::ATTR_Target) == VISA_3D &&
+      kernel.getNumRegTotal() > 32 &&
+      !hasStackCall &&
+      ((getIterNo() == maxRAIterations - 1) ||
+       (allowAddrTaken && getIterNo() == failSafeRAIteration))) {
+    RA_TRACE(std::cout << "\t--enable failSafe RA\n");
+    reserveSpillReg = true;
+
+    if (incRA.isEnabled()) {
+      incRA.skipIncrementalRANextIter();
+    }
+
+    if (builder.hasScratchSurface() && !hasStackCall) {
+      // Since this is fail safe RA iteration, we ensure the 2 special
+      // variables are created before coloring so spill code can use
+      // them, if needed.
+      auto a0Dot2Temp = kernel.fg.builder->getOldA0Dot2Temp();
+      addVarToRA(a0Dot2Temp);
+      if (builder.supportsLSC()) {
+        auto spillFillHdr = kernel.fg.builder->getSpillFillHeader();
+        addVarToRA(spillFillHdr);
+      }
+    }
+  }
+  return reserveSpillReg;
+}
+
+void GlobalRA::undefinedUses(bool rematDone, LivenessAnalysis& liveAnalysis) {
+  if (builder.getOption(vISA_DumpUndefUsesFromLiveness) && getIterNo() == 0 &&
+      !rematDone) {
+    liveAnalysis.reportUndefinedUses();
+  }
+}
+
+void GlobalRA::writeVerboseStatsNumVars(LivenessAnalysis &liveAnalysis,
+                                        FINALIZER_INFO *jitInfo) {
+  if (builder.getOption(vISA_DumpPerfStatsVerbose)) {
+    jitInfo->statsVerbose.varNum = liveAnalysis.getNumSelectedVar();
+    jitInfo->statsVerbose.globalVarNum = liveAnalysis.getNumSelectedGlobalVar();
+  }
+}
+
+void GlobalRA::writeVerboseRPEStats(RPE &rpe) {
+  if (builder.getOption(vISA_DumpPerfStatsVerbose) &&
+      builder.getJitInfo()->statsVerbose.RAIterNum == 1) {
+    builder.getJitInfo()->statsVerbose.maxRP = rpe.getMaxRP();
+  }
+  if (builder.getOption(vISA_DumpPerfStats)) {
+    builder.getJitInfo()->stats.maxGRFPressure = rpe.getMaxRP();
+  }
+}
+
+
+void GlobalRA::splitOnSpill(bool fastCompile, GraphColor &coloring,
+                            LivenessAnalysis &liveAnalysis) {
+  if (!kernel.getOption(vISA_Debug) && getIterNo() == 0 && !fastCompile &&
+      kernel.getOption(vISA_DoSplitOnSpill)) {
+    RA_TRACE(std::cout << "\t--var split around loop\n");
+    LoopVarSplit loopSplit(kernel, &coloring, &liveAnalysis);
+    kernel.fg.getLoops().computePreheaders();
+    loopSplit.run();
+  }
+}
+
+bool GlobalRA::convertToFailSafe(bool reserveSpillReg, GraphColor &coloring,
+                                 LivenessAnalysis &liveAnalysis,
+                                 unsigned int nextSpillOffset) {
+  // Very few spills in this iter. Check if we can convert this to fail
+  // safe iter. By converting this iter to fail safe we can save (at
+  // least) 1 additional iter to allocate spilled temps. But converting to
+  // fail safe needs extra checks because no reserved GRF may exist at
+  // this point. So push/pop needs to succeed without additional GRF
+  // potentially.
+  if (!kernel.getOption(vISA_Debug) && getIterNo() >= 1 &&
+      kernel.getOption(vISA_NewFailSafeRA) && !reserveSpillReg &&
+      coloring.getSpilledLiveRanges().size() <= BoundedRA::MaxSpillNumVars &&
+      liveAnalysis.getNumSelectedVar() > BoundedRA::LargeProgramSize) {
+    // Stack call always has free GRF so it is safe to convert this iter
+    // to fail safe
+    if (builder.usesStack() ||
+        // If LSC has to be used for spill/fill then we need to ensure
+        // spillHeader is created
+        (useLscForNonStackCallSpillFill && builder.hasValidSpillFillHeader()) ||
+        // or if immediate can be folded in to LSC
+        canUseLscImmediateOffsetSpillFill ||
+       // If scratch is to be used then max spill offset must be within
+       // addressable range and r0 must be available as reserved. If r0
+       // is not reserved, we cannot conver current iteration to fail
+       // safe because r0 may get assigned to other virtual variables.
+        ((kernel.getOption(vISA_PreserveR0InR0) ||
+          builder.getBuiltinR0()->isOutput()) &&
+         (nextSpillOffset + BoundedRA::getNumPhyVarSlots(kernel)) <
+             SCRATCH_MSG_LIMIT)) {
+      // Few ranges are spilled but this was not executed as fail
+      // safe iteration. However, we've the capability of doing
+      // push/pop with new fail safe RA implementation. So for very
+      // few spills, we insert push/pop to free up some GRFs rather
+      // than executing a new RA iteration. When doing so, we mark
+      // this RA iteration as fail safe.
+      coloring.markFailSafeIter(true);
+      // No reserved GRFs
+      setNumReservedGRFsFailSafe(0);
+      RA_TRACE(std::cout << "\t--enabling new fail safe RA\n");
+      return true;
+    }
+  }
+  return reserveSpillReg;
+}
+
+std::pair<bool, unsigned int>
+GlobalRA::abortOnSpill(unsigned int GRFSpillFillCount,
+                            GraphColor &coloring) {
+  // Calculate the spill caused by send to decide if global splitting is
+  // required or not
+  for (auto spilled : coloring.getSpilledLiveRanges()) {
+    GRFSpillFillCount += spilled->getRefCount();
+  }
+
+  // vISA_AbortOnSpillThreshold is defined as [0..200]
+  // where 0 means abort on any spill and 200 means never abort
+  auto underSpillThreshold = [this](int numSpill, int asmCount) {
+    int threshold = std::min(
+        builder.getOptions()->getuInt32Option(vISA_AbortOnSpillThreshold),
+        200u);
+    return (numSpill * 200) < (threshold * asmCount);
+  };
+
+  unsigned int instNum = instCount();
+  bool isUnderThreshold = underSpillThreshold(GRFSpillFillCount, instNum);
+  if (isUnderThreshold) {
+    if (auto jitInfo = builder.getJitInfo()) {
+      jitInfo->avoidRetry = true;
+    }
+  }
+
+  if (builder.getOption(vISA_AbortOnSpill) && !isUnderThreshold) {
+    // update jit metadata information
+    if (auto jitInfo = builder.getJitInfo()) {
+      jitInfo->stats.spillMemUsed = 0;
+      jitInfo->stats.numAsmCountUnweighted = instNum;
+      jitInfo->stats.numGRFSpillFillWeighted = GRFSpillFillCount;
+    }
+
+    return std::make_pair(true, GRFSpillFillCount);
+  }
+  return std::make_pair(false, GRFSpillFillCount);
+}
+
+unsigned GlobalRA::computeSpillSize(std::list<LSLiveRange *> &spilledLRs) {
+  unsigned spillSize = 0;
+  for (auto lr : spilledLRs) {
+    spillSize += lr->getTopDcl()->getByteSize();
+  }
+  return spillSize;
+}
+
+unsigned GlobalRA::computeSpillSize(const LIVERANGE_LIST &spilledLRs) {
+  unsigned spillSize = 0;
+  for (auto lr : spilledLRs) {
+    spillSize += lr->getDcl()->getByteSize();
+  }
+  return spillSize;
+}
+
+bool GlobalRA::spillSpaceCompression(int spillSize,
+                                     const int globalScratchOffset) {
+  // factor 1.2 is used to count in the space used for the following
+  // iterations. Generally, the most spill will happen in first iteration.
+  if ((spillSize * 1.2) <
+      ((int)SCRATCH_COMPRESS_THRESHOLD - globalScratchOffset)) {
+    return false;
+  }
+  return true;
+}
+
+void GlobalRA::verifyNoInfCostSpill(GraphColor& coloring, bool reserveSpillReg)
+{
+  vISA_ASSERT(std::all_of(coloring.getSpilledLiveRanges().begin(),
+                          coloring.getSpilledLiveRanges().end(),
+                          [&](const LiveRange *spilledLR) {
+                            // EOT spills even of infinite cost are
+                            // specially handled in spill insertion when
+                            // using old fail safe RA. So don't assert for
+                            // such spills.
+                            if (isEOTSpillWithFailSafeRA(builder, spilledLR,
+                                                         reserveSpillReg) &&
+                                !builder.getOption(vISA_NewFailSafeRA))
+                              return true;
+                            return spilledLR->getSpillCost() != MAXSPILLCOST;
+                          }),
+              "Spilled inf spill cost range");
+}
+
+void GlobalRA::setupA0Dot2OnSpill(bool hasStackCall,
+                                  unsigned int nextSpillOffset,
+                                  int globalScratchOffset) {
+  if (builder.hasScratchSurface() && !hasStackCall &&
+      (nextSpillOffset + globalScratchOffset) > SCRATCH_MSG_LIMIT) {
+    // create temp variable to store old a0.2 - this is marked as live-in
+    // and live-out. because the variable is emitted only post RA to
+    // preserve old value of a0.2.
+    kernel.fg.builder->getOldA0Dot2Temp();
+  } else if (useLscForNonStackCallSpillFill || useLscForScatterSpill) {
+    // Xe2+ LSC-based spill/fill needs the same as above
+    {
+      kernel.fg.builder->getOldA0Dot2Temp();
+    }
+  }
+}
+
+bool GlobalRA::spillCleanup(bool fastCompile, bool useScratchMsgForSpill,
+                            bool hasStackCall, bool reserveSpillReg, RPE &rpe,
+                            GraphColor &coloring,
+                            LivenessAnalysis &liveAnalysis,
+                            SpillManagerGRF &spillGRF) {
+  bool disableSpillCoalecse = builder.getOption(vISA_DisableSpillCoalescing) ||
+                              builder.getOption(vISA_FastSpill) ||
+                              fastCompile || builder.getOption(vISA_Debug) ||
+                              // spill cleanup is not support when we use oword
+                              // msg for spill/fill for non-stack calls.
+                              (!useScratchMsgForSpill && !hasStackCall);
+
+  if (!reserveSpillReg && !disableSpillCoalecse && builder.useSends()) {
+    RA_TRACE(std::cout << "\t--spill/fill cleanup\n");
+    CoalesceSpillFills c(kernel, liveAnalysis, coloring, spillGRF, getIterNo(),
+                         rpe, *this);
+    c.run();
+#ifndef DLL_MODE
+    if (stopAfter("spillCleanup")) {
+      return true;
+    }
+#endif // DLL_MODE
+  }
+  return false;
+}
+
+std::tuple<bool, bool, bool, unsigned int, unsigned int>
+GlobalRA::insertSpillCode(bool enableSpillSpaceCompression,
+                          GraphColor &coloring, LivenessAnalysis &liveAnalysis,
+                          RPE &rpe, unsigned int scratchOffset,
+                          bool fastCompile, bool hasStackCall,
+                          int globalScratchOffset, unsigned int nextSpillOffset,
+                          bool reserveSpillReg, unsigned int spillRegSize,
+                          unsigned int indrSpillRegSize,
+                          bool useScratchMsgForSpill) {
+  if (getIterNo() == 0 && enableSpillSpaceCompression &&
+      kernel.getInt32KernelAttr(Attributes::ATTR_Target) == VISA_3D &&
+      !hasStackCall) {
+    enableSpillSpaceCompression = spillSpaceCompression(
+        computeSpillSize(coloring.getSpilledLiveRanges()), globalScratchOffset);
+  }
+
+  startTimer(TimerID::SPILL);
+  SpillManagerGRF spillGRF(*this, nextSpillOffset, &liveAnalysis,
+                           coloring.getIntf(), &coloring.getSpilledLiveRanges(),
+                           reserveSpillReg, spillRegSize, indrSpillRegSize,
+                           enableSpillSpaceCompression, useScratchMsgForSpill);
+
+  if (kernel.getOption(vISA_SpillAnalysis)) {
+    spillAnalysis->Do(&liveAnalysis, &coloring, &spillGRF);
+  }
+
+  verifyNoInfCostSpill(coloring, reserveSpillReg);
+
+  bool success = spillGRF.insertSpillFillCode(&kernel, pointsToAnalysis);
+  nextSpillOffset = spillGRF.getNextOffset();
+
+  if (kernel.getOption(vISA_VerifyRA)) {
+    // For least false positives, turn off RMW opt and spill cleanup
+    verifySpillFill();
+  }
+
+  setupA0Dot2OnSpill(hasStackCall, nextSpillOffset, globalScratchOffset);
+
+  RA_TRACE({
+    auto &&spills = coloring.getSpilledLiveRanges();
+    std::cout << "\t--# variables spilled: " << spills.size() << "\n";
+    if (spills.size() < 100) {
+      std::cout << "\t--spilled variables: ";
+      for (auto &&lr : spills) {
+        std::cout << lr->getDcl()->getName() << "  ";
+      }
+      std::cout << "\n";
+    }
+    std::cout << "\t--current spill size: " << nextSpillOffset << "\n";
+  });
+
+  if (!success) {
+    return std::make_tuple(false, enableSpillSpaceCompression, false,
+                           scratchOffset, nextSpillOffset);
+  }
+
+  kernel.dumpToFile("after.Spill_GRF." + std::to_string(getIterNo() + 1));
+#ifndef DLL_MODE
+  if (stopAfter("Spill_GRF")) {
+    return std::make_tuple(true, enableSpillSpaceCompression, true,
+                           scratchOffset, nextSpillOffset);
+  }
+#endif // DLL_MODE
+
+  scratchOffset = std::max(scratchOffset, spillGRF.getNextScratchOffset());
+
+  bool isEarlyExit =
+      spillCleanup(fastCompile, useScratchMsgForSpill, hasStackCall,
+                   reserveSpillReg, rpe, coloring, liveAnalysis, spillGRF);
+
+  return std::make_tuple(true, enableSpillSpaceCompression, isEarlyExit,
+                         scratchOffset, nextSpillOffset);
+}
+
+bool GlobalRA::rerunGRAIter(bool rerunGRA)
+{
+  if (getIterNo() == 0 && (rerunGRA || kernel.getOption(vISA_forceBCR))) {
+    if (kernel.getOption(vISA_forceBCR)) {
+      // FIXME: We shouldn't modify options. Use local bool flag instead.
+      kernel.getOptions()->setOption(vISA_forceBCR, false);
+    }
+    return true;
+  }
+  return false;
+}
+
 //
 // graph coloring entry point.  returns nonzero if RA fails
 //
@@ -9278,74 +9945,43 @@ int GlobalRA::coloringRegAlloc() {
 
     flagRegAlloc();
   }
-       // LSC messages are used when:
-       // a. Stack call is used on PVC+,
-       // b. Spill size exceeds what can be represented using hword msg on PVC+
+  // LSC messages are used when:
+  // a. Stack call is used on PVC+,
+  // b. Spill size exceeds what can be represented using hword msg on PVC+
+  // c. Xe2+ requires LSC stack (can force on DG2+ via -lscNonStackSpill)
+  if (builder.supportsLSC()) {
 
-  //
-  // If the graph has stack calls, then add the caller-save/callee-save pseudo
-  // declares and code. This currently must be done after flag/addr RA due to
-  // the assumption about the location of the pseudo save/restore instructions
-  //
-  if (hasStackCall) {
-    addCallerSavePseudoCode();
-
-    // Only GENX sub-graphs require callee-save code.
-
-    if (builder.getIsKernel() == false) {
-      addCalleeSavePseudoCode();
-      addStoreRestoreToReturn();
-    }
-
-    if (!kernel.getOption(vISA_PreserveR0InR0)) {
-      // bind builtinR0 to the reserved stack call ABI GRF so that caller and
-      // callee can agree on which GRF to use for r0
-      builder.getBuiltinR0()->getRegVar()->setPhyReg(
-          builder.phyregpool.getGreg(kernel.stackCall.getThreadHeaderGRF()),
-          0);
-    }
+    const auto scratchAddrType = VISA_LSC_IMMOFF_ADDR_TYPE_SS;
+    const uint32_t immOffOpts =
+        builder.getuint32Option(vISA_lscEnableImmOffsFor);
+    canUseLscImmediateOffsetSpillFill =
+        // HW supports it
+        builder.getPlatform() >= Xe2 &&
+        // the spill/fill is enabled in options
+        (immOffOpts & (1 << VISA_LSC_IMMOFF_SPILL_FILL)) != 0 &&
+        // address type is also enabled in options
+        (immOffOpts & (1 << scratchAddrType)) != 0;
   }
+
+  stackCallSaveRestore(hasStackCall);
 
   if (kernel.getOption(vISA_SpillAnalysis)) {
     spillAnalysis = std::make_unique<SpillAnalysis>();
   }
 
+  if (kernel.fg.getIsStackCallFunc()) {
+    // Allocate space to store Frame Descriptor
+    nextSpillOffset += 32;
+    scratchOffset += 32;
+  }
+
   // Global linear scan RA
   if (builder.getOption(vISA_LinearScan) &&
       builder.kernel.getInt32KernelAttr(Attributes::ATTR_Target) == VISA_3D) {
-    copyMissingAlignment();
-    BankConflictPass bc(*this, false);
-    LivenessAnalysis liveAnalysis(*this, G4_GRF | G4_INPUT);
-    liveAnalysis.computeLiveness();
-
-    TIME_SCOPE(LINEARSCAN_RA);
-    LinearScanRA lra(bc, *this, liveAnalysis);
-    int success = lra.doLinearScanRA();
-    if (success == VISA_SUCCESS) {
-      // TODO: Get correct spillSize from LinearScanRA
-      unsigned spillSize = 0;
-      expandSpillFillIntrinsics(spillSize);
-      assignRegForAliasDcl();
-      computePhyReg();
-      if (builder.getOption(vISA_verifyLinearScan)) {
-        resetGlobalRAStates();
-        markGraphBlockLocalVars();
-        LivenessAnalysis live(*this, G4_GRF | G4_INPUT, false, true);
-        live.computeLiveness();
-        GraphColor coloring(live, false, false);
-        coloring.createLiveRanges();
-        Interference intf(&live, *this);
-        intf.init();
-        intf.computeInterference();
-
-        if (kernel.getOption(vISA_DumpRAIntfGraph))
-          intf.dumpInterference();
-        intf.linearScanVerify();
-      }
-      return VISA_SUCCESS;
-    }
-
-    if (success == VISA_SPILL) {
+    int success = doGlobalLinearScanRA();
+    if (success == VISA_SUCCESS)
+      return success;
+    else if (success == VISA_SPILL) {
       return VISA_SPILL;
     }
   } else if (useLocalRA && !hasStackCall) {
@@ -9375,17 +10011,7 @@ int GlobalRA::coloringRegAlloc() {
   bool enableSpillSpaceCompression =
       builder.getOption(vISA_SpillSpaceCompression);
 
-  uint32_t nextSpillOffset = 0;
-  uint32_t scratchOffset = 0;
-
-  if (kernel.fg.getIsStackCallFunc()) {
-    // Allocate space to store Frame Descriptor
-    nextSpillOffset += 32;
-    scratchOffset += 32;
-  }
-
   uint32_t GRFSpillFillCount = 0;
-  uint32_t sendAssociatedGRFSpillFillCount = 0;
   unsigned fastCompileIter = 1;
   bool fastCompile =
     (useFastRA || useHybridRAwithSpill) &&
@@ -9415,32 +10041,7 @@ int GlobalRA::coloringRegAlloc() {
   DynPerfModel perfModel(kernel);
   FINALIZER_INFO *jitInfo = builder.getJitInfo();
 
-  // Reset state of incremental RA here as we move from hybrid RA
-  // to global RA. Note that when moving from flag->address or from
-  // address->GRF RA, we don't need to explicitly reset state because
-  // incremental RA can deduce we're moving to RA for different
-  // variable class. But it cannot deduce so when moving from hybrid
-  // to global RA.
-  incRA.moveFromHybridToGlobalGRF();
-
-  // This part makes incremental RA a non-NFC change. The reason we need
-  // to do this is because variables that spill intrinsics use may end up
-  // getting extended in each RA iteration. Given that those variables
-  // are either r0 or scalars, we mark them as Output here so they're
-  // live-out throughout. To make this an NFC change, we can enable this
-  // block even when incremental RA is not enabled.
-  if (incRA.isEnabled()) {
-    builder.getBuiltinR0()->getRootDeclare()->setLiveOut();
-    builder.getSpillFillHeader();
-    bool flag = true;
-    if (flag) {
-      if (builder.hasScratchSurface()) {
-        builder.initScratchSurfaceOffset();
-        builder.getOldA0Dot2Temp();
-      }
-    }
-  }
-
+  incRABookKeeping();
   while (iterationNo < maxRAIterations) {
     jitInfo->statsVerbose.RAIterNum++;
     if (builder.getOption(vISA_DynPerfModel)) {
@@ -9450,18 +10051,15 @@ int GlobalRA::coloringRegAlloc() {
                        << kernel.getName() << "\n");
     setIterNo(iterationNo);
 
-    if (!useHybridRAwithSpill) {
-      resetGlobalRAStates();
-    }
-
     if (builder.getOption(vISA_clearScratchWritesBeforeEOT) &&
         (globalScratchOffset + nextSpillOffset) > 0) {
       // we need to set r0 be live out for this WA
       builder.getBuiltinR0()->setLiveOut();
     }
 
-    // Identify the local variables to speedup following analysis
     if (!useHybridRAwithSpill) {
+      resetGlobalRAStates();
+      // Identify the local variables to speedup following analysis
       markGraphBlockLocalVars();
     }
 
@@ -9469,57 +10067,12 @@ int GlobalRA::coloringRegAlloc() {
       spillAnalysis->Clear();
     }
 
-    // Do variable splitting in each iteration
-    // Don't do when fast compile is required
-    if (builder.getOption(vISA_LocalDeclareSplitInGlobalRA) && !fastCompile) {
-      RA_TRACE(std::cout << "\t--split local send--\n");
-      for (auto bb : kernel.fg) {
-        splitPass.localSplit(builder, bb);
-      }
-    }
+    localSplit(fastCompile, splitPass);
 
-    bool doBankConflictReduction = false;
-    bool highInternalConflict =
-        false; // this is set by setupBankConflictsForKernel
+    const auto [doBankConflictReduction, highInternalConflict] = bankConflict();
 
-    if (builder.getOption(vISA_LocalBankConflictReduction) &&
-        builder.hasBankCollision()) {
-      bool reduceBCInRR = false;
-      bool reduceBCInTAandFF = false;
-      BankConflictPass bc(*this, true);
-
-      reduceBCInRR = bc.setupBankConflictsForKernel(
-          true, reduceBCInTAandFF, SECOND_HALF_BANK_START_GRF * 2,
-          highInternalConflict);
-      doBankConflictReduction = reduceBCInRR && reduceBCInTAandFF;
-    }
-
-    bool allowAddrTaken = builder.getOption(vISA_FastSpill) || fastCompile ||
-                          !kernel.getHasAddrTaken();
-    if (builder.getOption(vISA_FailSafeRA) &&
-        kernel.getInt32KernelAttr(Attributes::ATTR_Target) == VISA_3D &&
-        !hasStackCall &&
-        ((iterationNo == maxRAIterations - 1) ||
-         (allowAddrTaken && iterationNo == failSafeRAIteration))) {
-      RA_TRACE(std::cout << "\t--enable failSafe RA\n");
-      reserveSpillReg = true;
-
-      if (incRA.isEnabled()) {
-        incRA.skipIncrementalRANextIter();
-      }
-
-      if (builder.hasScratchSurface() && !hasStackCall) {
-        // Since this is fail safe RA iteration, we ensure the 2 special
-        // variables are created before coloring so spill code can use
-        // them, if needed.
-        auto a0Dot2Temp = kernel.fg.builder->getOldA0Dot2Temp();
-        addVarToRA(a0Dot2Temp);
-        if (builder.supportsLSC()) {
-          auto spillFillHdr = kernel.fg.builder->getSpillFillHeader();
-          addVarToRA(spillFillHdr);
-        }
-      }
-    }
+    reserveSpillReg = setupFailSafeIfNeeded(
+        fastCompile, hasStackCall, maxRAIterations, failSafeRAIteration);
 
     LivenessAnalysis liveAnalysis(*this, G4_GRF | G4_INPUT);
     liveAnalysis.computeLiveness();
@@ -9533,399 +10086,161 @@ int GlobalRA::coloringRegAlloc() {
       liveAnalysis.dump();
     }
     if (jitInfo->statsVerbose.RAIterNum == 1) {
-      if (builder.getOption(vISA_DumpPerfStatsVerbose)) {
-        jitInfo->statsVerbose.varNum = liveAnalysis.getNumSelectedVar();
-        jitInfo->statsVerbose.globalVarNum =
-            liveAnalysis.getNumSelectedGlobalVar();
-      }
+      writeVerboseStatsNumVars(liveAnalysis, jitInfo);
       RA_TRACE(std::cout << "\t--# global variable: "
                          << jitInfo->statsVerbose.globalVarNum << "\n");
     }
 #ifdef DEBUG_VERBOSE_ON
     emitFGWithLiveness(liveAnalysis);
 #endif
-    //
     // if no reg var needs to reg allocated, then skip reg allocation
-    //
-    if (liveAnalysis.getNumSelectedVar() > 0) {
-      if (builder.getOption(vISA_DumpUndefUsesFromLiveness) &&
-          iterationNo == 0 && !rematDone) {
-        liveAnalysis.reportUndefinedUses();
-      }
-      // force spill should be done only for the 1st iteration
-      bool forceSpill =
-          iterationNo > 0 ? false : builder.getOption(vISA_ForceSpills);
-      RPE rpe(*this, &liveAnalysis);
-      if (!fastCompile) {
-        rpe.run();
-        if (builder.getOption(vISA_DumpPerfStatsVerbose) &&
-            builder.getJitInfo()->statsVerbose.RAIterNum == 1) {
-          builder.getJitInfo()->statsVerbose.maxRP = rpe.getMaxRP();
-        }
-        if (builder.getOption(vISA_DumpPerfStats)) {
-          builder.getJitInfo()->stats.maxGRFPressure = rpe.getMaxRP();
-        }
-      }
-      GraphColor coloring(liveAnalysis, false, forceSpill);
+    if (liveAnalysis.getNumSelectedVar() == 0)
+      break;
 
-      if (builder.getOption(vISA_dumpRPE) && iterationNo == 0 && !rematDone) {
-        // dump pressure the first time we enter global RA
-        coloring.dumpRegisterPressure();
-      }
+    undefinedUses(rematDone, liveAnalysis);
 
-      // Get the size of register which are reserved for spill
-      unsigned spillRegSize = 0;
-      unsigned indrSpillRegSize = 0;
+    // force spill should be done only for the 1st iteration
+    bool forceSpill =
+        iterationNo > 0 ? false : builder.getOption(vISA_ForceSpills);
+    RPE rpe(*this, &liveAnalysis);
+    if (!fastCompile) {
+      rpe.run();
+      writeVerboseRPEStats(rpe);
+    }
+    GraphColor coloring(liveAnalysis, false, forceSpill);
 
-      if (reserveSpillReg) {
-        std::pair <unsigned, unsigned> p = reserveGRFSpillReg(coloring);
-        spillRegSize = p.first;
-        indrSpillRegSize = p.second;
-      }
-      generateForbiddenTemplates(spillRegSize + indrSpillRegSize);
-      bool isColoringGood = coloring.regAlloc(
-          doBankConflictReduction, highInternalConflict, &rpe);
-      if (!isColoringGood) {
+    if (builder.getOption(vISA_dumpRPE) && iterationNo == 0 && !rematDone) {
+      // dump pressure the first time we enter global RA
+      coloring.dumpRegisterPressure();
+    }
 
-        bool runRemat =
-            kernel.getInt32KernelAttr(Attributes::ATTR_Target) == VISA_CM
-                ? true
-                : kernel.getSimdSize() < kernel.numEltPerGRF<Type_UB>();
-        // -noremat takes precedence over -forceremat
-        bool rematOn = !kernel.getOption(vISA_Debug) &&
-                       !kernel.getOption(vISA_NoRemat) &&
-                       !kernel.getOption(vISA_FastSpill) && !fastCompile &&
-                       (kernel.getOption(vISA_ForceRemat) || runRemat);
-        bool rerunGRA = false;
-        bool globalSplitChange = false;
+    // Get the size of register which are reserved for spill
+    unsigned spillRegSize = 0;
+    unsigned indrSpillRegSize = 0;
 
-        if (!rematDone && rematOn) {
-          RA_TRACE(std::cout << "\t--rematerialize\n");
-          Rematerialization remat(kernel, liveAnalysis, coloring, rpe, *this);
-          remat.run();
-          rematDone = true;
+    if (reserveSpillReg) {
+      std::tie(spillRegSize, indrSpillRegSize) = reserveGRFSpillReg(coloring);
+    }
+    generateForbiddenTemplates(spillRegSize + indrSpillRegSize);
+    bool isColoringGood =
+        coloring.regAlloc(doBankConflictReduction, highInternalConflict, &rpe);
+    if (!isColoringGood) {
 
-          // Re-run GRA loop only if remat caused changes to IR
-          rerunGRA |= remat.getChangesMade();
-        }
-
-        if (kernel.getOption(vISA_SplitGRFAlignedScalar) && !fastCompile &&
-            !kernel.getOption(vISA_FastSpill) && !alignedScalarSplitDone) {
-          SplitAlignedScalars split(*this, coloring);
-          split.run();
-          alignedScalarSplitDone = true;
-
-          // Re-run GRA loop if changes were made to IR
-          rerunGRA |= split.getChangesMade();
-          kernel.dumpToFile("after.Split_Aligned_Scalar." + std::to_string(iterationNo));
+      bool rerunGRA1 = false, rerunGRA2 = false, rerunGRA3 = false,
+           isEarlyExit = false, abort = false, success = false;
+      std::tie(rerunGRA1, rematDone) = remat(fastCompile, rematDone, liveAnalysis, coloring, rpe);
+      std::tie(rerunGRA2, alignedScalarSplitDone, isEarlyExit) =
+          alignedScalarSplit(fastCompile, alignedScalarSplitDone, coloring);
 #ifndef DLL_MODE
-          if (stopAfter("Split_Aligned_Scalar")) {
-            return VISA_EARLY_EXIT;
-          }
+      if (isEarlyExit) {
+        return VISA_EARLY_EXIT;
+      }
 #endif // DLL_MODE
+
+      rerunGRA3 = globalSplit(splitPass, coloring);
+
+      if (rerunGRAIter(rerunGRA1 || rerunGRA2 || rerunGRA3))
+        continue;
+
+      splitOnSpill(fastCompile, coloring, liveAnalysis);
+
+      reserveSpillReg = convertToFailSafe(reserveSpillReg, coloring, liveAnalysis,
+                        nextSpillOffset);
+
+      if (iterationNo == 0) {
+        // Dump out interference graph information of spill candidates
+        VISA_DEBUG_VERBOSE(reportSpillInfo(liveAnalysis, coloring));
+      }
+
+      std::tie(abort, GRFSpillFillCount) =
+          abortOnSpill(GRFSpillFillCount, coloring);
+      if (abort) {
+        // Early exit when -abortonspill is passed, instead of
+        // spending time inserting spill code and then aborting.
+        stopTimer(TimerID::GRF_GLOBAL_RA);
+        return VISA_SPILL;
+      }
+
+      std::tie(success, enableSpillSpaceCompression, isEarlyExit, scratchOffset,
+               nextSpillOffset) =
+          insertSpillCode(enableSpillSpaceCompression, coloring, liveAnalysis,
+                          rpe, scratchOffset, fastCompile, hasStackCall,
+                          globalScratchOffset, nextSpillOffset, reserveSpillReg,
+                          spillRegSize, indrSpillRegSize,
+                          useScratchMsgForSpill);
+      if (!success) {
+        iterationNo = maxRAIterations;
+        break;
+      }
+#ifndef DLL_MODE
+      if (isEarlyExit)
+        return VISA_EARLY_EXIT;
+#endif // DLL_MODE
+
+      ++iterationNo;
+
+      if (iterationNo == builder.getuint32Option(vISA_FailSafeRALimit)) {
+        if (coloring.getSpilledLiveRanges().size() < 2) {
+          // give regular RA one more try as we are close to success
+          failSafeRAIteration++;
         }
+      }
+      stopTimer(TimerID::SPILL);
+    }
+    // RA successfully allocates regs
+    if (isColoringGood == true || reserveSpillReg) {
+      coloring.confirmRegisterAssignments();
 
-        // Calculate the spill caused by send to decide if global splitting is
-        // required or not
-        for (auto spilled : coloring.getSpilledLiveRanges()) {
-          auto spillDcl = spilled->getDcl();
-          if (spillDcl->getIsRefInSendDcl() && spillDcl->getNumRows() > 1) {
-            sendAssociatedGRFSpillFillCount += spilled->getRefCount();
-          }
-        }
+      if (hasStackCall) {
+        // spill/fill intrinsics expect offset in HWord, so round up to 64
+        // byte but maintain it in OWord unit ToDo: we really need to change
+        // everything to byte for everyone's sanity..
+        unsigned localSpillAreaOwordSize = ROUND(scratchOffset, 64) / 16;
+        coloring.getSaveRestoreRegister();
+        addSaveRestoreCode(localSpillAreaOwordSize);
+      }
 
-        int instNum = 0;
-        for (auto bb : kernel.fg) {
-          instNum += (int)bb->size();
-        }
+      if (kernel.getOption(vISA_DumpRegChart)) {
+        assignRegForAliasDcl();
+        computePhyReg();
+        // invoke before expanding spill/fill since
+        // it modifies IR
+        regChart->dumpRegChart(std::cerr, {}, 0);
+      }
 
-        if (iterationNo ==
-                0 && // Only works when first iteration of Global RA failed.
-            !splitPass.didGlobalSplit && // Do only one time.
-            splitPass.canDoGlobalSplit(builder, kernel,
-                                       sendAssociatedGRFSpillFillCount)) {
-          RA_TRACE(std::cout << "\t--global send split\n");
-          splitPass.globalSplit(builder, kernel);
-          splitPass.didGlobalSplit = true;
-          globalSplitChange = true;
-          // TODO: Since global split is rarely enabled, for now we skip
-          // incremental RA whenever it is enabled.
-          incRA.skipIncrementalRANextIter();
-        }
+      if (builder.getOption(vISA_DynPerfModel)) {
+        perfModel.run();
+      }
+      expandSpillFillIntrinsics(nextSpillOffset);
 
-        if (iterationNo == 0 && (rerunGRA || globalSplitChange ||
-                                 kernel.getOption(vISA_forceBCR))) {
-          if (kernel.getOption(vISA_forceBCR)) {
-            kernel.getOptions()->setOption(vISA_forceBCR, false);
-          }
+      VISA_DEBUG_VERBOSE(detectUndefinedUses(liveAnalysis, kernel));
 
-          continue;
-        }
-
-        if (!kernel.getOption(vISA_Debug) && iterationNo == 0 && !fastCompile &&
-            kernel.getOption(vISA_DoSplitOnSpill)) {
-          RA_TRACE(std::cout << "\t--var split around loop\n");
-          LoopVarSplit loopSplit(kernel, &coloring, &liveAnalysis);
-          kernel.fg.getLoops().computePreheaders();
-          loopSplit.run();
-        }
-
-        // Very few spills in this iter. Check if we can convert this to fail
-        // safe iter. By converting this iter to fail safe we can save (at
-        // least) 1 additional iter to allocate spilled temps. But converting to
-        // fail safe needs extra checks because no reserved GRF may exist at
-        // this point. So push/pop needs to succeed without additional GRF
-        // potentially.
-        if (!kernel.getOption(vISA_Debug) && iterationNo >= 1 &&
-            kernel.getOption(vISA_NewFailSafeRA) && !reserveSpillReg &&
-            coloring.getSpilledLiveRanges().size() <=
-                BoundedRA::MaxSpillNumVars &&
-            liveAnalysis.getNumSelectedVar() > BoundedRA::LargeProgramSize) {
-          // Stack call always has free GRF so it is safe to convert this iter
-          // to fail safe
-          if (builder.usesStack() ||
-              // If LSC has to be used for spill/fill then we need to ensure
-              // spillHeader is created
-              (useLscForNonStackCallSpillFill &&
-               builder.hasValidSpillFillHeader()) ||
-       // If scratch is to be used then max spill offset must be within
-       // addressable range and r0 must be available as reserved. If r0
-       // is not reserved, we cannot conver current iteration to fail
-       // safe because r0 may get assigned to other virtual variables.
-              ((kernel.getOption(vISA_PreserveR0InR0) ||
-                builder.getBuiltinR0()->isOutput()) &&
-               (nextSpillOffset + BoundedRA::getNumPhyVarSlots(kernel)) <
-                   SCRATCH_MSG_LIMIT)) {
-            // Few ranges are spilled but this was not executed as fail
-            // safe iteration. However, we've the capability of doing
-            // push/pop with new fail safe RA implementation. So for very
-            // few spills, we insert push/pop to free up some GRFs rather
-            // than executing a new RA iteration. When doing so, we mark
-            // this RA iteration as fail safe.
-            reserveSpillReg = true;
-            coloring.markFailSafeIter(true);
-            // No reserved GRFs
-            setNumReservedGRFsFailSafe(0);
-            RA_TRACE(std::cout << "\t--enabling new fail safe RA\n");
-          }
-        }
-
-        // Calculate the spill caused by send to decide if global splitting is
-        // required or not
-        for (auto spilled : coloring.getSpilledLiveRanges()) {
-          GRFSpillFillCount += spilled->getRefCount();
-        }
-
-        if (iterationNo == 0) {
-          // Dump out interference graph information of spill candidates
-          VISA_DEBUG_VERBOSE(reportSpillInfo(liveAnalysis, coloring));
-        }
-
-        // vISA_AbortOnSpillThreshold is defined as [0..200]
-        // where 0 means abort on any spill and 200 means never abort
-        auto underSpillThreshold = [this](int numSpill, int asmCount) {
-          int threshold = std::min(
-              builder.getOptions()->getuInt32Option(vISA_AbortOnSpillThreshold),
-              200u);
-          return (numSpill * 200) < (threshold * asmCount);
-        };
-
-        bool isUnderThreshold = underSpillThreshold(GRFSpillFillCount, instNum);
-        if (isUnderThreshold) {
-          if (auto jitInfo = builder.getJitInfo()) {
-            jitInfo->avoidRetry = true;
-          }
-        }
-
-        if (builder.getOption(vISA_AbortOnSpill) && !isUnderThreshold) {
-          // update jit metadata information
-          if (auto jitInfo = builder.getJitInfo()) {
-            jitInfo->stats.spillMemUsed = 0;
-            jitInfo->stats.numAsmCountUnweighted = instNum;
-            jitInfo->stats.numGRFSpillFillWeighted = GRFSpillFillCount;
-          }
-
-          // Early exit when -abortonspill is passed, instead of
-          // spending time inserting spill code and then aborting.
-          stopTimer(TimerID::GRF_GLOBAL_RA);
-          return VISA_SPILL;
-        }
-
-        if (iterationNo == 0 && enableSpillSpaceCompression &&
-            kernel.getInt32KernelAttr(Attributes::ATTR_Target) == VISA_3D &&
-            !hasStackCall) {
-          unsigned spillSize = 0;
-          const LIVERANGE_LIST &spilledLRs = coloring.getSpilledLiveRanges();
-          for (auto lr : spilledLRs) {
-            spillSize += lr->getDcl()->getByteSize();
-          }
-          if ((int)(spillSize * 1.5) <
-              (SCRATCH_MSG_LIMIT - globalScratchOffset)) {
-            enableSpillSpaceCompression = false;
-          }
-        }
-        startTimer(TimerID::SPILL);
-        SpillManagerGRF spillGRF(
-            *this, nextSpillOffset, &liveAnalysis, coloring.getIntf(),
-            &coloring.getSpilledLiveRanges(), reserveSpillReg, spillRegSize,
-            indrSpillRegSize, enableSpillSpaceCompression,
-            useScratchMsgForSpill);
-        // FIXME: This really should be done at loop end, but keep it here to
-        // match old behavior.
-        iterationNo++;
-
-        if (kernel.getOption(vISA_SpillAnalysis)) {
-          spillAnalysis->Do(&liveAnalysis, &coloring, &spillGRF);
-        }
-
-        vISA_ASSERT(
-            std::all_of(coloring.getSpilledLiveRanges().begin(),
-                        coloring.getSpilledLiveRanges().end(),
-                        [&](const LiveRange *spilledLR) {
-                          // EOT spills even of infinite cost are specially
-                          // handled in spill insertion when using old fail safe
-                          // RA. So don't assert for such spills.
-                          if (isEOTSpillWithFailSafeRA(builder, spilledLR,
-                                                       reserveSpillReg) &&
-                              !builder.getOption(vISA_NewFailSafeRA))
-                            return true;
-                          return spilledLR->getSpillCost() != MAXSPILLCOST;
-                        }),
-            "Spilled inf spill cost range");
-
-        bool success = spillGRF.insertSpillFillCode(&kernel, pointsToAnalysis);
-        nextSpillOffset = spillGRF.getNextOffset();
-
-        if (kernel.getOption(vISA_VerifyRA)) {
-          // For least false positives, turn off RMW opt and spill cleanup
-          verifySpillFill();
-        }
-
-        if (builder.hasScratchSurface() && !hasStackCall &&
-            (nextSpillOffset + globalScratchOffset) > SCRATCH_MSG_LIMIT) {
-          // create temp variable to store old a0.2 - this is marked as live-in
-          // and live-out. because the variable is emitted only post RA to
-          // preserve old value of a0.2.
-          kernel.fg.builder->getOldA0Dot2Temp();
-        } else if (useLscForNonStackCallSpillFill || useLscForScatterSpill) {
-          {
-            kernel.fg.builder->getOldA0Dot2Temp();
-          }
-        }
-
-        RA_TRACE({
-          auto &&spills = coloring.getSpilledLiveRanges();
-          std::cout << "\t--# variables spilled: " << spills.size() << "\n";
-          if (spills.size() < 100) {
-            std::cout << "\t--spilled variables: ";
-            for (auto &&lr : spills) {
-              std::cout << lr->getDcl()->getName() << "  ";
-            }
-            std::cout << "\n";
-          }
-          std::cout << "\t--current spill size: " << nextSpillOffset << "\n";
-        });
-
-        if (!success) {
-          iterationNo = maxRAIterations;
+      if (nextSpillOffset) {
+        switch (kernel.getRAType()) {
+        case RA_Type::GRAPH_COLORING_RR_BC_RA:
+          kernel.setRAType(RA_Type::GRAPH_COLORING_SPILL_RR_BC_RA);
+          break;
+        case RA_Type::GRAPH_COLORING_FF_BC_RA:
+          kernel.setRAType(RA_Type::GRAPH_COLORING_SPILL_FF_BC_RA);
+          break;
+        case RA_Type::GRAPH_COLORING_RR_RA:
+          kernel.setRAType(RA_Type::GRAPH_COLORING_SPILL_RR_RA);
+          break;
+        case RA_Type::GRAPH_COLORING_FF_RA:
+          kernel.setRAType(RA_Type::GRAPH_COLORING_SPILL_FF_RA);
+          break;
+        default:
+          vISA_ASSERT_UNREACHABLE("invalid ra type");
           break;
         }
-
-        kernel.dumpToFile("after.Spill_GRF." + std::to_string(iterationNo));
-#ifndef DLL_MODE
-        if (stopAfter("Spill_GRF")) {
-          return VISA_EARLY_EXIT;
-        }
-#endif // DLL_MODE
-
-        scratchOffset =
-            std::max(scratchOffset, spillGRF.getNextScratchOffset());
-
-        bool disableSpillCoalecse =
-            builder.getOption(vISA_DisableSpillCoalescing) ||
-            builder.getOption(vISA_FastSpill) || fastCompile ||
-            builder.getOption(vISA_Debug) ||
-            // spill cleanup is not support when we use oword msg for spill/fill
-            // for non-stack calls.
-            (!useScratchMsgForSpill && !hasStackCall);
-
-        if (!reserveSpillReg && !disableSpillCoalecse && builder.useSends()) {
-          RA_TRACE(std::cout << "\t--spill/fill cleanup\n");
-          CoalesceSpillFills c(kernel, liveAnalysis, coloring, spillGRF,
-                               iterationNo, rpe, *this);
-          c.run();
-#ifndef DLL_MODE
-          if (stopAfter("spillCleanup")) {
-            return VISA_EARLY_EXIT;
-          }
-#endif // DLL_MODE
-        }
-
-        if (iterationNo == builder.getuint32Option(vISA_FailSafeRALimit)) {
-          if (coloring.getSpilledLiveRanges().size() < 2) {
-            // give regular RA one more try as we are close to success
-            failSafeRAIteration++;
-          }
-        }
-        stopTimer(TimerID::SPILL);
       }
-      // RA successfully allocates regs
-      if (isColoringGood == true || reserveSpillReg) {
-        coloring.confirmRegisterAssignments();
 
-        if (hasStackCall) {
-          // spill/fill intrinsics expect offset in HWord, so round up to 64
-          // byte but maintain it in OWord unit ToDo: we really need to change
-          // everything to byte for everyone's sanity..
-          unsigned localSpillAreaOwordSize = ROUND(scratchOffset, 64) / 16;
-          coloring.getSaveRestoreRegister();
-          addSaveRestoreCode(localSpillAreaOwordSize);
-        }
-
-        if (kernel.getOption(vISA_DumpRegChart)) {
-          assignRegForAliasDcl();
-          computePhyReg();
-          // invoke before expanding spill/fill since
-          // it modifies IR
-          regChart->dumpRegChart(std::cerr, {}, 0);
-        }
-
-        if (builder.getOption(vISA_DynPerfModel)) {
-          perfModel.run();
-        }
-        expandSpillFillIntrinsics(nextSpillOffset);
-
-        VISA_DEBUG_VERBOSE(detectUndefinedUses(liveAnalysis, kernel));
-
-        if (nextSpillOffset) {
-          switch (kernel.getRAType()) {
-          case RA_Type::GRAPH_COLORING_RR_BC_RA:
-            kernel.setRAType(RA_Type::GRAPH_COLORING_SPILL_RR_BC_RA);
-            break;
-          case RA_Type::GRAPH_COLORING_FF_BC_RA:
-            kernel.setRAType(RA_Type::GRAPH_COLORING_SPILL_FF_BC_RA);
-            break;
-          case RA_Type::GRAPH_COLORING_RR_RA:
-            kernel.setRAType(RA_Type::GRAPH_COLORING_SPILL_RR_RA);
-            break;
-          case RA_Type::GRAPH_COLORING_FF_RA:
-            kernel.setRAType(RA_Type::GRAPH_COLORING_SPILL_FF_RA);
-            break;
-          default:
-            vISA_ASSERT_UNREACHABLE("invalid ra type");
-            break;
-          }
-        }
-
-        if (verifyAugmentation) {
-          assignRegForAliasDcl();
-          computePhyReg();
-          verifyAugmentation->verify();
-        }
-        break; // done
+      if (verifyAugmentation) {
+        assignRegForAliasDcl();
+        computePhyReg();
+        verifyAugmentation->verify();
       }
-    } else {
-      break;
+      break; // done
     }
   }
   assignRegForAliasDcl();
@@ -10622,23 +10937,19 @@ void GlobalRA::insertRestoreAddr(G4_BB *bb) {
 // correctness.
 //
 unsigned GraphColor::edgeWeightGRF(const LiveRange *lr1, const LiveRange *lr2) {
-  bool lr1EvenAlign = gra.isEvenAligned(lr1->getDcl());
   unsigned lr1_nreg = lr1->getNumRegNeeded();
   unsigned lr2_nreg = lr2->getNumRegNeeded();
 
-  if (!lr1EvenAlign) {
-    return lr1_nreg + lr2_nreg - 1;
-  }
+  if (gra.use4GRFAlign) {
+    auto lr1Align = gra.getAugAlign(lr1->getDcl());
+    auto lr2Align = gra.getAugAlign(lr2->getDcl());
 
-  bool lr2EvenAlign = gra.isEvenAligned(lr2->getDcl());
-  if (!lr2EvenAlign) {
-    unsigned sum = lr1_nreg + lr2_nreg;
-    return sum + 1 - ((sum) % 2);
-  } else if (lr2EvenAlign) {
-    return lr1_nreg + lr2_nreg - 1 + (lr1_nreg % 2) + (lr2_nreg % 2);
+    return edgeWeightWith4GRF(lr1Align, lr2Align, lr1_nreg, lr2_nreg);
   } else {
-    vISA_ASSERT_UNREACHABLE("should be unreachable");
-    return 0;
+    bool lr1EvenAlign = gra.isEvenAligned(lr1->getDcl());
+    bool lr2EvenAlign = gra.isEvenAligned(lr2->getDcl());
+
+    return edgeWeightGRF(lr1EvenAlign, lr2EvenAlign, lr1_nreg, lr2_nreg);
   }
 }
 

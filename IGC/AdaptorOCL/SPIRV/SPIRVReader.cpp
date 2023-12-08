@@ -2219,9 +2219,14 @@ SPIRVToLLVM::transType(SPIRVType *T) {
     return mapType(T, Type::getIntNTy(*Context, T->getIntegerBitWidth()));
   case OpTypeFloat:
     return mapType(T, transFPType(T));
-  case OpTypeArray:
+  case OpTypeArray: {
+    // The length might be an OpSpecConstantOp, that needs to be specialized
+    // and evaluated before the LLVM ArrayType can be constructed.
+    auto* LenExpr = static_cast<const SPIRVTypeArray*>(T)->getLength();
+    auto* LenValue = cast<ConstantInt>(transValue(LenExpr, nullptr, nullptr));
     return mapType(T, ArrayType::get(transType(T->getArrayElementType()),
-        T->getArrayLength()));
+        LenValue->getZExtValue()));
+  }
   case OpTypeTokenINTEL:
     return mapType(T, Type::getTokenTy(*Context));
   case OpTypePointer:
@@ -2295,6 +2300,12 @@ SPIRVToLLVM::transType(SPIRVType *T) {
     SPIRVTypeJointMatrixINTEL *MT = static_cast<SPIRVTypeJointMatrixINTEL *>(T);
     std::string typeName = kJointMatrixName::TypePrefix + MT->getMangledName() + kJointMatrixName::TypeSuffix;
     return mapType(T, getOrCreateOpaquePtrType(M, typeName, SPIRAddressSpace::SPIRAS_Global));
+  }
+  case OpTypeForwardPointer: {
+    SPIRVTypeForwardPointer* FP =
+      static_cast<SPIRVTypeForwardPointer*>(static_cast<SPIRVEntry*>(T));
+    return mapType(T, transType(static_cast<SPIRVType*>(
+      BM->getEntry(FP->getPointerId()))));
   }
   default: {
     auto OC = T->getOpCode();
@@ -3648,23 +3659,21 @@ SPIRVToLLVM::transValueWithoutDecoration(SPIRVValue *BV, Function *F,
 
   case OpCompositeExtract: {
     SPIRVCompositeExtract *CE = static_cast<SPIRVCompositeExtract *>(BV);
-    auto Type = CE->getComposite()->getType();
-    IGC_ASSERT_MESSAGE(BB, "Invalid BB");
-    if (Type->isTypeVector())
-    {
+    IRBuilder<> Builder(*Context);
+    if (BB) {
+        Builder.SetInsertPoint(BB);
+    }
+    if (CE->getComposite()->getType()->isTypeVector()) {
         IGC_ASSERT_MESSAGE(CE->getIndices().size() == 1, "Invalid index");
-        return mapValue(BV, ExtractElementInst::Create(
-            transValue(CE->getComposite(), F, BB),
-            ConstantInt::get(*Context, APInt(32, CE->getIndices()[0])),
-            BV->getName(), BB));
+        return mapValue(
+            BV, Builder.CreateExtractElement(
+                transValue(CE->getComposite(), F, BB),
+                ConstantInt::get(*Context, APInt(32, CE->getIndices()[0])),
+                BV->getName()));
     }
-    else
-    {
-        return mapValue(BV, ExtractValueInst::Create(
-            transValue(CE->getComposite(), F, BB),
-            CE->getIndices(),
-            BV->getName(), BB));
-    }
+    return mapValue(
+        BV, Builder.CreateExtractValue(transValue(CE->getComposite(), F, BB),
+            CE->getIndices(), BV->getName()));
     }
     break;
 

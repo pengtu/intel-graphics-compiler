@@ -6,7 +6,7 @@
 ;
 ;============================ end_copyright_notice =============================
 
-; RUN: opt %use_old_pass_manager% -GenXPatternMatch -march=genx64 -mcpu=Gen9 -mtriple=spir64-unknown-unknown -S < %s | FileCheck %s
+; RUN: %opt %use_old_pass_manager% -GenXPatternMatch -march=genx64 -mcpu=Gen9 -mtriple=spir64-unknown-unknown -S < %s | FileCheck %s
 
 ; CHECK-LABEL: @test_inverse
 define <16 x float> @test_inverse(<16 x float> %val) {
@@ -80,6 +80,26 @@ define <16 x float> @test_inverse3(<16 x float> %val) {
 ; CHECK-NEXT: ret <16 x float> [[INVERSE_SQRT_FDIV]]
   %inv = fdiv fast <16 x float> <float 1.000000e+00, float 1.000000e+00, float 1.000000e+00, float 1.000000e+00, float 1.000000e+00, float 1.000000e+00, float 1.000000e+00, float 1.000000e+00, float 1.000000e+00, float 1.000000e+00, float 1.000000e+00, float 1.000000e+00, float 1.000000e+00, float 1.000000e+00, float 1.000000e+00, float 1.000000e+00>, %sqrt
   ret <16 x float> %inv
+}
+
+; CHECK-LABEL: @test_inverse_of_not_sqrt
+define <16 x float> @test_inverse_of_not_sqrt(<16 x float> %val, <16 x float> %tmp) {
+; CHECK-NEXT: fsub <16 x float>
+; CHECK-NEXT: call <16 x float> @llvm.genx.inv.v16f32
+  %sub = fsub <16 x float> %val, %tmp
+  %inv = call <16 x float> @llvm.genx.inv.v16f32(<16 x float> %sub)
+  ret <16 x float> %inv
+}
+
+; CHECK-LABEL: @test_sqrt_multiple_use
+define <16 x float> @test_sqrt_multiple_use(<16 x float> %val) {
+; CHECK-NEXT: call <16 x float> @llvm.genx.sqrt.v16f32
+; CHECK-NEXT: call <16 x float> @llvm.genx.inv.v16f32
+; CHECK-NEXT: fadd <16 x float>
+  %sqrt = call <16 x float> @llvm.genx.sqrt.v16f32(<16 x float> %val)
+  %inv = call <16 x float> @llvm.genx.inv.v16f32(<16 x float> %sqrt)
+  %add = fadd <16 x float> %sqrt, %inv
+  ret <16 x float> %add
 }
 
 declare float @llvm.genx.sqrt.f32(float)

@@ -2586,22 +2586,26 @@ void CustomUnsafeOptPass::visitIntrinsicInst(IntrinsicInst& I)
     else if (ID == Intrinsic::sqrt)
     {
         // y*y = x if y = sqrt(x).
-        int replacedUses = 0;
-        for (auto iter = I.user_begin(); iter != I.user_end(); iter++)
+        if (IGC_IS_FLAG_DISABLED(DisableSqrtOpt) && !modMD->compOpt.disableSqrtOpt)
         {
-            if (Instruction* mul = dyn_cast<Instruction>(*iter))
+            int replacedUses = 0;
+            for (auto iter = I.user_begin(); iter != I.user_end(); iter++)
             {
-                if (mul->getOpcode() == Instruction::FMul &&
-                    mul->getOperand(0) == mul->getOperand(1))
+                if (Instruction* mul = dyn_cast<Instruction>(*iter))
                 {
-                    mul->replaceAllUsesWith(I.getOperand(0));
-                    collectForErase(*mul);
-                    ++replacedUses;
+                    if (mul->getOpcode() == Instruction::FMul &&
+                        mul->getOperand(0) == mul->getOperand(1))
+                    {
+                        mul->replaceAllUsesWith(I.getOperand(0));
+                        collectForErase(*mul);
+                        ++replacedUses;
+                    }
                 }
             }
+            if (I.hasNUses(replacedUses))
+                collectForErase(I);
         }
-        if (I.hasNUses(replacedUses))
-            collectForErase(I);
+
     }
     // This optimization simplifies FMA expressions with zero arguments.
     else if (ID == Intrinsic::fma && I.isFast())
@@ -2903,7 +2907,6 @@ private:
     static DenseSet<const Value*> tryAndFoldValues(ArrayRef<Instruction*> Values);
     static BasicBlock* SplitBasicBlock(Instruction* inst, const DenseSet<const Value*>& FoldedVals);
     static bool FoldsToZero(const Instruction* inst, const Value* use, const DenseSet<const Value*>& FoldedVals);
-    static void MoveOutputToConvergeBlock(BasicBlock* divergeBlock, BasicBlock* convergeBlock);
     static bool EarlyOutBenefit(
         const Instruction* earlyOutInst,
         const DenseSet<const Value*>& FoldedVals,
@@ -3661,7 +3664,7 @@ bool EarlyOutPatterns::processBlock(BasicBlock* BB)
                     for (auto iter = GII->getParent()->begin(); iter != GII->getParent()->end(); iter++)
                     {
                         GenIntrinsicInst* outI = dyn_cast<GenIntrinsicInst>(iter);
-                        if (outI && outI->getIntrinsicID() == GenISAIntrinsic::GenISA_OUTPUT)
+                        if (outI && outI->getIntrinsicID() == GetOutputPSIntrinsic(m_ctx->platform))
                         {
                             outputCount++;
                         }
@@ -3959,23 +3962,6 @@ BasicBlock* EarlyOutPatterns::SplitBasicBlock(Instruction* inst, const DenseSet<
     builder.SetInsertPoint(currentBB);
     builder.CreateCondBr(inst, ifBlock, elseBlock);
     return elseBlock;
-}
-
-void EarlyOutPatterns::MoveOutputToConvergeBlock(BasicBlock* divergeBlock, BasicBlock* convergeBlock)
-{
-    for (auto it = divergeBlock->begin(), ie = divergeBlock->end(); it != ie; )
-    {
-        Instruction* I = &(*it);
-        ++it;
-        if (GenIntrinsicInst * intr = dyn_cast<GenIntrinsicInst>(I))
-        {
-            auto id = intr->getIntrinsicID();
-            if (id == GenISAIntrinsic::GenISA_OUTPUT)
-            {
-                intr->moveBefore(convergeBlock->getTerminator());
-            }
-        }
-    }
 }
 
 ///////////////////////////////////////////////////////////////////////

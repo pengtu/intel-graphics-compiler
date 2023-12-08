@@ -54,7 +54,7 @@ IGC::createEstimateFunctionSizePass(EstimateFunctionSize::AnalysisLevel AL) {
 
 EstimateFunctionSize::EstimateFunctionSize(AnalysisLevel AL)
     : ModulePass(ID), M(nullptr), AL(AL), tmpHasImplicitArg(false), HasRecursion(false), EnableSubroutine(false),
-      threshold_func_freq(Scaled64::getLargest()), thresholdForTrimming(Scaled64::get(IGC_GET_FLAG_VALUE(ControlInlineSizeContribution))){}
+      threshold_func_freq(Scaled64::getLargest()), thresholdForTrimming(Scaled64::get(IGC_GET_FLAG_VALUE(ControlInlineTinySizeForSPGT))){}
 
 EstimateFunctionSize::~EstimateFunctionSize() { clear(); }
 
@@ -144,7 +144,7 @@ namespace {
     } FUNCTION_TRAIT_FLAG_t;
     struct FunctionNode {
         FunctionNode(Function* F, std::size_t Size)
-            : F(F), InitialSize(Size), UnitSize(Size), ExpandedSize(Size), SizeAfterInlining(Size), Inline_cnt(0), tmpSize(Size), CallingSubroutine(false),
+            : F(F), InitialSize(Size), UnitSize(Size), ExpandedSize(Size), SizeAfterCollapsing(Size), Inline_cnt(0), tmpSize(Size), CallingSubroutine(false),
             FunctionAttr(0), InMultipleUnit(false), HasImplicitArg(false), staticFuncFreq(0, 0), EntryFreq(0,0) {}
 
         Function* F;
@@ -161,7 +161,7 @@ namespace {
         uint32_t ExpandedSize;
 
         /// \brief Expanded size when all functions in a unit below the node are expanded
-        uint32_t SizeAfterInlining;
+        uint32_t SizeAfterCollapsing;
 
         /// \brief How many times the function is inlined at callsites.
         uint32_t Inline_cnt;
@@ -199,9 +199,17 @@ namespace {
 
         std::string getStaticFuncFreqStr() { return staticFuncFreq.toString(); }
 
-        uint64_t getSizeContribution() { return Inline_cnt == 0 ? SizeAfterInlining : static_cast<uint64_t>(Inline_cnt) * SizeAfterInlining; }
+        // \brief return the size used for Static Profile Guided Trimming
+        uint64_t getPotentialBodySize() { return  IGC_IS_FLAG_ENABLED(EnableLeafCollapsing) ? SizeAfterCollapsing : InitialSize; }
+
+        uint64_t getSizeContribution() {return Inline_cnt == 0 ? getPotentialBodySize() : static_cast<uint64_t>(Inline_cnt) * getPotentialBodySize(); }
+
+        uint64_t getSizeForTrimming() {return IGC_IS_FLAG_ENABLED(EnableSizeContributionOptimization) ? getSizeContribution() : getPotentialBodySize();}
+
         Scaled64 getWeightForTrimming() {
-            return staticFuncFreq == 0 ? Scaled64::get(getSizeContribution() * getSizeContribution()) : Scaled64::get(getSizeContribution() * getSizeContribution()) / staticFuncFreq;
+            if (IGC_IS_FLAG_ENABLED(StaticProfileGuidedTrimming) && IGC_IS_FLAG_ENABLED(UseFrequencyInfoForSPGT))
+                return staticFuncFreq == 0 ? Scaled64::get(getSizeForTrimming() * getSizeForTrimming()) : Scaled64::get(getSizeForTrimming() * getSizeForTrimming()) / staticFuncFreq;
+            return Scaled64::get(getSizeForTrimming());
         }
 
         /// \brief A node becomes a leaf when all called functions are expanded.
@@ -288,11 +296,14 @@ namespace {
             if (IGC_IS_FLAG_ENABLED(ForceInlineExternalFunctions) && InMultipleUnit)
                 return FT_MUL_KERNEL;
 
+            uint64_t tinySize = IGC_IS_FLAG_ENABLED(StaticProfileGuidedTrimming) ? IGC_GET_FLAG_VALUE(ControlInlineTinySizeForSPGT)
+                                                                                 : IGC_GET_FLAG_VALUE(ControlInlineTinySize);
+
+            if (getPotentialBodySize() < tinySize) //It's too small to trim
+                return FT_TOO_TINY;
+
             if (IGC_IS_FLAG_ENABLED(StaticProfileGuidedTrimming))
             {
-                if (SizeAfterInlining < IGC_GET_FLAG_VALUE(ControlInlineTinySizeForSizeContribution)) //It's too small to trim
-                    return FT_TOO_TINY;
-
                 if (getWeightForTrimming() < thresholdForTrimming) {
                     return FT_LOWER_WEIGHT;
                 } else {
@@ -300,13 +311,7 @@ namespace {
                 }
             }
 
-            //This is a legacy mode trimming based on the size
-            if (InitialSize < IGC_GET_FLAG_VALUE(ControlInlineTinySize)) { //It's too small to trim
-                return FT_TOO_TINY;
-            } else {
-                return FT_BIG_ENOUGH;
-            }
-            return FT_NOT_APPLICABLE;
+            return FT_BIG_ENOUGH;
         }
 
         std::string getFuncAttrStr()
@@ -330,6 +335,35 @@ namespace {
             return "";
         }
 
+        void dumpFuncInfo(uint16_t type, std::string message)
+        {
+            std::string dumpInfo = message + ", ";
+            dumpInfo += F->getName().str();
+            dumpInfo += ", Function Attribute: ";dumpInfo += getFuncAttrStr();
+            dumpInfo += ", Function size: "; dumpInfo += std::to_string(InitialSize);
+            if (IGC_IS_FLAG_ENABLED(EnableLeafCollapsing))
+            {
+                dumpInfo += ", Size after collapsing: ";
+                dumpInfo += std::to_string(SizeAfterCollapsing);
+            }
+            if (IGC_IS_FLAG_ENABLED(EnableSizeContributionOptimization))
+            {
+                dumpInfo += ", Size contribution: ";
+                dumpInfo += std::to_string(getSizeContribution());
+            }
+            if (IGC_IS_FLAG_ENABLED(UseFrequencyInfoForSPGT))
+            {
+                dumpInfo += ", Freq: ";
+                dumpInfo += getStaticFuncFreqStr();
+            }
+            if (IGC_IS_FLAG_ENABLED(StaticProfileGuidedTrimming))
+            {
+                dumpInfo += ", Weight: ";
+                dumpInfo += getWeightForTrimming().toString();
+            }
+            PrintTrimUnit(type, dumpInfo);
+        }
+
         //Top down bfs to find the size of a compilation unit
         uint32_t updateUnitSize() {
             std::unordered_set<FunctionNode*> visit;
@@ -344,7 +378,7 @@ namespace {
                 PrintFunctionSizeAnalysis(0x4, Node->F->getName().str() << ": " << Node->InitialSize)
                 TopDownQueue.pop_front();
                 total += Node->InitialSize;
-                for (auto Callee : Node->CalleeList)
+                for (auto& Callee : Node->CalleeList)
                 {
                     FunctionNode* calleeNode = Callee.first;
                     if (visit.find(calleeNode) != visit.end() || calleeNode->isStackCallAssigned()) //Already processed or head of stack call
@@ -393,9 +427,9 @@ namespace {
 
 void FunctionNode::print(raw_ostream& os) {
     os << "Function: " << F->getName() << ", " << InitialSize << "\n";
-    for (auto G : CalleeList)
+    for (const auto &G : CalleeList)
         os << "--->>>" << G.first->F->getName() << "\n";
-    for (auto G : CallerList)
+    for (const auto &G : CallerList)
         os << "<<<---" << G.first->F->getName() << "\n";
 }
 #endif
@@ -481,7 +515,7 @@ void EstimateFunctionSize::updateStaticFuncFreq()
     uint64_t ColdSyntheticCount = 5;
     for (Function& F : *M) {
         uint64_t InitialCount = InitialSyntheticCount;
-        if (F.isDeclaration())
+        if (F.empty() || F.isDeclaration())
             continue;
         if (F.hasFnAttribute(llvm::Attribute::AlwaysInline) ||
             F.hasFnAttribute(llvm::Attribute::InlineHint)) {
@@ -571,6 +605,7 @@ void EstimateFunctionSize::runStaticAnalysis()
                 continue;
             FunctionNode* Node = get<FunctionNode>(&F);
             Scaled64 EntryFreq = Node->getEntryFrequency();
+            PrintStaticProfileGuidedKernelSizeReduction(0x1, "Function frequency of " << Node->F->getName().str() << ": " << Node->getStaticFuncFreqStr())
             for (auto& B : F.getBasicBlockList())
             {
                 Scaled64 BBCount = Node->blockFreqs[&B];
@@ -620,7 +655,6 @@ void EstimateFunctionSize::runStaticAnalysis()
             threshold_func_freq = freqLog.back();
         else
             threshold_func_freq = map_log10_to_scaled64[*it_lower];
-        thresholdForTrimming = (thresholdForTrimming * thresholdForTrimming) / threshold_func_freq;
         PrintStaticProfileGuidedKernelSizeReduction(0x1, "Metric: Normal distribution");
         PrintStaticProfileGuidedKernelSizeReduction(0x1, "Sample count: " << freqLogDbl.size());
         PrintStaticProfileGuidedKernelSizeReduction(0x1, "Execution frequency mean (Log10 scale): " << mean);
@@ -634,7 +668,6 @@ void EstimateFunctionSize::runStaticAnalysis()
         std::nth_element(freqLog.begin(), freqLog.begin() + C_pos, freqLog.end(),
             [](Scaled64& x, Scaled64& y) {return x < y;}); //Low C%
         threshold_func_freq = freqLog[C_pos];
-        thresholdForTrimming = (thresholdForTrimming * thresholdForTrimming) / threshold_func_freq;
         PrintStaticProfileGuidedKernelSizeReduction(0x1, "Metric: Long tail distribution");
         PrintStaticProfileGuidedKernelSizeReduction(0x1, "Low " << threshold_cold << "% pos: " << C_pos << " out of " << freqLog.size());
         PrintStaticProfileGuidedKernelSizeReduction(0x1, "Execution frequency threshold: " << threshold_func_freq);
@@ -644,10 +677,15 @@ void EstimateFunctionSize::runStaticAnalysis()
         Scaled64 C = Scaled64::get(IGC_GET_FLAG_VALUE(ParameterForColdFuncThreshold)) / Scaled64::get(10); //Scale down /10
         IGC_ASSERT(C > 0 && C <= 100);
         threshold_func_freq = mean * (C / Scaled64::get(100));
-        thresholdForTrimming = (thresholdForTrimming * thresholdForTrimming) / threshold_func_freq;
         PrintStaticProfileGuidedKernelSizeReduction(0x1, "Metric: Average%");
         PrintStaticProfileGuidedKernelSizeReduction(0x1, "Average threshold * " << C.toString() << "%: " << threshold_func_freq.toString());
     }
+
+    Scaled64 sizeThreshold = Scaled64::get(IGC_GET_FLAG_VALUE(ControlInlineTinySizeForSPGT));
+    if (IGC_IS_FLAG_ENABLED(UseFrequencyInfoForSPGT))
+        thresholdForTrimming = sizeThreshold * sizeThreshold / threshold_func_freq;
+    else
+        thresholdForTrimming = sizeThreshold; //If we don't want to use freq data, just use size only
 
     PrintStaticProfileGuidedKernelSizeReduction(0x1, "------------------Static analysis end------------------\n")
     return;
@@ -895,7 +933,7 @@ bool EstimateFunctionSize::onlyCalledOnce(const Function* F) {
         auto MdWrapper = getAnalysisIfAvailable<MetaDataUtilsWrapper>();
         if (MdWrapper) {
             auto pMdUtils = MdWrapper->getMetaDataUtils();
-            for (auto node : Node->CallerList) {
+            for (const auto &node : Node->CallerList) {
                 FunctionNode* Caller = node.first;
                 uint32_t cnt = node.second;
                 if (cnt > 1) {
@@ -943,7 +981,7 @@ void EstimateFunctionSize::initializeTopologicalVisit(Function* root, std::unord
     while (!Queue.empty()) {
         FunctionNode* Node = Queue.front();Queue.pop_front();
         Node->tmpSize = Node->InitialSize;
-        for (auto Callee : Node->CalleeList) {
+        for (auto &Callee : Node->CalleeList) {
             FunctionNode* CalleeNode = Callee.first;
             if (FunctionsInKernel.find(CalleeNode) != FunctionsInKernel.end())
                 continue;
@@ -974,7 +1012,7 @@ llvm::ScaledNumber<uint64_t> EstimateFunctionSize::calculateTotalWeight(Function
         totalSizeContributionSq += Scaled64::get(node->getSizeContribution()*node->getSizeContribution());
         if(!node->willBeInlined())
             totalSubroutineFreq += node->getStaticFuncFreq();
-        for (auto callee_info : node->CalleeList)
+        for (auto &callee_info : node->CalleeList)
         {
             FunctionNode* callee = callee_info.first;
             if (visit.find(callee) == visit.end())
@@ -987,7 +1025,7 @@ llvm::ScaledNumber<uint64_t> EstimateFunctionSize::calculateTotalWeight(Function
     return totalSizeContributionSq * totalSizeContributionSq * totalSubroutineFreq;
 }
 
-//Update inlined sizes of functions
+//Update the information about how many time a function will be inlined
 void EstimateFunctionSize::updateInlineCnt(Function *root)
 {
     FunctionNode* root_node = get<FunctionNode>(root);
@@ -1004,7 +1042,7 @@ void EstimateFunctionSize::updateInlineCnt(Function *root)
     {
         FunctionNode* node = (FunctionNode*)TopdownQueue.front(); TopdownQueue.pop_front();
         node->Inline_cnt = 0;
-        for (auto callee_info : node->CalleeList)
+        for (auto &callee_info : node->CalleeList)
         {
             FunctionNode* callee = callee_info.first;
             if (unprocessed_callers.find(callee) == unprocessed_callers.end())
@@ -1022,7 +1060,7 @@ void EstimateFunctionSize::updateInlineCnt(Function *root)
     while (!TopdownQueue.empty())
     {
         FunctionNode* node = (FunctionNode*)TopdownQueue.front(); TopdownQueue.pop_front();
-        for (auto callee_info : node->CalleeList)
+        for (auto &callee_info : node->CalleeList)
         {
             FunctionNode* callee = callee_info.first;
             uint16_t call_cnt = callee_info.second;
@@ -1042,13 +1080,13 @@ void EstimateFunctionSize::updateInlineCnt(Function *root)
 //Functions with those two kinds should be inlined no matter what the reason is.
 //When all small leaf functions are inlined and collapsed, there may be a set of new leaf functions
 //So, the algorithm repeat collapsing small leaf functions until only large leaf functions are left
-void EstimateFunctionSize::UpdateExpectedSizeAfterInlining(std::deque<void*> &nodesToProcess, std::unordered_set<void*> &funcsInKernel)
+void EstimateFunctionSize::UpdateSizeAfterCollapsing(std::deque<void*> &nodesToProcess, std::unordered_set<void*> &funcsInKernel)
 {
     for (auto n : funcsInKernel)
     {
         //Initialize the size after inlining
         FunctionNode* Node = (FunctionNode*)n;
-        Node->SizeAfterInlining = Node->InitialSize;
+        Node->SizeAfterCollapsing = Node->InitialSize;
     }
     std::unordered_map<FunctionNode*, uint16_t> remainingCallee;
     std::unordered_set<FunctionNode*> hasCalleesAfterInline;
@@ -1057,16 +1095,16 @@ void EstimateFunctionSize::UpdateExpectedSizeAfterInlining(std::deque<void*> &no
     {
         FunctionNode* Node = (FunctionNode*)nodesToProcess.front();nodesToProcess.pop_front();
         bool hasCallee = hasCalleesAfterInline.find(Node) != hasCalleesAfterInline.end();
-        if (Node->willBeInlined() && !hasCallee && Node->SizeAfterInlining < IGC_GET_FLAG_VALUE(ControlInlineTinySizeForSizeContribution))
+        if (Node->willBeInlined() && !hasCallee && Node->SizeAfterCollapsing < IGC_GET_FLAG_VALUE(ControlInlineTinySizeForSPGT))
         {
             if (!Node->isForcedInlined())
             {
-                PrintTrimUnit(0x8, "Small leaf functions should always be inlined" << Node->F->getName().str() << ", Size after Inline: " << Node->SizeAfterInlining);
+                PrintTrimUnit(0x8, "Small leaf functions should always be inlined" << Node->F->getName().str() << ", Size after Inline: " << Node->SizeAfterCollapsing);
                 Node->setForceInline(); //If the node is supposed to have no callee in the end and small size, it should be inlined
             }
         }
 
-        for (auto c : Node->CallerList)
+        for (const auto &c : Node->CallerList)
         {
             FunctionNode* caller = c.first;
             uint16_t call_cnt = c.second;
@@ -1082,7 +1120,7 @@ void EstimateFunctionSize::UpdateExpectedSizeAfterInlining(std::deque<void*> &no
 
 
             if (Node->isForcedInlined()) {//Will be inlined in any case
-                caller->SizeAfterInlining += Node->SizeAfterInlining * call_cnt;
+                caller->SizeAfterCollapsing += Node->SizeAfterCollapsing * call_cnt;
                 if (hasCallee) //Fucntion that already has force inline might have callee
                     hasCalleesAfterInline.insert(caller);
             } else {//Otherwise we don't know, so conservatively mark it having callees
@@ -1118,7 +1156,7 @@ uint32_t EstimateFunctionSize::updateExpandedUnitSize(Function* F, bool ignoreSt
                 << ", Total chunck size: " << unitTotalSize);
         }
 
-        for (auto c : node->CallerList)
+        for (const auto &c : node->CallerList)
         {
             FunctionNode* caller = c.first;
             if (FunctionsInUnit.find(caller) == FunctionsInUnit.end()) //Caller is in another compilation unit
@@ -1184,7 +1222,7 @@ uint32_t EstimateFunctionSize::bottomUpHeuristic(Function* F, uint32_t& stackCal
             }
         }
 
-        for (auto c : Node->CallerList)
+        for (const auto &c : Node->CallerList)
         {
             FunctionNode* caller = c.first;
             if (FunctionsInUnit.find(caller) == FunctionsInUnit.end()) //The caller is in another kernel, skip
@@ -1273,7 +1311,7 @@ void EstimateFunctionSize::getFunctionsToTrim(llvm::Function* root, llvm::SmallV
     visit.insert((void*)unitHead);
 
     SmallVector<FunctionNode*, 64> funcsInKernel;
-    uint64_t tinySizeThreshold = IGC_IS_FLAG_ENABLED(StaticProfileGuidedTrimming) ? IGC_GET_FLAG_VALUE(ControlInlineTinySizeForSizeContribution) : IGC_GET_FLAG_VALUE(ControlInlineTinySize);
+    uint64_t tinySizeThreshold = IGC_IS_FLAG_ENABLED(StaticProfileGuidedTrimming) ? IGC_GET_FLAG_VALUE(ControlInlineTinySizeForSPGT) : IGC_GET_FLAG_VALUE(ControlInlineTinySize);
 
     std::deque<void*> bottomUpQueue;
 
@@ -1281,7 +1319,7 @@ void EstimateFunctionSize::getFunctionsToTrim(llvm::Function* root, llvm::SmallV
     while (!TopDownQueue.empty())
     {
         FunctionNode* Node = TopDownQueue.front();TopDownQueue.pop_front();
-        for (auto Callee : Node->CalleeList)
+        for (auto &Callee : Node->CalleeList)
         {
             FunctionNode* calleeNode = Callee.first;
             if (visit.find((void*)calleeNode) != visit.end() || (!ignoreStackCallBoundary && calleeNode->isStackCallAssigned()))
@@ -1296,8 +1334,10 @@ void EstimateFunctionSize::getFunctionsToTrim(llvm::Function* root, llvm::SmallV
     }
     func_cnt += visit.size();
 
-    if (IGC_IS_FLAG_ENABLED(StaticProfileGuidedTrimming))
-        UpdateExpectedSizeAfterInlining(bottomUpQueue,visit);
+    if (IGC_IS_FLAG_ENABLED(EnableSizeContributionOptimization))
+        updateInlineCnt(root);
+    if (IGC_IS_FLAG_ENABLED(EnableLeafCollapsing))
+        UpdateSizeAfterCollapsing(bottomUpQueue, visit);
 
     if (IGC_GET_FLAG_VALUE(EnableGreedyTrimming))
     {
@@ -1315,41 +1355,28 @@ void EstimateFunctionSize::getFunctionsToTrim(llvm::Function* root, llvm::SmallV
         switch (func_trait)
         {
         case FT_NOT_BEST_EFFORT:
-            PrintTrimUnit(0x4, "Can't trim (not best effort inline)");
+            Node->dumpFuncInfo(0x4, "Can't trim (not best effort inline)");
             break;
         case FT_MUL_KERNEL:
-            PrintTrimUnit(0x4, "Can't trim (in multiple kernels)");
+            Node->dumpFuncInfo(0x4, "Can't trim (in multiple kernels)");
             break;
         case FT_BIG_ENOUGH://Functions are big enough to trim
             trimming_pool.push_back(Node);
-            PrintTrimUnit(0x4, "Good to trim (Big enough)");
+            Node->dumpFuncInfo(0x4, "Good to trim (Big enough > " + std::to_string(tinySizeThreshold) + ")");
             break;
         case FT_TOO_TINY:
-            PrintTrimUnit(0x4, "Can't trim (Too tiny)");
+            Node->dumpFuncInfo(0x4, "Can't trim (Too tiny < " + std::to_string(tinySizeThreshold) + ")");
             break;
         case FT_HIGHER_WEIGHT:
             trimming_pool.push_back(Node);
-            PrintTrimUnit(0x4, "Good to trim (High weight)");
+            Node->dumpFuncInfo(0x4, "Good to trim (High weight > " + thresholdForTrimming.toString() + ")");
             break;
         case FT_LOWER_WEIGHT:
-            PrintTrimUnit(0x4, "Can't trim (Low weight)");
+            Node->dumpFuncInfo(0x4, "Can't trim (Low weight < " + thresholdForTrimming.toString() + ")");
             break;
         default:
             PrintTrimUnit(0x4, "Something goes wrong with the function property");
             break;
-        }
-        if (IGC_IS_FLAG_ENABLED(StaticProfileGuidedTrimming)) {
-            PrintTrimUnit(0x4, Node->F->getName().str()
-                << ", Function Attribute: " << Node->getFuncAttrStr()
-                << ", Function size: " << Node->InitialSize
-                << ", Size after inlining: " << Node->SizeAfterInlining << "(Thrs" << tinySizeThreshold << ")"
-                << ", Size contribution: " << Node->getSizeContribution()
-                << ", Freq: " << Node->getStaticFuncFreqStr()
-                << ", Weight: " << Node->getWeightForTrimming().toString() << " (Thrs" << thresholdForTrimming << ")");
-        } else {
-            PrintTrimUnit(0x4, " " << Node->F->getName().str()
-                << " Function Attribute: " << Node->getFuncAttrStr()
-                << ", Function size: " << Node->InitialSize << "(Thrs" << tinySizeThreshold << ")");
         }
     }
     return;
@@ -1400,8 +1427,6 @@ void EstimateFunctionSize::trimCompilationUnit(llvm::SmallVector<void*, 64> &uni
     // Iterate over units
     for (auto unit : unitsToTrim) {
         size_t expandedUnitSize = updateExpandedUnitSize(unit->F, ignoreStackCallBoundary); //A kernel size can be reduced by a function that is trimmed at previous kernels, so recompute it.
-        if(IGC_IS_FLAG_ENABLED(StaticProfileGuidedTrimming))
-            updateInlineCnt(unit->F);
         PrintTrimUnit(0x2, "Trimming kernel / unit " << unit->F->getName().str() << " expanded size= " << expandedUnitSize)
         if (expandedUnitSize <= threshold) {
             PrintTrimUnit(0x2, "Kernel / unit " << unit->F->getName().str() << ": The expanded unit size(" << expandedUnitSize << ") is smaller than threshold(" << threshold << ")")
@@ -1444,7 +1469,7 @@ void EstimateFunctionSize::performGreedyTrimming(Function* head, llvm::SmallVect
     for (auto f : functions_to_trim)
     {
         FunctionNode* func = (FunctionNode*)f;
-        if (func->getSizeContribution() != func->SizeAfterInlining) {
+        if (func->getSizeContribution() != func->getPotentialBodySize()) {
             candidates.push_back(func);
         } else {
             funcWithNoEffect.push_back(func);
@@ -1479,7 +1504,7 @@ void EstimateFunctionSize::performGreedyTrimming(Function* head, llvm::SmallVect
         PrintTrimUnit(0x8, "Trim the function " << bestForTrim->F->getName().str()
             << ", Function Attribute: " << bestForTrim->getFuncAttrStr()
             << ", Function size: " << bestForTrim->InitialSize
-            << ", Size after inlining: " << bestForTrim->SizeAfterInlining
+            << ", Size after inlining: " << bestForTrim->SizeAfterCollapsing
             << ", Size contribution: " << bestForTrim->getSizeContribution()
             << ", Freq: " << bestForTrim->getStaticFuncFreqStr()
             << ", Weight: " << bestForTrim->getWeightForTrimming().toString());
@@ -1492,13 +1517,13 @@ void EstimateFunctionSize::performGreedyTrimming(Function* head, llvm::SmallVect
         llvm::SmallVector<FunctionNode*, 64> new_candidates;
         for (auto func : candidates)
         {
-            if (func->getSizeContribution() != func->SizeAfterInlining) {
+            if (func->getSizeContribution() != func->getPotentialBodySize()) {
                 new_candidates.push_back(func);
             } else {
                 funcWithNoEffect.push_back(func);
             }
         }
-        candidates = new_candidates;
+        candidates = std::move(new_candidates);
     }
     updateExpandedUnitSize(head, ignoreStackCallBoundary);
     for (FunctionNode* trimNoGain : candidates) //Those remaining candidates will likely degrade performance
@@ -1506,7 +1531,7 @@ void EstimateFunctionSize::performGreedyTrimming(Function* head, llvm::SmallVect
         PrintTrimUnit(0x8, "Dont't trim (Performance penalty is higher than size reduction)" << trimNoGain->F->getName().str()
             << ", Function Attribute: " << trimNoGain->getFuncAttrStr()
             << ", Function size: " << trimNoGain->InitialSize
-            << ", Size after inlining: " << trimNoGain->SizeAfterInlining
+            << ", Size after inlining: " << trimNoGain->SizeAfterCollapsing
             << ", Size contribution: " << trimNoGain->getSizeContribution()
             << ", Freq: " << trimNoGain->getStaticFuncFreqStr()
             << ", Weight: " << trimNoGain->getWeightForTrimming().toString());
@@ -1516,7 +1541,7 @@ void EstimateFunctionSize::performGreedyTrimming(Function* head, llvm::SmallVect
         PrintTrimUnit(0x8, "Dont't trim (Trimming doesn't give size reduction)" << trimNoGain->F->getName().str()
             << ", Function Attribute: " << trimNoGain->getFuncAttrStr()
             << ", Function size: " << trimNoGain->InitialSize
-            << ", Size after inlining: " << trimNoGain->SizeAfterInlining
+            << ", Size after inlining: " << trimNoGain->SizeAfterCollapsing
             << ", Size contribution: " << trimNoGain->getSizeContribution()
             << ", Freq: " << trimNoGain->getStaticFuncFreqStr()
             << ", Weight: " << trimNoGain->getWeightForTrimming().toString());
@@ -1536,31 +1561,28 @@ void EstimateFunctionSize::performTrimming(Function *head, llvm::SmallVector<voi
     {
         std::sort(functions_to_trim.begin(), functions_to_trim.end(),
             [&](const void* LHS, const void* RHS) {
-                if (IGC_IS_FLAG_ENABLED(StaticProfileGuidedTrimming))
                     return ((FunctionNode*)LHS)->getWeightForTrimming() < ((FunctionNode*)RHS)->getWeightForTrimming();
-                return ((FunctionNode*)LHS)->InitialSize < ((FunctionNode*)RHS)->InitialSize;
-            }); //Sort by the expanded size in an ascending order;
+            });
         FunctionNode* functionToTrim = (FunctionNode*)functions_to_trim.back(); //Pick the largest one first to trim
         functions_to_trim.pop_back();
         uint64_t original_expandedSize = unitHead->ExpandedSize;
 
-        if (IGC_IS_FLAG_ENABLED(StaticProfileGuidedTrimming))
+        if (IGC_IS_FLAG_ENABLED(EnableSizeContributionOptimization))
         {
             uint64_t size_contribution = functionToTrim->getSizeContribution();
-            if (functionToTrim->SizeAfterInlining == size_contribution) //We don't need to trim function that will be called just one time
+            if (IGC_IS_FLAG_ENABLED(SkipTrimmingOneCopyFunction)
+                && functionToTrim->getPotentialBodySize() == size_contribution)
             {
-                PrintTrimUnit(0x8, "Don't trim (Same size contribution) " << functionToTrim->F->getName().str() << " Initial Size: " << functionToTrim->InitialSize << " Size after inlining: " << functionToTrim->SizeAfterInlining << " Size contribution: " << size_contribution);
+                functionToTrim->dumpFuncInfo(0x8, "Don't trim (Same size contribution)");
                 continue;
             }
-            //Trim the function
-            PrintTrimUnit(0x8, "Trim the function " << functionToTrim->F->getName().str() << " Initial Size: " << functionToTrim->InitialSize << " Size after inlining: " << functionToTrim->SizeAfterInlining  << " Size contribution: " << size_contribution);
+            functionToTrim->dumpFuncInfo(0x8, "Trim the function");
             functionToTrim->setTrimmed();
-            //update size contribution
             updateInlineCnt(head);
             PrintTrimUnit(0x8, "The size contribution of the trimmed function changes to " << functionToTrim->getSizeContribution());
-        } else {
-            //Trim the function
-            PrintTrimUnit(0x8, "Trim the function " << functionToTrim->F->getName().str() << " Initial Size: " << functionToTrim->InitialSize);
+        }
+        else {
+            functionToTrim->dumpFuncInfo(0x8, "Trim the function");
             functionToTrim->setTrimmed();
         }
         total_trim_cnt += 1;

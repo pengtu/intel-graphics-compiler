@@ -1073,6 +1073,8 @@ namespace IGC
             break;
         case GenISAIntrinsic::GenISA_intatomictyped:
         case GenISAIntrinsic::GenISA_icmpxchgatomictyped:
+        case GenISAIntrinsic::GenISA_floatatomictyped:
+        case GenISAIntrinsic::GenISA_fcmpxchgatomictyped:
             overloadedTys.push_back(pIntr->getType());
             overloadedTys.push_back(newPtr->getType());
             break;
@@ -1175,6 +1177,8 @@ namespace IGC
             case GenISAIntrinsic::GenISA_intatomictyped:
             case GenISAIntrinsic::GenISA_icmpxchgatomictyped:
             case GenISAIntrinsic::GenISA_floatatomicraw:
+            case GenISAIntrinsic::GenISA_floatatomictyped:
+            case GenISAIntrinsic::GenISA_fcmpxchgatomictyped:
             case GenISAIntrinsic::GenISA_icmpxchgatomicraw:
             case GenISAIntrinsic::GenISA_fcmpxchgatomicraw:
             case GenISAIntrinsic::GenISA_simdBlockRead:
@@ -1753,6 +1757,12 @@ namespace IGC
             break;
         }
         return false;
+    }
+
+    llvm::GenISAIntrinsic::ID GetOutputPSIntrinsic(const CPlatform& platform)
+    {
+        constexpr llvm::GenISAIntrinsic::ID iid = llvm::GenISAIntrinsic::GenISA_OUTPUT;
+        return iid;
     }
 
     bool ComputesGradient(llvm::Instruction* inst)
@@ -2708,24 +2718,30 @@ namespace IGC
         const std::string& param1Name, // debug name for the first param
         const std::string& param2Name) // debug name for the second param
     {
-        Value* maskLo = builder.getInt32(BITMASK(numBits));
         Value* maskHi = builder.getInt32((~(BITMASK(numBits))));
 
         Function* rdneFunc = GenISAIntrinsic::getDeclaration(
             builder.GetInsertBlock()->getModule(),
             GenISAIntrinsic::GenISA_ROUNDNE);
-        Value* intParam1 = builder.CreateFPToUI(
+        // FPToUI cannot be used to avoid generation of a poison value in case of
+        // the negative constant value. Such an approach is possible since
+        // there is a protection against exceeding limits by param1.
+        Value* intParam1 = builder.CreateFPToSI(
             builder.CreateCall(rdneFunc, param1),
             builder.getInt32Ty(),
             VALUE_NAME(std::string("_int") + param1Name));
-        Value* intParam1Lsb = builder.CreateAnd(
+        Value* minVal = builder.getInt32(0);
+        Value* lowRangeCond = builder.CreateICmp(CmpInst::Predicate::ICMP_SGE, intParam1, minVal);
+        Value* intParam1Lsb = builder.CreateSelect(
+            lowRangeCond,
             intParam1,
-            maskLo,
-            VALUE_NAME(intParam1->getName() + "LSB"));
+            minVal);
+        Value* maxVal = builder.getInt32(BITMASK(numBits));
+        Value* highRangeCond = builder.CreateICmp(CmpInst::Predicate::ICMP_SLE, intParam1Lsb, maxVal);
         intParam1Lsb = builder.CreateSelect(
-            builder.CreateICmp(CmpInst::Predicate::ICMP_EQ, intParam1, intParam1Lsb),
+            highRangeCond,
             intParam1Lsb,
-            maskLo,
+            maxVal,
             VALUE_NAME(intParam1->getName() + "ClampedLSB"));
         Value* param2Int = builder.CreateBitCast(
             param2,

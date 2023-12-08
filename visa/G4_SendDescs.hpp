@@ -14,6 +14,7 @@ SPDX-License-Identifier: MIT
 #include <optional>
 #include <ostream>
 #include <string>
+#include <tuple>
 #include <utility>
 
 namespace vISA {
@@ -56,6 +57,10 @@ static inline bool MsgOpIs2D(MsgOp op) {
   return op == MsgOp::LOAD_BLOCK2D || op == MsgOp::STORE_BLOCK2D;
 }
 
+
+static inline bool MsgOpIsApndCtrAtomic(MsgOp op) {
+  return op == MsgOp::ATOMIC_ACADD || op == MsgOp::ATOMIC_ACSUB || op == MsgOp::ATOMIC_ACSTORE;
+}
 
 // does it have a data channel mask (e.g. load_quad)
 bool MsgOpHasChMask(MsgOp);
@@ -157,8 +162,8 @@ enum class Caching {
   UC, // uncached (load)
   ST, // streaming (load/store)
   WT, // writethrough (store)
+  CC,  // cached as constant (load)
 };
-
 
 std::string ToSymbol(Caching);
 // default, default returns ""
@@ -321,15 +326,9 @@ public:
   // This is the size of the element in memory not the register file
   // (which might widen the result in GRF).
   virtual unsigned getElemSize() const = 0;
-
   //
-  // Returns the caching behavior of this message if known.
-  // Returns Caching::INVALID if the message doesn't support caching
-  // controls.
-  virtual std::pair<Caching, Caching> getCaching() const = 0;
-  Caching getCachingL1() const { return getCaching().first; }
-  Caching getCachingL3() const { return getCaching().second; }
-  virtual void setCaching(Caching l1, Caching l3) = 0;
+  // retrieves the caching for L1
+  virtual Caching getCachingL1() const = 0;
   //
   // generally in multiples of full GRFs, but a few exceptions such
   // as OWord and HWord operations may make this different
@@ -337,13 +336,11 @@ public:
   virtual size_t getSrc0LenBytes() const = 0;
   virtual size_t getSrc1LenBytes() const = 0;
   //
-  // These round up to the nearest register.
-  // For legacy uses (e.g. MessageLength, exMessageLength(), ...)
-  // (e.g. an OWord block read will report 1 register)
-  // Favor the get{Dst,Src0,Src1}LenBytes() methods.
-  size_t getDstLenRegs() const;
-  size_t getSrc0LenRegs() const;
-  size_t getSrc1LenRegs() const;
+  // dst/src0/src1 len in GRF unit.
+  // Return the value encoded in the send messages
+  virtual size_t getDstLenRegs() const = 0;
+  virtual size_t getSrc0LenRegs() const = 0;
+  virtual size_t getSrc1LenRegs() const = 0;
   //
   // true if the message is a scratch space access (e.g. scratch block read)
   virtual bool isScratch() const = 0;
@@ -418,6 +415,9 @@ private:
   // sfid now stored separately from the ExDesc[4:0] since the new LSC format
   // no longer uses ExDesc for that information
   int src1Len;
+
+  // only used for LSC Xe2 BSS/SS; BTI and FLAT use exDesc
+  uint32_t exDescImmOff = 0;
 
   // Mimic SendDescLdSt. Valid only for LSC msg. It's set via setLdStAttr(), not
   // ctor (should be removed if lsc switchs to use SendDescLdSt
@@ -508,6 +508,14 @@ public:
   LSC_ADDR_TYPE getLscAddrType() const;
   int getLscAddrSizeBytes() const; // e.g. a64 => 8
   LSC_DATA_ORDER getLscDataOrder() const;
+
+  int getLscImmOff() const;
+  void setLscImmOff(int off);
+  bool canSetLscImmOff(int off) const {
+    return trySetLscImmOff(off, nullptr, nullptr);
+  }
+  bool trySetLscImmOff(int off, const char **whyFailed,
+                       G4_SendDescRaw *rawDesc = nullptr) const;
 
   // query methods common for all raw sends
   uint16_t ResponseLength() const;
@@ -605,6 +613,13 @@ public:
   bool is16BitReturn() const;
 
 
+  // c.f. with G4_SendDescRaw::exDescImmOff
+  void setExDescImmOff(uint32_t immOff) {
+    vISA_ASSERT(immOff == 0 || getSFID() == SFID::UGM,
+                 "this field is only legal given UGM");
+    exDescImmOff = immOff;
+  }
+  uint32_t getExDescImmOff() const { return exDescImmOff; }
   bool isLSCTyped() const { return isTyped() && isLSC(); }
   // atomic write or explicit barrier
   bool isBarrierOrAtomic() const { return isAtomicMessage() || isBarrier(); }
@@ -631,6 +646,10 @@ public:
 
   std::string getDescription() const override;
 
+  // Return data size of either dst or src1 in bytes for LSC
+  // load/store instructions
+  uint32_t getDataSizeInBytesLscLdStInst(Gen4_Operand_Number opnd_num) const;
+
 private:
   void setBindingTableIdx(unsigned idx);
 
@@ -640,10 +659,20 @@ public:
   virtual size_t getSrc0LenBytes() const override;
   virtual size_t getDstLenBytes() const override;
   virtual size_t getSrc1LenBytes() const override;
+
+  virtual size_t getDstLenRegs() const override { return ResponseLength(); }
+  virtual size_t getSrc0LenRegs() const override { return MessageLength(); }
+  virtual size_t getSrc1LenRegs() const override;
   //
   virtual SendAccess getAccessType() const override { return accessType; }
-  virtual std::pair<Caching, Caching> getCaching() const override;
-  virtual void setCaching(Caching l1, Caching l3) override;
+  //
+  // Returns the caching behavior of this message if known.
+  // Returns Caching::INVALID if the message doesn't support caching
+  // controls.
+  Caching getCachingL1() const override { return getCaching().first; }
+  Caching getCachingL3() const { return getCaching().second; }
+  std::pair<Caching, Caching> getCaching() const;
+  void setCaching(Caching l1, Caching l3);
   //
   // If the message has an immediate address offset,
   // this returns that offset.  The offset is in bytes.

@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2017-2022 Intel Corporation
+Copyright (C) 2017-2023 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -189,10 +189,10 @@ Region genx::makeRegionFromBaleInfo(const Instruction *Inst, const BaleInfo &BI,
           Result.Mask = 0;
       break;
     default:
-      IGC_ASSERT(0);
+      IGC_ASSERT_EXIT(0);
   }
   // Get the region parameters.
-  IGC_ASSERT(Subregion);
+  IGC_ASSERT_EXIT(Subregion);
   Result.ElementTy = Subregion->getType();
   if (auto *VT = dyn_cast<IGCLLVM::FixedVectorType>(Result.ElementTy)) {
     Result.ElementTy = VT->getElementType();
@@ -364,12 +364,14 @@ unsigned genx::getLegalRegionSizeForTarget(const GenXSubtarget &ST,
         // 3. fit in a row if the width is not legal
         // 4. no more than 8 elements in multi indirect (because there
         //    are only 8 elements in an address register).
-        unsigned LogWidth = genx::log2(Width);
+        IGC_ASSERT_EXIT(Width > 0 && R.ElementBytes > 0);
+        auto LogWidth = genx::log2(Width);
         if (1U << LogWidth == Width)
           LogWidth = genx::log2(R.NumElements); // legal width
         unsigned LogElementBytes = genx::log2(R.ElementBytes);
         if (LogWidth + LogElementBytes > (LogGRFWidth + 1))
           LogWidth = LogGRFWidth + 1 - LogElementBytes;
+        IGC_ASSERT_EXIT(LogWidth >= 0);
         ValidWidth = 1 << LogWidth;
         if (ValidWidth > 8)
           ValidWidth = 8;
@@ -495,6 +497,7 @@ unsigned genx::getLegalRegionSizeForTarget(const GenXSubtarget &ST,
                 NumRows = (R.NumElements - Idx) / R.Width;
             }
           }
+          IGC_ASSERT_EXIT(NumRows > 0);
           ValidWidth = (1 << genx::log2(NumRows)) * R.Width;
         }
         if (ValidWidth == 1 && Idx % R.Width) {
@@ -516,8 +519,11 @@ unsigned genx::getLegalRegionSizeForTarget(const GenXSubtarget &ST,
         // That failed. See how many elements we can get, no further than the
         // next end of row.
         ValidWidth = R.Width - Idx % R.Width;
-        if (ValidWidth * R.Stride - (R.Stride - 1) > ElementsToBoundary)
+        if (ValidWidth * R.Stride - (R.Stride - 1) > ElementsToBoundary) {
+          IGC_ASSERT_EXIT(R.Stride != 0);
           ValidWidth = (ElementsToBoundary + R.Stride - 1) / R.Stride;
+        }
+        IGC_ASSERT_EXIT(ValidWidth > 0);
         ValidWidth = 1 << genx::log2(ValidWidth);
       }
       // If the RStride is 0 (which is seen in splat operations) then the
@@ -1139,6 +1145,8 @@ Value *llvm::genx::simplifyRegionInst(Instruction *Inst, const DataLayout *DL,
   case GenXIntrinsic::genx_rdregioni: {
     auto replace = simplifyConstIndirectRegion(Inst);
     if (replace != Inst) {
+      if (!genx::isSafeToReplaceInstCheckAVLoadKill(Inst, replace))
+        break;
       Inst->replaceAllUsesWith(replace);
       Inst = replace;
     }
@@ -1177,53 +1185,12 @@ bool llvm::genx::simplifyRegionInsts(Function *F, const DataLayout *DL,
     for (auto I = BB.begin(); I != BB.end();) {
       Instruction *Inst = &*I++;
       if (auto V = simplifyRegionInst(Inst, DL, ST)) {
+        if (isa<Instruction>(V) && !genx::isSafeToReplaceInstCheckAVLoadKill(
+                                       Inst, cast<Instruction>(V)))
+          continue;
         Inst->replaceAllUsesWith(V);
         Inst->eraseFromParent();
         Changed = true;
-      }
-    }
-  }
-  return Changed;
-}
-
-// Cleanup loads.
-// %load1 = load *m
-// %load2 = load *m
-// no store to m
-// use(load1, load2)
-//
-bool llvm::genx::cleanupLoads(Function *F) {
-  bool Changed = false;
-  for (auto &BB : F->getBasicBlockList()) {
-    // The dominating loads (may have different types) for each variable.
-    std::unordered_map<GlobalVariable *, std::vector<LoadInst *>> DomLoads;
-    for (auto I = BB.begin(); I != BB.end();) {
-      Instruction *Inst = &*I++;
-      if (auto SI = dyn_cast<StoreInst>(Inst)) {
-        auto *GV = vc::getUnderlyingGlobalVariable(SI->getPointerOperand());
-        if (!GV)
-          continue;
-        // Kill all live loads on this variable.
-        DomLoads[GV].clear();
-      } else if (auto LI = dyn_cast<LoadInst>(Inst)) {
-        auto *GV = vc::getUnderlyingGlobalVariable(LI->getPointerOperand());
-        if (!GV)
-          continue;
-        auto &Loads = DomLoads[GV];
-        LoadInst *DomLI = nullptr;
-        for (auto LI1 : Loads) {
-          if (LI1->getType() == LI->getType()) {
-            DomLI = LI1;
-            break;
-          }
-        }
-        if (DomLI == nullptr)
-          Loads.push_back(LI);
-        else {
-          LI->replaceAllUsesWith(DomLI);
-          LI->eraseFromParent();
-          Changed = true;
-        }
       }
     }
   }

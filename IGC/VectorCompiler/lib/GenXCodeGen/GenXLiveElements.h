@@ -56,8 +56,9 @@ public:
   LiveElements(Type *Ty, bool IsLive = false);
   LiveElements(const ArrayRef<SmallBitVector> LE)
       : LiveElems(LE.begin(), LE.end()) {}
-  LiveElements(const SmallBitVector LE)
-      : LiveElems({LE}) {}
+  LiveElements(SmallBitVector &&LE) : LiveElems({std::move(LE)}) {}
+  LiveElements(const SmallBitVector &LE) = delete;
+  LiveElements &operator=(const SmallBitVector &) = delete;
 
   iterator begin() { return LiveElems.begin(); }
   const_iterator begin() const { return LiveElems.begin(); }
@@ -87,7 +88,10 @@ public:
 
   LiveElements operator|=(const LiveElements &Rhs);
 
-  void dump(raw_ostream &OS) const;
+  void print(raw_ostream &OS) const;
+#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
+  void dump() const;
+#endif // if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
 };
 
 inline LiveElements operator|(const LiveElements &Lhs,
@@ -98,54 +102,54 @@ inline LiveElements operator|(const LiveElements &Lhs,
 }
 
 inline raw_ostream &operator<<(raw_ostream &OS, const LiveElements &LE) {
-  LE.dump(OS);
+  LE.print(OS);
   return OS;
 }
+} // namespace genx
 
-// LiveElementsAnalysis - analysis that can give information for 2 types of
+// GenXLiveElements - analysis that can give information for 2 types of
 // queries:
 // 1. What elements of instruction result or function argument are live (i.e.
 //    can be used later)
 // 2. What elements of value are live in some particular use. This gives
 //    more precise result that live elements of whole value, because
 //    multiple uses of same value can use different elements
-class LiveElementsAnalysis {
+class GenXLiveElements {
 public:
   void processFunction(const Function &F);
   void clear() { LiveMap.clear(); }
 
-  LiveElements getLiveElements(const Value *V) const;
-  LiveElements getLiveElements(const Use *U) const;
-
-  void print(raw_ostream &OS) const;
+  genx::LiveElements getLiveElements(const Value *V) const;
+  genx::LiveElements getLiveElements(const Use *U) const;
 
 private:
   ValueMap<const Value *, genx::LiveElements> LiveMap;
 
-  LiveElements getBitCastLiveElements(const BitCastInst *BCI,
-                                      const LiveElements &InstLiveElems) const;
-  LiveElements getExtractValueLiveElements(const ExtractValueInst *EVI,
-                                           unsigned OperandNo,
-                                           const LiveElements &InstLiveElems) const;
-  LiveElements getInsertValueLiveElements(const InsertValueInst *IVI,
-                                          unsigned OperandNo,
-                                          const LiveElements &InstLiveElems) const;
-  LiveElements getRdRegionLiveElements(const Instruction *RdR,
-                                       unsigned OperandNo,
-                                       const LiveElements &InstLiveElems) const;
-  LiveElements getWrRegionLiveElements(const Instruction *WrR,
-                                       unsigned OperandNo,
-                                       const LiveElements &InstLiveElems) const;
-  LiveElements getTwoDstInstLiveElements(const LiveElements &InstLiveElems) const;
-  LiveElements getOperandLiveElements(const Instruction *Inst,
-                                      unsigned OperandNo,
-                                      const LiveElements &InstLiveElems) const;
+  genx::LiveElements
+  getBitCastLiveElements(const BitCastInst *BCI,
+                         const genx::LiveElements &InstLiveElems) const;
+  genx::LiveElements
+  getExtractValueLiveElements(const ExtractValueInst *EVI, unsigned OperandNo,
+                              const genx::LiveElements &InstLiveElems) const;
+  genx::LiveElements
+  getInsertValueLiveElements(const InsertValueInst *IVI, unsigned OperandNo,
+                             const genx::LiveElements &InstLiveElems) const;
+  genx::LiveElements
+  getRdRegionLiveElements(const Instruction *RdR, unsigned OperandNo,
+                          const genx::LiveElements &InstLiveElems) const;
+  genx::LiveElements
+  getWrRegionLiveElements(const Instruction *WrR, unsigned OperandNo,
+                          const genx::LiveElements &InstLiveElems) const;
+  genx::LiveElements
+  getTwoDstInstLiveElements(const genx::LiveElements &InstLiveElems) const;
+  genx::LiveElements
+  getOperandLiveElements(const Instruction *Inst, unsigned OperandNo,
+                         const genx::LiveElements &InstLiveElems) const;
 };
-} // namespace genx
 
-// Function pass wrapper for LiveElementsAnalysis
+// Function pass wrapper for GenXLiveElements
 class GenXFuncLiveElements : public FunctionPass,
-                             public genx::LiveElementsAnalysis {
+                             public GenXLiveElements {
 public:
   static char ID;
 
@@ -162,21 +166,18 @@ public:
   }
 
   bool runOnFunction(Function &F) override {
+    clear();
     processFunction(F);
     return false;
-  }
-
-  void print(raw_ostream &OS, const Module *M) const override {
-    genx::LiveElementsAnalysis::print(OS);
   }
 };
 
 void initializeGenXFuncLiveElementsPass(PassRegistry &);
 
-// FunctionGroup pass wrapper for LiveElementsAnalysis
+// FunctionGroup pass wrapper for GenXLiveElements
 class GenXGroupLiveElements : public FGPassImplInterface,
                               public IDMixin<GenXGroupLiveElements>,
-                              public genx::LiveElementsAnalysis {
+                              public GenXLiveElements {
 public:
   static StringRef getPassName() {
     return "GenX live elements analysis for a function group";
@@ -187,7 +188,8 @@ public:
   static void getAnalysisUsage(AnalysisUsage &AU) { AU.setPreservesAll(); }
 
   bool runOnFunctionGroup(FunctionGroup &FG) override {
-    for (auto F : FG)
+    clear();
+    for (auto &F : FG)
       processFunction(*F);
     return false;
   }

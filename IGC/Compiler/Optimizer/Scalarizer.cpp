@@ -160,21 +160,6 @@ bool ScalarizeFunction::runOnFunction(Function& F)
         if (Value * val = dyn_cast<Value>(*index))
         {
             UndefValue* undefVal = UndefValue::get((*index)->getType());
-
-            if (MDNode* pEIMD = (*index)->getMetadata("implicitGlobalID"))
-            {
-                // Compute thread and group identification instructions must have 'Output' attribute
-                // added later during compilation. The implicitGlobalID metadata attached to this
-                // instruction must be assigned to a new instruction, which replaces this instruction.
-                // Unfortunatelly, replaceAllUsesWith() will not ensure such propagation.
-                Instruction* pNewInst = dyn_cast_or_null<llvm::Instruction>(undefVal);
-                if (pNewInst)
-                {
-                    IGC_ASSERT_MESSAGE(pNewInst, "Missing implicit global ID instruction");
-                    Instruction* instr = dyn_cast<Instruction>(*index);
-                    pNewInst->copyMetadata(*instr);
-                }
-            }
             (val)->replaceAllUsesWith(undefVal);
         }
         IGC_ASSERT_MESSAGE((*index)->use_empty(), "Unable to remove used instruction");
@@ -807,27 +792,6 @@ void ScalarizeFunction::scalarizeInstruction(ExtractElementInst* EI)
     if (static_cast<unsigned int>(scalarIndex) < (unsigned)valueVType->getNumElements())
     {
         IGC_ASSERT_MESSAGE(NULL != operand[static_cast<unsigned int>(scalarIndex)], "SCM error");
-
-        if (IGC_IS_FLAG_ENABLED(UseOffsetInLocation))
-        {
-            // Metadata "implicitGlobalID" must be propagated to a new instruction as a WA
-            // for missing meta data preservation in this pass. When a general fix is applied
-            // then instructions below for this specific propagation must be removed.
-            Value* pNewVal = operand[static_cast<unsigned int>(scalarIndex)];
-
-            if (MDNode* pEIMD = EI->getMetadata("implicitGlobalID"))
-            {
-                // Compute thread and group identification instructions must have 'Output' attribute
-                // added later during compilation. The implicitGlobalID metadata attached to this
-                // instruction must be assigned to a new instruction, which replaces this instruction.
-                // Unfortunatelly, replaceAllUsesWith() will not ensure such propagation.
-                Instruction* pNewInst = dyn_cast_or_null<llvm::Instruction>(pNewVal);
-                IGC_ASSERT_MESSAGE(pNewInst, "Missing implicit global ID instruction");
-
-                pNewInst->copyMetadata(*EI);
-            }
-        }
-
         // Replace all users of this inst, with the extracted scalar value
         EI->replaceAllUsesWith(operand[static_cast<unsigned int>(scalarIndex)]);
     }
@@ -1421,7 +1385,7 @@ void ScalarizeFunction::resolveDeferredInstructions()
         }
     }
 
-    for ( auto entry : dummyToScalarMap )
+    for (const auto &entry : dummyToScalarMap)
     {
         // Replace and erase all dummy instructions (don't use eraseFromParent as the dummy is not in the function)
         Instruction *dummyInst = cast<Instruction>(entry.first);

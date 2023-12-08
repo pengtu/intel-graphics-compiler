@@ -84,10 +84,12 @@ bool GenXLinkageCorruptor::runOnModule(Module &M) {
 
     // Remove alwaysinline attribute and keep unchanged stack calls linkage as
     // we may have both types of stack calls.
-    if (vc::requiresStackCall(&F) && SaveStackCallLinkage) {
+    if (vc::requiresStackCall(&F)) {
       F.removeFnAttr(Attribute::AlwaysInline);
       Changed = true;
-      continue;
+
+      if (SaveStackCallLinkage)
+        continue;
     }
 
     F.setLinkage(GlobalValue::InternalLinkage);

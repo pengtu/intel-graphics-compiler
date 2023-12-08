@@ -263,28 +263,19 @@ public:
 
     void emitUAVSerialize();
 
-    void emitScalarAtomics(
-        llvm::Instruction* pInst,
-        ResourceDescriptor& resource,
-        AtomicOp atomic_op,
-        CVariable* pDstAddr,
-        CVariable* pU,
-        CVariable* pV,
-        CVariable* pR,
-        CVariable* pSrc,
-        bool isA64,
-        int bitSize);
+    void emitScalarAtomics(llvm::Instruction *pInst,
+                           ResourceDescriptor &resource, AtomicOp atomic_op,
+                           CVariable *pDstAddr, CVariable *pU, CVariable *pV,
+                           CVariable *pR, CVariable *pSrc, bool isA64,
+                           int bitSize, int immOffset, int immScale,
+                           LSC_ADDR_SIZE addrSize);
 
-    void emitScalarAtomicLoad(
-        llvm::Instruction* pInst,
-        ResourceDescriptor& resource,
-        CVariable* pDstAddr,
-        CVariable* pU,
-        CVariable* pV,
-        CVariable* pR,
-        CVariable* pSrc,
-        bool isA64,
-        int bitSize);
+    void emitScalarAtomicLoad(llvm::Instruction *pInst,
+                              ResourceDescriptor &resource,
+                              CVariable *pDstAddr, CVariable *pU, CVariable *pV,
+                              CVariable *pR, CVariable *pSrc, bool isA64,
+                              int bitWidth, int immOffset, int immScale,
+                              LSC_ADDR_SIZE addrSize);
 
     /// wave/subgroup support
     /// reduction and prefix/postfix facilities
@@ -338,7 +329,10 @@ public:
         bool isPrefix);
 
     bool IsUniformAtomic(llvm::Instruction* pInst);
-    void emitAtomicRaw(llvm::GenIntrinsicInst* pInst);
+    void emitAtomicRaw(llvm::GenIntrinsicInst *pInst, Value *varOffset,
+                       ConstantInt *immOffset = nullptr,
+                       ConstantInt *immScale = nullptr
+    );
     void emitAtomicTyped(llvm::GenIntrinsicInst* pInst);
     void emitAtomicCounter(llvm::GenIntrinsicInst* pInst);
     void emitFastClear(llvm::LoadInst* inst);
@@ -367,6 +361,7 @@ public:
     CVariable* GetVMaskPred(CVariable*& predicate);
     void createVMaskPred(CVariable*& predicate);
     void UseVMaskPred();
+    CVariable* GetCombinedVMaskPred(CVariable* basePredicate);
     CVariable* m_vMaskPredForSubplane = nullptr;
 
     void emitGradientX(const SSource& source, const DstModifier& modifier);
@@ -430,13 +425,15 @@ public:
                            llvm::Value *offset, llvm::ConstantInt *immOffset,
                            ConstantInt *immScale,
                            LSC_CACHE_OPTS cacheOpts,
-                           LSC_DOC_ADDR_SPACE addrSpace);
+                           LSC_DOC_ADDR_SPACE addrSpace
+    );
     void emitLSCVectorStore(llvm::Value *Ptr,
                             llvm::Value *offset, llvm::ConstantInt *immOffset,
                             llvm::ConstantInt *immScale, llvm::Value *storedVal,
                             llvm::BasicBlock *BB, LSC_CACHE_OPTS cacheOpts,
                             alignment_t align, bool dontForceDMask,
-                            LSC_DOC_ADDR_SPACE addrSpace);
+                            LSC_DOC_ADDR_SPACE addrSpace
+      );
     void emitUniformVectorCopy(CVariable* Dst, CVariable* Src, uint32_t nElts,
         uint32_t DstSubRegOffset = 0, uint32_t SrcSubRegOffset = 0);
     void emitVectorCopy(CVariable* Dst, CVariable* Src, uint32_t nElts,
@@ -949,32 +946,41 @@ private:
     CVariable *prepareDataForUniform(CVariable *DataVar, uint32_t ExecSz,
                                      e_alignment Align);
     // sub-function of vector load/store
-    void emitLSCVectorLoad_subDW(LSC_CACHE_OPTS cacheOpts, bool UseA32,
+    void emitLSCVectorLoad_subDW(LSC_CACHE_OPTS CacheOpts, bool UseA32,
                                  ResourceDescriptor &Resource, CVariable *Dest,
-                                 CVariable *Offset, int ImmOffset, int ImmScale,
-                                 uint32_t NumElts, uint32_t EltBytes,
-                                 LSC_DOC_ADDR_SPACE addrSpace);
-    void emitLSCVectorLoad_uniform(LSC_CACHE_OPTS cacheOpts, bool UseA32,
+                                 CVariable *Offset, int ImmOffset,
+                                 int ImmScale, uint32_t NumElts,
+                                 uint32_t EltBytes,
+                                 LSC_DOC_ADDR_SPACE AddrSpace,
+                                 LSC_ADDR_SIZE AddrSize
+    );
+    void emitLSCVectorLoad_uniform(LSC_CACHE_OPTS CacheOpts, bool UseA32,
                                    ResourceDescriptor &Resource,
                                    CVariable *Dest,
                                    CVariable *Offset, int ImmOffset,
                                    int ImmScale, uint32_t NumElts,
                                    uint32_t EltBytes, uint64_t Align,
                                    uint32_t Addrspace,
-                                   LSC_DOC_ADDR_SPACE userAddrSpace);
-    void emitLSCVectorStore_subDW(LSC_CACHE_OPTS cacheOpts, bool UseA32,
+                                   LSC_DOC_ADDR_SPACE UserAddrSpace,
+                                   LSC_ADDR_SIZE AddrSize
+      );
+    void emitLSCVectorStore_subDW(LSC_CACHE_OPTS CacheOpts, bool UseA32,
                                   ResourceDescriptor &Resource,
                                   CVariable *StoreVar, CVariable *Offset,
                                   int ImmOffset, int ImmScale, uint32_t NumElts,
                                   uint32_t EltBytes, alignment_t Align,
-                                  LSC_DOC_ADDR_SPACE addrSpace);
-    void emitLSCVectorStore_uniform(LSC_CACHE_OPTS cacheOpts, bool UseA32,
+                                  LSC_DOC_ADDR_SPACE AddrSpace,
+                                  LSC_ADDR_SIZE AddrSize
+      );
+    void emitLSCVectorStore_uniform(LSC_CACHE_OPTS CacheOpts, bool UseA32,
                                     ResourceDescriptor &Resource,
                                     CVariable *StoreVar, CVariable *Offset,
                                     int ImmOffset, int ImmScale,
                                     uint32_t NumElts, uint32_t EltBytes,
                                     alignment_t Align,
-                                    LSC_DOC_ADDR_SPACE addrSpace);
+                                    LSC_DOC_ADDR_SPACE AddrSpace,
+                                    LSC_ADDR_SIZE AddrSize
+      );
     LSC_FENCE_OP getLSCMemoryFenceOp(bool IsGlobalMemFence, bool InvalidateL1,
                                      bool EvictL1) const;
 

@@ -215,7 +215,6 @@ set(GenX_Common_Sources_G4_Passes
 set(GenX_Common_Sources_External_Other
   Assertions.cpp
   Attributes.cpp
-  BinaryCISAEmission.cpp
   BinaryEncoding.cpp
   BinaryEncodingCNL.cpp
   BinaryEncodingIGA.cpp
@@ -227,6 +226,7 @@ set(GenX_Common_Sources_External_Other
   RADebug.cpp
   FlagSpillCleanup.cpp
   FlowGraph.cpp
+  FrequencyInfo.cpp
   G4_BB.cpp
   G4_IR.cpp
   G4_Kernel.cpp
@@ -313,7 +313,6 @@ set(GenX_Utility_Files
 set(GenX_Common_Headers
   Attributes.hpp
   Assertions.h
-  BinaryCISAEmission.h
   BinaryEncoding.h
   BinaryEncodingCNL.h
   BinaryEncodingIGA.h
@@ -326,9 +325,11 @@ set(GenX_Common_Headers
   RADebug.h
   FlagSpillCleanup.h
   FlowGraph.h
+  FrequencyInfo.h
   G4_BB.hpp
   G4_Declare.h
   G4_IR.hpp
+  G4_Instruction.h
   G4_Kernel.hpp
   G4_MsgOpDefs.hpp
   G4_Opcode.h
@@ -336,7 +337,6 @@ set(GenX_Common_Headers
   G4_Register.h
   G4_SendDescs.hpp
   G4_Verifier.hpp
-  G4Instruction.h
   GraphColor.h
   HWConformity.h
   EmuInt64Add.h

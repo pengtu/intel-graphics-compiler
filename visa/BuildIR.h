@@ -27,6 +27,7 @@ SPDX-License-Identifier: MIT
 #include "inc/common/sku_wa.h"
 #include "visa_igc_common_header.h"
 #include "visa_wa.h"
+#include "FrequencyInfo.h"
 
 #define MAX_DWORD_VALUE 0x7fffffff
 #define MIN_DWORD_VALUE 0x80000000
@@ -444,6 +445,8 @@ private:
   Mem_Manager metadataMem;
   std::vector<Metadata *> allMDs;
   std::vector<MDNode *> allMDNodes;
+
+  FrequencyInfo freqInfoManager;
 
   // bump pointer allocator for variable and label names, used for IR dump only.
   Mem_Manager debugNameMem;
@@ -2048,7 +2051,7 @@ public:
       VISA_EMask_Ctrl emask, LSC_CACHE_OPTS cacheOpts,
       LSC_DATA_SHAPE_BLOCK2D shape, G4_DstRegRegion *dstData,
       G4_Operand *src0Addrs[LSC_BLOCK2D_ADDR_PARAMS],
-      G4_SrcRegRegion *src1Data);
+      G4_SrcRegRegion *src1Data, int xImmOff, int yImmOff);
   int translateLscTypedInst(
       LSC_OP op, G4_Predicate *pred, VISA_Exec_Size execSize,
       VISA_EMask_Ctrl emask, LSC_CACHE_OPTS cacheOpts, LSC_ADDR_TYPE addrModel,
@@ -2086,7 +2089,8 @@ public:
                                           bool transposed);
   G4_SrcRegRegion *lscBuildBlock2DPayload(LSC_DATA_SHAPE_BLOCK2D dataShape2D,
                                           G4_Predicate *pred,
-                                          G4_Operand *src0Addrs[6]);
+                                          G4_Operand *src0Addrs[6],
+                                          int immOffX, int immOffY);
 
   //
   // LSC allows users to pass an immediate scale and immediate addend.
@@ -2095,8 +2099,16 @@ public:
   G4_SrcRegRegion *lscLoadEffectiveAddress(
       LSC_OP lscOp, LSC_SFID lscSfid, G4_Predicate *pred, G4_ExecSize execSize,
       VISA_EMask_Ctrl execCtrl, LSC_ADDR addrInfo, int bytesPerDataElem,
-      const G4_Operand *surface, G4_SrcRegRegion *addr, uint32_t &exDesc
-  );
+      const G4_Operand *surface, G4_SrcRegRegion *addr, uint32_t &exDesc,
+      uint32_t &exDescImmOff);
+
+  // try and promote an immediate offset to LSC descriptor
+  // (doesn't work for block2d)
+  bool lscTryPromoteImmOffToExDesc(LSC_OP lscOp, LSC_SFID lscSfid,
+                                   LSC_ADDR addrInfo, int bytesPerDataElem,
+                                   const G4_Operand *surface,
+                                   uint32_t &exDescImm, uint32_t &exDescImmOff);
+
   G4_SrcRegRegion *lscCheckRegion(G4_Predicate *pred, G4_ExecSize execSize,
                                   VISA_EMask_Ctrl execCtrl,
                                   G4_SrcRegRegion *src);
@@ -2309,9 +2321,12 @@ public:
     return newNode;
   }
 
+  //FrequencyInfo API
+  FrequencyInfo& getFreqInfoManager() { return freqInfoManager;}
   ///////////////////////////////////////////////////////////////////////////
   ///////////////////////////////////////////////////////////////////////////
   // Generic IR simplification tasks
+  G4_Imm *foldConstVal(G4_Imm* opnd, G4_INST *op);
   G4_Imm *foldConstVal(G4_Imm *const1, G4_Imm *const2, G4_opcode op);
   void doConsFolding(G4_INST *inst);
   void doSimplification(G4_INST *inst);
@@ -2330,6 +2345,23 @@ private:
                                 bool isNativeSIMDSize, bool isFP16Return,
                                 bool isFP16Input) const;
 };
+
+constexpr VISALscImmOffOpts getLscImmOffOpt(LSC_ADDR_TYPE addrType) {
+  switch (addrType) {
+  case LSC_ADDR_TYPE_FLAT:
+    return VISA_LSC_IMMOFF_ADDR_TYPE_FLAT;
+  case LSC_ADDR_TYPE_BSS:
+    return VISA_LSC_IMMOFF_ADDR_TYPE_BSS;
+  case LSC_ADDR_TYPE_SS:
+    return VISA_LSC_IMMOFF_ADDR_TYPE_SS;
+  case LSC_ADDR_TYPE_BTI:
+  case LSC_ADDR_TYPE_ARG:
+    return VISA_LSC_IMMOFF_ADDR_TYPE_BTI;
+  default:
+    break;
+  }
+  return VISA_LSC_IMMOFF_INVALID;
+}
 } // namespace vISA
 
 // G4IR instructions added by JIT that do not result from lowering

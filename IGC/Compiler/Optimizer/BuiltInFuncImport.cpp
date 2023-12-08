@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2017-2021 Intel Corporation
+Copyright (C) 2017-2023 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -535,67 +535,6 @@ void BIImport::fixSPIRFunctionsReturnType(Module& M)
         F->eraseFromParent();
 }
 
-// The built-in definition returns i32, however, at this point the function call
-// that has been added for round_to_tf32() call returns a float (as the orig
-// matrix type was float).  So we need to: 1) Change the return type of the
-// function declaration to int so that it matches the builtin definition; 2)
-// Cast the returned value of the function back to float so that the previous
-// users of the return value are happy.
-void fixRoundToTF32ReturnType(Module &M) {
-    SmallPtrSet<Function *, 8> funcsToRemove;
-    for (auto &F : M) {
-        if (!F.isDeclaration())
-            continue;
-        auto FuncName = F.getName();
-
-        if (!FuncName.contains("OpRoundFToTF32INTEL") ||
-            FuncName.contains("_old"))
-            continue;
-        if (!F.getReturnType()->isFloatTy())
-            continue;
-
-        FunctionType *FT = F.getFunctionType();
-
-        FunctionType *NewFT = FunctionType::get(
-            Type::getInt32Ty(M.getContext()), FT->params(), false);
-        auto *NewF =
-            Function::Create(NewFT, F.getLinkage(), FuncName + ".cloned", M);
-
-        SmallPtrSet<CallInst *, 16> Calls;
-
-        for (auto user : F.users())
-            if (CallInst *CI = dyn_cast<CallInst>(user))
-                Calls.insert(CI);
-
-        for (auto CI : Calls) {
-            IRBuilder<> builder(CI);
-
-            SmallVector<Value *, 4> Args;
-            for (auto &Arg : CI->args())
-                Args.push_back(Arg);
-
-            auto *newCall = builder.CreateCall(NewF, Args);
-            newCall->setCallingConv(CI->getCallingConv());
-            newCall->setAttributes(CI->getAttributes());
-            // Convert the value back so that previous users of
-            // the return value are happy
-            auto *converted = builder.CreateBitCast(newCall, CI->getType());
-
-            CI->replaceAllUsesWith(converted);
-            CI->eraseFromParent();
-        }
-
-        std::string originalName = FuncName.str();
-        F.setName(FuncName + "_old");
-        NewF->setName(originalName);
-
-        funcsToRemove.insert(&F);
-    }
-
-    for (auto *F : funcsToRemove)
-        F->eraseFromParent();
-}
-
 // Older Clang versions generate invalid bitcast instructions for explicit
 // C-style casts with specified address space. For example:
 //   %0 = bitcast i8 addrspace(1)* %mem to i32 addrspace(4)*
@@ -655,7 +594,6 @@ bool BIImport::runOnModule(Module& M)
     }
 
     fixSPIRFunctionsReturnType(M);
-    fixRoundToTF32ReturnType(M);
 
     for (auto& F : M)
     {
@@ -931,7 +869,7 @@ bool BIImport::runOnModule(Module& M)
                         Function* callerF = CI->getParent()->getParent();
                         // Assume the caller has explicit subgroup size set, otherwise we cannot determine which variant to use
                         FunctionInfoMetaDataHandle funcInfoMD = pMdUtils->getFunctionsInfoItem(callerF);
-                        unsigned subgroup_size = (unsigned)funcInfoMD->getSubGroupSize()->getSIMD_size();
+                        unsigned subgroup_size = (unsigned)funcInfoMD->getSubGroupSize()->getSIMDSize();
                         IGC_ASSERT(subgroup_size != 0);
 
                         // Parse each variant string in the table, stop at the first one that matches subgroup_size
@@ -1037,22 +975,23 @@ void BIImport::removeFunctionBitcasts(Module& M)
                         {
                             pDstFunc = Function::Create(pInstCall->getFunctionType(), funcTobeChanged->getLinkage(), funcTobeChanged->getName(), &M);
                             if (pDstFunc->arg_size() != funcTobeChanged->arg_size()) continue;
-                            // Need to copy the attributes over too.
-                            AttributeList FuncAttrs = funcTobeChanged->getAttributes();
-                            pDstFunc->setAttributes(FuncAttrs);
-
                             // Go through and convert function arguments over, remembering the mapping.
                             Function::arg_iterator itSrcFunc = funcTobeChanged->arg_begin();
                             Function::arg_iterator eSrcFunc = funcTobeChanged->arg_end();
                             llvm::Function::arg_iterator itDest = pDstFunc->arg_begin();
 
-                            // Fix incorrect address space caused by CloneFunctionInto later
-                            // for example, CloneFunctionInto causes incorrect LLVM IR, like below
+                            // Fix incorrect address space or incorrect pointer type caused by CloneFunctionInto later
+                            // 1. AddressSpaceCast example: CloneFunctionInto causes incorrect LLVM IR, like below
                             //     %arrayidx.le.i = getelementptr inbounds i8, i8 addrspace(1)* %8, i64 %conv.le.i
                             //     %9 = load i8, i8 addrspace(4)* %arrayidx.le.i, align 1, !tbaa !309
                             // Address space should match for %arrayidx.le.i, so we insert necessary
-                            // address space casts, which should be eliminated later
-                            SmallVector<Instruction *, 5> ascInsts;
+                            // address space casts, which should be eliminated later by other passes
+                            // 2. incorrect type example:
+                            //     %0 = load i16, %"class.sycl::_V1::ext::oneapi::bfloat16" addrspace(4)* %x, align 2
+                            // Load value type should match pointer type for %x, so we insert necessary bitcast:
+                            //     %x.bcast = bitcast %"class.sycl::_V1::ext::oneapi::bfloat16" addrspace(4)* %x to i16 addrspace(4)*
+                            //     %0 = load i16, i16 addrspace(4)* %x.bcast, align 2
+                            SmallVector<Instruction *, 5> castInsts;
 
                             for (; itSrcFunc != eSrcFunc; ++itSrcFunc, ++itDest)
                             {
@@ -1061,17 +1000,23 @@ void BIImport::removeFunctionBitcasts(Module& M)
                                 Type *srcType = (*itSrcFunc).getType();
                                 Value *destVal = &(*itDest);
                                 Type *destType = destVal->getType();
-                                if (srcType->isPointerTy() && destType->isPointerTy() &&
-                                    srcType->getPointerAddressSpace() != destType->getPointerAddressSpace())
+                                if (srcType->isPointerTy() && destType->isPointerTy())
                                 {
-                                    AddrSpaceCastInst *newASC = new AddrSpaceCastInst(destVal, srcType, destVal->getName() + "cast");
-                                    ascInsts.push_back(newASC);
-                                    operandMap[&(*itSrcFunc)] = newASC;
+                                    if (srcType->getPointerAddressSpace() != destType->getPointerAddressSpace())
+                                    {
+                                        AddrSpaceCastInst *newASC = new AddrSpaceCastInst(destVal, srcType, destVal->getName() + ".ascast");
+                                        castInsts.push_back(newASC);
+                                        destVal = newASC;
+                                    }
+                                    if (IGCLLVM::getNonOpaquePtrEltTy(srcType) != IGCLLVM::getNonOpaquePtrEltTy(destType))
+                                    {
+                                        BitCastInst *newBT = new BitCastInst(destVal, srcType, destVal->getName() + ".bcast");
+                                        castInsts.push_back(newBT);
+                                        destVal = newBT;
+                                    }
                                 }
-                                else
-                                {
-                                    operandMap[&(*itSrcFunc)] = &(*itDest);
-                                }
+
+                                operandMap[&(*itSrcFunc)] = destVal;
                             }
 
                             // Clone the body of the function into the dest function.
@@ -1084,9 +1029,13 @@ void BIImport::removeFunctionBitcasts(Module& M)
                                 Returns,
                                 "");
 
+                            // Need to copy the attributes over too.
+                            AttributeList FuncAttrs = funcTobeChanged->getAttributes();
+                            pDstFunc->setAttributes(FuncAttrs);
+
                             // get first instruction in function and insert addressspacecast before it
                             Instruction *firstInst = &(*pDstFunc->begin()->getFirstInsertionPt());
-                            for (Instruction *valToInsert : ascInsts)
+                            for (Instruction *valToInsert : castInsts)
                                 valToInsert->insertBefore(firstInst);
 
                             pDstFunc->setCallingConv(funcTobeChanged->getCallingConv());
@@ -1100,6 +1049,7 @@ void BIImport::removeFunctionBitcasts(Module& M)
                         auto newCI = CallInst::Create(pDstFunc, Args, "", pInstCall);
                         newCI->takeName(pInstCall);
                         newCI->setCallingConv(pInstCall->getCallingConv());
+                        newCI->setAttributes(pInstCall->getAttributes());
                         pInstCall->replaceAllUsesWith(newCI);
                         pInstCall->dropAllReferences();
                         if (constExpr->use_empty())
@@ -1495,7 +1445,7 @@ bool PreBIImportAnalysis::runOnModule(Module& M)
         }
     }
 
-    for (auto InstTuple : InstToModify)
+    for (const auto &InstTuple : InstToModify)
     {
       auto inst = std::get<0>(InstTuple);
       auto value = std::get<1>(InstTuple);

@@ -36,6 +36,7 @@ SPDX-License-Identifier: MIT
 #include "Compiler/MetaDataApi/MetaDataApi.h"
 #include "common/MDFrameWork.h"
 #include "common/Types.hpp"
+#include "LLVM3DBuilder/MetadataBuilder.h"
 #include "Probe/Assertion.h"
 #include <functional>
 
@@ -190,6 +191,7 @@ namespace IGC
     bool IsStatelessMemLoadIntrinsic(llvm::GenISAIntrinsic::ID id);
     bool IsStatelessMemStoreIntrinsic(llvm::GenISAIntrinsic::ID id);
     bool IsStatelessMemAtomicIntrinsic(llvm::GenIntrinsicInst& inst, llvm::GenISAIntrinsic::ID id);
+    llvm::GenISAIntrinsic::ID GetOutputPSIntrinsic(const CPlatform& platform);
 
     bool isURBWriteIntrinsic(const llvm::Instruction* inst);
 
@@ -585,6 +587,8 @@ namespace IGC
     struct Defer
     {
         Defer(Fn F) : F(F) {}
+        Defer(const Defer&) = delete;
+        Defer& operator=(const Defer&) = delete;
         ~Defer() {
             if (Do) F();
         }

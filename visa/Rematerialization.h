@@ -113,7 +113,7 @@ private:
         opIt->second.numUses = numUses - 1;
 
       if (numUses == 1) {
-        for (auto ref : opIt->second.def) {
+        for (const auto &ref : opIt->second.def) {
           ref.second->remove(ref.first);
         }
         opIt->second.def.clear();
@@ -231,6 +231,9 @@ public:
       dcl->resetSpillFlag();
     }
   }
+
+  Rematerialization(const Rematerialization&) = delete;
+  Rematerialization& operator=(const Rematerialization&) = delete;
 
   bool getChangesMade() const { return IRChanged; }
 

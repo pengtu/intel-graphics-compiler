@@ -113,9 +113,6 @@ struct GenXBackendOptions {
   // Disable induction variable simplification
   bool DisableIndvarsOpt = false;
 
-  // use new Prolog/Epilog Insertion pass vs old CisaBuilder machinery
-  bool UseNewStackBuilder = true;
-
   FunctionControl FCtrl = FunctionControl::Default;
 
   // Non-owning pointer to workaround table.
@@ -174,7 +171,13 @@ struct GenXBackendOptions {
   unsigned InteropSubgroupSize = 16;
 
   // Run auxiliary checker/fixup for GV access clobbering cases.
-  bool CheckGVClobbering = false;
+  bool CheckGVClobbering =
+#ifdef NDEBUG
+      false
+#else
+      true
+#endif
+      ;
 
   // Compile until vISA stage only.
   bool EmitVisaOnly = false;
@@ -233,8 +236,8 @@ private:
 
 public:
   GenXBackendConfig();
-  explicit GenXBackendConfig(GenXBackendOptions OptionsIn,
-                             GenXBackendData DataIn);
+  explicit GenXBackendConfig(GenXBackendOptions &&OptionsIn,
+                             GenXBackendData &&DataIn);
 
   // Return whether regalloc results should be printed.
   bool enableRegAllocDump() const { return Options.DumpRegAlloc; }
@@ -322,8 +325,6 @@ public:
   }
 
   bool disableIndvarsOpt() const { return Options.DisableIndvarsOpt; }
-
-  bool useNewStackBuilder() const { return Options.UseNewStackBuilder; }
 
   unsigned getStatelessPrivateMemSize() const {
     return Options.StatelessPrivateMemSize;
