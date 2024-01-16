@@ -252,7 +252,7 @@ namespace IGC
     // This function returns true if the current function is any of those variant kernels.
     inline bool isIntelSymbolTableVoidProgram(llvm::Function* pF)
     {
-        return (pF && pF->getName().startswith(INTEL_SYMBOL_TABLE_VOID_PROGRAM));
+        return (pF && pF->getName().starts_with(INTEL_SYMBOL_TABLE_VOID_PROGRAM));
     }
 
     int getFunctionControl(const CodeGenContext* pContext);

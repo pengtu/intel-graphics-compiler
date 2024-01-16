@@ -36,7 +36,7 @@ static llvm::GenISAIntrinsic::ID GetID(const llvm::Function& func, bool useConte
             {
                 llvm::StringRef prefix = GetIntrinsicPrefixName();
                 llvm::StringRef Name = pValueName->getKey();
-                if (Name.size() > prefix.size() && Name.startswith(prefix))
+                if (Name.size() > prefix.size() && Name.starts_with(prefix))
                 {
                     id = static_cast<llvm::GenISAIntrinsic::ID>(LookupIntrinsicId(Name.data()));
                     SafeIntrinsicIdCache[&func] = static_cast<uint32_t>(id);
@@ -59,7 +59,7 @@ static llvm::GenISAIntrinsic::ID GetID(const llvm::Function& func, bool useConte
         {
             llvm::StringRef prefix = GetIntrinsicPrefixName();
             llvm::StringRef Name = pValueName->getKey();
-            if (Name.size() > prefix.size() && Name.startswith(prefix))
+            if (Name.size() > prefix.size() && Name.starts_with(prefix))
             {
                 id = static_cast<llvm::GenISAIntrinsic::ID>(LookupIntrinsicId(Name.data()));
             }
